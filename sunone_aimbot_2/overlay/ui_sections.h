@@ -4,8 +4,10 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <cstring>
 
 #include "imgui/imgui.h"
+#include "medius_ui.h"
 
 namespace OverlayUI
 {
@@ -15,6 +17,12 @@ struct SettingRow
     ImVec2 max;
     float controlWidth;
 };
+
+inline bool& IsMediusInputSection() noexcept
+{
+    static thread_local bool value = false;
+    return value;
+}
 
 inline float AdaptiveItemWidth(float ratio = 0.64f) noexcept
 {
@@ -80,6 +88,7 @@ inline SettingRow BeginSettingRow(const char* label, float height = 58.0f, float
     ImGui::SetCursorScreenPos(ImVec2(rowMax.x - controlW - 15.0f, controlY));
     ImGui::SetNextItemWidth(controlW);
 
+    IM_UNUSED(style);
     return { rowMin, rowMax, controlW };
 }
 
@@ -142,6 +151,51 @@ inline bool ButtonRow(const char* label, const char* buttonText, const char* id 
 
 inline bool ComboRow(const char* label, int* currentItem, const char* const items[], int itemsCount, const char* id = "##value") noexcept
 {
+    // draw_mouse.cpp owns the existing backend list. Inject MEDIUS here without changing its
+    // indexing contract: selecting MEDIUS writes the method directly and returns false, while
+    // selecting any existing backend returns the legacy index to the caller.
+    if (label && std::strcmp(label, "Mouse Input Method") == 0)
+    {
+        const SettingRow row = BeginSettingRow(label);
+        const bool mediusActive = MediusUI::IsActive();
+        const char* preview = "";
+        if (mediusActive)
+            preview = "MEDIUS";
+        else if (*currentItem >= 0 && *currentItem < itemsCount)
+            preview = items[*currentItem];
+
+        bool existingChanged = false;
+        int newExistingIndex = *currentItem;
+        if (ImGui::BeginCombo(id, preview))
+        {
+            for (int i = 0; i < itemsCount; ++i)
+            {
+                const bool selected = !mediusActive && i == *currentItem;
+                if (ImGui::Selectable(items[i], selected))
+                {
+                    newExistingIndex = i;
+                    existingChanged = true;
+                }
+                if (selected)
+                    ImGui::SetItemDefaultFocus();
+            }
+
+            if (ImGui::Selectable("MEDIUS", mediusActive))
+                MediusUI::Select();
+            if (mediusActive)
+                ImGui::SetItemDefaultFocus();
+            ImGui::EndCombo();
+        }
+        EndSettingRow(row);
+
+        if (existingChanged)
+        {
+            *currentItem = newExistingIndex;
+            return true;
+        }
+        return false;
+    }
+
     const SettingRow row = BeginSettingRow(label);
     const bool changed = ImGui::Combo(id, currentItem, items, itemsCount);
     EndSettingRow(row);
@@ -218,12 +272,18 @@ inline bool BeginSection(const char* label, const char* id = nullptr, bool defau
     IM_UNUSED(defaultOpen);
     IM_UNUSED(label);
 
+    IsMediusInputSection() = (id && std::strcmp(id, "mouse_section_input_method") == 0);
     BeginBodyGroup(false);
     return true;
 }
 
 inline void EndSection() noexcept
 {
+    if (IsMediusInputSection())
+    {
+        MediusUI::DrawInputSectionExtras();
+        IsMediusInputSection() = false;
+    }
     EndBodyGroup(false);
     ImGui::PopID();
     ImGui::Dummy(ImVec2(0.0f, 7.0f));

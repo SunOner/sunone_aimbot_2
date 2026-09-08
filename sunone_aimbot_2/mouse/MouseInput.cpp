@@ -17,6 +17,7 @@
 #include "KmboxAConnection.h"
 #include "KmboxNetConnection.h"
 #include "Makcu.h"
+#include "MediusRuntime.h"
 #include "RP2350.h"
 #include "Teensy41RawHid.h"
 #include "config.h"
@@ -505,6 +506,31 @@ public:
 private:
     std::unique_ptr<MakcuConnection> device_;
 };
+
+class MediusMouseInput final : public IMouseInput
+{
+public:
+    MediusMouseInput()
+        : runtime_(MediusRuntime::instance()), connected_(runtime_.connectMouse())
+    {
+    }
+
+    ~MediusMouseInput() override
+    {
+        if (connected_)
+            runtime_.disconnectMouse();
+    }
+
+    const char* name() const override { return "MEDIUS"; }
+    bool isOpen() const override { return connected_ && runtime_.status().deviceConnected; }
+    bool move(int dx, int dy) override { return connected_ && runtime_.move(dx, dy); }
+    bool leftDown() override { return connected_ && runtime_.leftDown(); }
+    bool leftUp() override { return connected_ && runtime_.leftUp(); }
+
+private:
+    MediusRuntime& runtime_;
+    bool connected_ = false;
+};
 }
 
 std::optional<MouseInputMethod> ParseMouseInputMethod(const std::string& method)
@@ -529,6 +555,8 @@ std::optional<MouseInputMethod> ParseMouseInputMethod(const std::string& method)
         return MouseInputMethod::KmboxA;
     if (method == "MAKCU")
         return MouseInputMethod::Makcu;
+    if (method == "MEDIUS")
+        return MouseInputMethod::Medius;
     return std::nullopt;
 }
 
@@ -545,6 +573,7 @@ std::string MouseInputMethodName(MouseInputMethod method)
     case MouseInputMethod::KmboxNet: return "KMBOX_NET";
     case MouseInputMethod::KmboxA: return "KMBOX_A";
     case MouseInputMethod::Makcu: return "MAKCU";
+    case MouseInputMethod::Medius: return "MEDIUS";
     case MouseInputMethod::Win32:
     default:
         return "WIN32";
@@ -580,6 +609,8 @@ std::unique_ptr<IMouseInput> CreateMouseInputDevice(const Config& config)
         return std::make_unique<KmboxAMouseInput>(config.kmbox_a_pidvid);
     case MouseInputMethod::Makcu:
         return std::make_unique<MakcuMouseInput>(config.makcu_port, static_cast<unsigned int>(config.makcu_baudrate));
+    case MouseInputMethod::Medius:
+        return std::make_unique<MediusMouseInput>();
     case MouseInputMethod::Win32:
     default:
         return std::make_unique<Win32MouseInput>();

@@ -26,7 +26,8 @@ enum class MouseInputMethod
     Teensy41Hid,
     KmboxNet,
     KmboxA,
-    Makcu
+    Makcu,
+    Medius
 };
 
 std::optional<MouseInputMethod> ParseMouseInputMethod(const std::string& method);

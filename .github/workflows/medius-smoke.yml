@@ -1,0 +1,66 @@
+name: Medius smoke build
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'sunone_aimbot_2/mouse/MediusRuntime.h'
+      - 'sunone_aimbot_2/mouse/MouseInput.h'
+      - 'sunone_aimbot_2/mouse/MouseInput.cpp'
+      - 'sunone_aimbot_2/overlay/medius_ui.h'
+      - 'sunone_aimbot_2/overlay/ui_sections.h'
+      - 'tests/medius_runtime_smoke.cpp'
+      - 'tests/medius_ui_smoke.cpp'
+      - '.github/workflows/medius-smoke.yml'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compile Medius runtime smoke test
+        shell: cmd
+        run: |
+          for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSINSTALL=%%i"
+          if not defined VSINSTALL exit /b 2
+          call "%VSINSTALL%\VC\Auxiliary\Build\vcvars64.bat"
+          cl /nologo /std:c++17 /EHsc /I . tests\medius_runtime_smoke.cpp /Fe:medius_runtime_smoke.exe
+
+      - name: Run runtime policy smoke test
+        shell: cmd
+        run: medius_runtime_smoke.exe
+
+      - name: Run updater integration test
+        shell: cmd
+        run: medius_runtime_smoke.exe --update-integration
+
+      - name: Compile Medius UI integration
+        shell: cmd
+        run: |
+          for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSINSTALL=%%i"
+          if not defined VSINSTALL exit /b 2
+          call "%VSINSTALL%\VC\Auxiliary\Build\vcvars64.bat"
+          cl /nologo /std:c++17 /EHsc /c /I . /I sunone_aimbot_2 tests\medius_ui_smoke.cpp /Fo:medius_ui_smoke.obj
+
+      - name: Verify MouseInput backend wiring
+        shell: powershell
+        run: |
+          $cpp = Get-Content 'sunone_aimbot_2/mouse/MouseInput.cpp' -Raw
+          $hdr = Get-Content 'sunone_aimbot_2/mouse/MouseInput.h' -Raw
+          $requiredCpp = @(
+            'class MediusMouseInput',
+            'MediusRuntime::instance().connectMouse()',
+            'runtime_->move(dx, dy)',
+            'runtime_->leftDown()',
+            'runtime_->leftUp()',
+            'return MouseInputMethod::Medius',
+            'case MouseInputMethod::Medius: return "MEDIUS"',
+            'return std::make_unique<MediusMouseInput>()'
+          )
+          foreach ($needle in $requiredCpp) {
+            if (-not $cpp.Contains($needle)) { throw "Missing Medius backend wiring: $needle" }
+          }
+          if (-not $hdr.Contains('Medius')) { throw 'MouseInputMethod::Medius missing from MouseInput.h' }
+          Write-Host 'Medius MouseInput backend wiring: PASS'
