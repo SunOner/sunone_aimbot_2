@@ -463,8 +463,9 @@ private:
 class MakcuMouseInput final : public IMouseInput
 {
 public:
-    MakcuMouseInput(const std::string& port, unsigned int baudrate)
-        : device_(std::make_unique<MakcuConnection>(port, baudrate))
+    MakcuMouseInput(const std::string& port, unsigned int baudrate, bool useButtonState)
+        : device_(std::make_unique<MakcuConnection>(port, baudrate)),
+          useButtonState_(useButtonState)
     {
     }
 
@@ -491,19 +492,35 @@ public:
         device_->release(0);
         return true;
     }
-    bool hasPhysicalButtonState() const override { return true; }
+    bool hasPhysicalButtonState() const override { return useButtonState_; }
     bool keyPressed(const std::string& keyName) override
     {
-        return isOpen() &&
-            logicalButtonPressed(keyName, shootingActive(), zoomingActive(), aimingActive());
+        if (!isOpen() || !useButtonState_)
+            return false;
+
+        if (keyName == "LeftMouseButton")
+            return device_->left_active.load();
+        if (keyName == "RightMouseButton")
+            return device_->right_active.load();
+        if (keyName == "MiddleMouseButton")
+            return device_->middle_active.load();
+        if (keyName == "X1MouseButton")
+            return device_->side1_active.load();
+        if (keyName == "X2MouseButton")
+            return device_->side2_active.load();
+        return false;
     }
-    bool aimingActive() const override { return device_ && device_->aiming_active; }
-    bool shootingActive() const override { return device_ && device_->shooting_active; }
-    bool zoomingActive() const override { return device_ && device_->zooming_active; }
+    // Button roles come from the configured hotkeys through keyPressed() above.
+    // Publishing raw device state here would bypass that config (e.g. mouse5
+    // would always aim regardless of button_targeting). Same approach as KmboxNet.
+    bool aimingActive() const override { return false; }
+    bool shootingActive() const override { return false; }
+    bool zoomingActive() const override { return false; }
     MakcuConnection* makcu() override { return device_.get(); }
 
 private:
     std::unique_ptr<MakcuConnection> device_;
+    bool useButtonState_ = false;
 };
 }
 
@@ -579,7 +596,10 @@ std::unique_ptr<IMouseInput> CreateMouseInputDevice(const Config& config)
     case MouseInputMethod::KmboxA:
         return std::make_unique<KmboxAMouseInput>(config.kmbox_a_pidvid);
     case MouseInputMethod::Makcu:
-        return std::make_unique<MakcuMouseInput>(config.makcu_port, static_cast<unsigned int>(config.makcu_baudrate));
+        return std::make_unique<MakcuMouseInput>(
+            config.makcu_port,
+            static_cast<unsigned int>(config.makcu_baudrate),
+            config.makcu_enable_keys);
     case MouseInputMethod::Win32:
     default:
         return std::make_unique<Win32MouseInput>();

@@ -104,6 +104,7 @@ public:
     // makcu
     int makcu_baudrate;
     std::string makcu_port;
+    bool makcu_enable_keys;
 
     // Mouse shooting
     bool auto_shoot;
