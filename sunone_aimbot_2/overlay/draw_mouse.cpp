@@ -929,6 +929,12 @@ static void draw_mouse_page(MouseSettingsPage page)
                 input_method_changed.store(true);
             }
 
+            if (OverlayUI::CheckboxRow("Makcu Enable Keys", &config.makcu_enable_keys))
+            {
+                OverlayConfig_MarkDirty();
+                input_method_changed.store(true);
+            }
+
             if (makcuSerial && makcuSerial->isOpen())
             {
                 ImGui::TextColored(ImVec4(0, 255, 0, 255), "Makcu connected");

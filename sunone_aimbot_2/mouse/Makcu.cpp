@@ -4,13 +4,14 @@
 #include <iostream>
 
 #include "Makcu.h"
-#include "sunone_aimbot_2.h"
 
 MakcuConnection::MakcuConnection(const std::string& port, unsigned int baud_rate)
     : is_open_(false)
-    , aiming_active(false)
-    , shooting_active(false)
-    , zooming_active(false)
+    , left_active(false)
+    , right_active(false)
+    , middle_active(false)
+    , side1_active(false)
+    , side2_active(false)
 {
     try
     {
@@ -135,30 +136,26 @@ void MakcuConnection::onButtonCallback(makcu::MouseButton button, bool pressed)
 {
     switch (button)
     {
+    // Physical button states only; which button means what is decided by the
+    // configured hotkeys (button_targeting / button_shoot / button_zoom).
     case makcu::MouseButton::LEFT:
-        // LMB = shooting
-        shooting_active = pressed;
-        shooting.store(pressed);
+        left_active = pressed;
         break;
 
     case makcu::MouseButton::RIGHT:
-        // RMB = zooming
-        zooming_active = pressed;
-        zooming.store(pressed);
+        right_active = pressed;
         break;
 
     case makcu::MouseButton::MIDDLE:
-        // MMB - not used for now
+        middle_active = pressed;
         break;
 
     case makcu::MouseButton::SIDE1:
-        // Mouse4 (side button 1) - not used
+        side1_active = pressed;
         break;
 
     case makcu::MouseButton::SIDE2:
-        // Mouse5 (side button 2) = aiming
-        aiming_active = pressed;
-        aiming.store(pressed);
+        side2_active = pressed;
         break;
     }
 }

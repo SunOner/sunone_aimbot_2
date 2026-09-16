@@ -20,9 +20,13 @@ public:
     void release(int button);
     void move(int x, int y);
 
-    bool aiming_active;
-    bool shooting_active;
-    bool zooming_active;
+    // Physical button states reported by the device (written by the SDK listener thread).
+    // Which button means what is decided by the configured hotkeys in the adapter.
+    std::atomic<bool> left_active;
+    std::atomic<bool> right_active;
+    std::atomic<bool> middle_active;
+    std::atomic<bool> side1_active;
+    std::atomic<bool> side2_active;
 
 private:
     void onButtonCallback(makcu::MouseButton button, bool pressed);

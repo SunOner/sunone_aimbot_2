@@ -147,6 +147,7 @@ bool Config::loadConfig(const std::string& filename)
         // makcu
         makcu_baudrate = 115200;
         makcu_port = "COM0";
+        makcu_enable_keys = false;
 
         // Mouse shooting
         auto_shoot = false;
@@ -473,6 +474,7 @@ bool Config::loadConfig(const std::string& filename)
     // makcu
     makcu_baudrate = get_long("makcu_baudrate", 115200);
     makcu_port = get_string("makcu_port", "COM0");
+    makcu_enable_keys = get_bool("makcu_enable_keys", false);
 
     // Mouse shooting
     auto_shoot = get_bool("auto_shoot", false);
@@ -772,7 +774,8 @@ bool Config::saveConfig(const std::string& filename)
     // makcu
     file << "# Makcu\n"
         << "makcu_baudrate = " << makcu_baudrate << "\n"
-		<< "makcu_port = " << makcu_port << "\n\n";
+        << "makcu_port = " << makcu_port << "\n"
+        << "makcu_enable_keys = " << (makcu_enable_keys ? "true" : "false") << "\n\n";
 
     // Mouse shooting
     file << "# Mouse shooting\n"
