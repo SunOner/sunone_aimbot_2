@@ -14,27 +14,29 @@
 
 #include "mouse.h"
 #include "capture.h"
-#include "sunone_aimbot_2.h"
+#include "config.h"
+#include "detection_buffer.h"
+#include "runtime/input_state.h"
 
 namespace
 {
-aim::AimKalmanSettings buildKalmanSettingsFromConfigUnlocked()
+aim::AimKalmanSettings buildKalmanSettings(const Config& snapshot)
 {
     aim::AimKalmanSettings settings;
-    settings.enabled = config.kalman_enabled;
-    settings.process_noise_position = static_cast<double>(config.kalman_process_noise_position);
-    settings.process_noise_velocity = static_cast<double>(config.kalman_process_noise_velocity);
-    settings.measurement_noise = static_cast<double>(config.kalman_measurement_noise);
-    settings.velocity_damping = static_cast<double>(config.kalman_velocity_damping);
-    settings.max_velocity = static_cast<double>(config.kalman_max_velocity);
-    settings.warmup_frames = config.kalman_warmup_frames;
+    settings.enabled = snapshot.kalman_enabled;
+    settings.process_noise_position = static_cast<double>(snapshot.kalman_process_noise_position);
+    settings.process_noise_velocity = static_cast<double>(snapshot.kalman_process_noise_velocity);
+    settings.measurement_noise = static_cast<double>(snapshot.kalman_measurement_noise);
+    settings.velocity_damping = static_cast<double>(snapshot.kalman_velocity_damping);
+    settings.max_velocity = static_cast<double>(snapshot.kalman_max_velocity);
+    settings.warmup_frames = snapshot.kalman_warmup_frames;
     return settings;
 }
 
 aim::AimKalmanSettings buildKalmanSettingsFromConfig()
 {
     std::lock_guard<std::mutex> lock(configMutex);
-    return buildKalmanSettingsFromConfigUnlocked();
+    return buildKalmanSettings(config);
 }
 
 double currentFrameIntervalSec()
@@ -99,48 +101,76 @@ MouseThread::MouseThread(
     lastPredictionLookaheadSec = 0.0;
     lastDetectionDelaySec = 0.0;
 
+    detectionGeneration = detectionBuffer.currentGeneration();
     moveWorker = std::thread(&MouseThread::moveWorkerLoop, this);
 }
 
-void MouseThread::updateConfig(
-    int resolution,
-    int fovX,
-    int fovY,
-    double minSpeedMultiplier,
-    double maxSpeedMultiplier,
-    double predictionInterval,
-    bool auto_shoot,
-    float bScope_multiplier
-)
+void MouseThread::updateConfig(const Config& snapshot)
 {
-    screen_width = screen_height = resolution;
-    fov_x = fovX;  fov_y = fovY;
-    min_speed_multiplier = minSpeedMultiplier;
-    max_speed_multiplier = maxSpeedMultiplier;
-    prediction_interval = predictionInterval;
-    this->auto_shoot = auto_shoot;
-    this->bScope_multiplier = bScope_multiplier;
+    std::lock_guard<std::mutex> lock(pendingConfigMutex);
+    pendingConfig = snapshot;
+}
 
+bool MouseThread::applyPendingConfig()
+{
+    std::optional<Config> snapshot;
+    {
+        std::lock_guard<std::mutex> lock(pendingConfigMutex);
+        snapshot.swap(pendingConfig);
+    }
+    if (!snapshot)
+        return false;
+
+    // Wait for dispatch and invalidate popped commands before changing the
+    // geometry also read by the worker's motion compensation/debug code.
+    resetPrediction();
+    if (!snapshot->auto_shoot)
+        releaseMouse();
+
+    const int resolution = snapshot->detection_resolution;
+    screen_width = screen_height = resolution;
+    fov_x = snapshot->fovX;
+    fov_y = snapshot->fovY;
+    min_speed_multiplier = snapshot->minSpeedMultiplier;
+    max_speed_multiplier = snapshot->maxSpeedMultiplier;
+    prediction_interval = snapshot->predictionInterval;
+    auto_shoot = snapshot->auto_shoot;
+    bScope_multiplier = snapshot->bScope_multiplier;
     center_x = center_y = resolution / 2.0;
     max_distance = std::hypot(resolution, resolution) / 2.0;
-
-    wind_mouse_enabled = config.wind_mouse_enabled;
-    wind_G = config.wind_G; wind_W = config.wind_W;
-    wind_M = config.wind_M; wind_D = config.wind_D;
-    resetWindState();
+    wind_mouse_enabled = snapshot->wind_mouse_enabled;
+    wind_G = snapshot->wind_G;
+    wind_W = snapshot->wind_W;
+    wind_M = snapshot->wind_M;
+    wind_D = snapshot->wind_D;
     clearWindDebugTrail();
-    targetKalman.setSettings(buildKalmanSettingsFromConfigUnlocked());
-    targetKalman.reset();
-    lastKalmanTelemetry = {};
-    lastPredictionLookaheadSec = 0.0;
-    lastDetectionDelaySec = 0.0;
+    targetKalman.setSettings(buildKalmanSettings(*snapshot));
+    return true;
 }
 
 MouseThread::~MouseThread()
 {
-    workerStop = true;
+    stop();
+}
+
+void MouseThread::requestStop()
+{
+    {
+        std::lock_guard<std::mutex> lock(queueMtx);
+        workerStop = true;
+        ++queueGeneration;
+        while (!moveQueue.empty())
+            moveQueue.pop();
+    }
     queueCv.notify_all();
-    if (moveWorker.joinable()) moveWorker.join();
+}
+
+void MouseThread::stop()
+{
+    requestStop();
+    if (moveWorker.joinable())
+        moveWorker.join();
+    setMouseInput(nullptr);
 }
 
 void MouseThread::queueMove(int dx, int dy)
@@ -151,8 +181,10 @@ void MouseThread::queueMove(int dx, int dy)
     }
 
     std::lock_guard lg(queueMtx);
+    if (workerStop)
+        return;
     if (moveQueue.size() >= queueLimit) moveQueue.pop();
-    moveQueue.push({ dx,dy });
+    moveQueue.push({ dx, dy, detectionGeneration, queueGeneration });
     queueCv.notify_one();
 }
 
@@ -160,20 +192,24 @@ void MouseThread::moveWorkerLoop()
 {
     try
     {
-        while (!workerStop)
+        for (;;)
         {
             std::unique_lock ul(queueMtx);
             queueCv.wait(ul, [&] { return workerStop || !moveQueue.empty(); });
+            if (workerStop)
+                break;
 
-            while (!moveQueue.empty())
+            Move m = moveQueue.front();
+            moveQueue.pop();
+            ul.unlock();
+
+            std::lock_guard<std::mutex> dispatchLock(dispatchMutex);
             {
-                Move m = moveQueue.front();
-                moveQueue.pop();
-                ul.unlock();
-                sendMovementToDriver(m.dx, m.dy);
-                appendWindDebugStep(m.dx, m.dy);
-                ul.lock();
+                std::lock_guard<std::mutex> queueLock(queueMtx);
+                if (workerStop || m.queueGeneration != queueGeneration)
+                    continue;
             }
+            sendMovementToDriver(m.dx, m.dy, m.detectionGeneration);
         }
     }
     catch (const std::exception& e)
@@ -446,12 +482,10 @@ double MouseThread::currentDetectionDelaySec(double observationAgeSec) const
     }
     else
     {
-#ifdef USE_CUDA
-        detectionDelaySec = trt_detector.lastInferenceTime.count() * 0.001;
-#else
-        if (dml_detector)
-            detectionDelaySec = dml_detector->lastInferenceTimeDML.count() * 0.001;
-#endif
+        // Last measured observation age belongs to this mouse loop. Reading
+        // mutable timing fields owned by an inference thread would race.
+        if (lastDetectionDelaySec > 0.0)
+            detectionDelaySec = lastDetectionDelaySec;
     }
     if (!std::isfinite(detectionDelaySec))
         detectionDelaySec = 0.05;
@@ -532,33 +566,33 @@ std::pair<double, double> MouseThread::predict_target_position(
     return { predictedX, predictedY };
 }
 
-void MouseThread::sendMovementToDriver(int dx, int dy)
+void MouseThread::sendMovementToDriver(int dx, int dy, std::uint64_t generation)
 {
     if (dx == 0 && dy == 0)
     {
         return;
     }
 
-    {
+    bool sent = false;
+    detectionBuffer.withCurrentGeneration(generation, [&] {
         std::lock_guard<std::mutex> lock(inputDevicesMutex);
 
-        if (!mouseInput)
-        {
+        if (workerStop || !mouseInput)
             return;
-        }
 
-        if (!mouseInput->move(dx, dy))
-        {
-            return;
-        }
+        sent = mouseInput->move(dx, dy);
+    });
+
+    if (sent)
+    {
+        recordMotionCompensationStep(dx, dy);
+        appendWindDebugStep(dx, dy);
     }
-
-    recordMotionCompensationStep(dx, dy);
 }
 
 void MouseThread::moveRelative(int dx, int dy)
 {
-    sendMovementToDriver(dx, dy);
+    sendMovementToDriver(dx, dy, detectionGeneration);
 }
 
 std::pair<double, double> MouseThread::calc_movement(double tx, double ty)
@@ -682,25 +716,26 @@ void MouseThread::moveMousePivot(
 
 void MouseThread::clearQueuedMoves()
 {
+    std::lock_guard<std::mutex> dispatchLock(dispatchMutex);
     std::lock_guard<std::mutex> lock(queueMtx);
-    std::queue<Move> empty;
-    moveQueue.swap(empty);
+    ++queueGeneration;
+    while (!moveQueue.empty())
+        moveQueue.pop();
     resetWindState();
 }
 
 void MouseThread::pressMouse(const AimbotTarget& target)
 {
+    if (!auto_shoot || workerStop)
+        return;
     bool bScope = check_target_in_scope(target.x, target.y, target.w, target.h, bScope_multiplier);
     if (bScope && !mouse_pressed)
     {
-        std::lock_guard<std::mutex> lock(inputDevicesMutex);
-        if (!mouseInput)
-        {
-            return;
-        }
-
-        if (mouseInput->leftDown())
-            mouse_pressed = true;
+        detectionBuffer.withCurrentGeneration(detectionGeneration, [&] {
+            std::lock_guard<std::mutex> lock(inputDevicesMutex);
+            if (!workerStop && mouseInput && mouseInput->leftDown())
+                mouse_pressed = true;
+        });
     }
     else if (!bScope && mouse_pressed)
     {
@@ -857,6 +892,20 @@ std::vector<std::pair<double, double>> MouseThread::getWindDebugTrail()
 
 void MouseThread::setMouseInput(IMouseInput* newMouseInput)
 {
+    clearQueuedMoves();
     std::lock_guard<std::mutex> lock(inputDevicesMutex);
+    if (mouseInput != newMouseInput && mouse_pressed)
+    {
+        try
+        {
+            if (mouseInput)
+                mouseInput->leftUp();
+        }
+        catch (...)
+        {
+            std::cerr << "[Mouse] Failed to release the old input device." << std::endl;
+        }
+        mouse_pressed = false;
+    }
     mouseInput = newMouseInput;
 }

@@ -10,7 +10,9 @@
 
 #include "capture.h"
 #include "mouse.h"
-#include "sunone_aimbot_2.h"
+#include "config.h"
+#include "detection_buffer.h"
+#include "runtime/input_state.h"
 #include "runtime/thread_loops.h"
 
 namespace
@@ -78,6 +80,12 @@ void handleEasyNoRecoil(MouseThread& mouseThread)
 
 void mouseThreadFunction(MouseThread& mouseThread)
 {
+    struct StopOnExit
+    {
+        MouseThread& mouse;
+        ~StopOnExit() { mouse.stop(); }
+    } stopOnExit{ mouseThread };
+
     int lastVersion = -1;
     std::vector<cv::Rect> boxes;
     std::vector<int> classes;
@@ -89,6 +97,7 @@ void mouseThreadFunction(MouseThread& mouseThread)
     bool wasAiming = false;
     int appliedDetectionResolution = -1;
     bool appliedTrackerEnabled = true;
+    std::uint64_t controlGeneration = detectionBuffer.currentGeneration();
     auto lastTrackerUpdate = std::chrono::steady_clock::time_point::min();
 
     auto resetActiveTarget = [&]() {
@@ -101,6 +110,9 @@ void mouseThreadFunction(MouseThread& mouseThread)
 
     while (!shouldExit)
     {
+        if (mouseThread.applyPendingConfig())
+            resetActiveTarget();
+
         bool hasNewDetection = false;
         bool hasAimObservation = false;
         int detectionResolution = 0;
@@ -108,6 +120,8 @@ void mouseThreadFunction(MouseThread& mouseThread)
         bool trackerEnabled = true;
         int predictionFuturePositions = 0;
         bool autoShoot = false;
+        bool pausedNow = false;
+        std::uint64_t observationGeneration = controlGeneration;
 
         {
             std::lock_guard<std::mutex> cfgLock(configMutex);
@@ -134,6 +148,9 @@ void mouseThreadFunction(MouseThread& mouseThread)
 
             if (shouldExit) break;
 
+            pausedNow = detectionBuffer.paused;
+            observationGeneration = detectionBuffer.generation;
+
             if (detectionBuffer.version > lastVersion)
             {
                 boxes = detectionBuffer.boxes;
@@ -142,6 +159,18 @@ void mouseThreadFunction(MouseThread& mouseThread)
                 lastVersion = detectionBuffer.version;
                 hasNewDetection = true;
             }
+        }
+
+        mouseThread.setDetectionGeneration(observationGeneration);
+        if (observationGeneration != controlGeneration)
+        {
+            controlGeneration = observationGeneration;
+            targetTracker.reset();
+            resetActiveTarget();
+            mouseThread.releaseMouse();
+            std::lock_guard<std::mutex> lk(g_trackerDebugMutex);
+            g_trackerDebugTracks.clear();
+            g_trackerLockedId = -1;
         }
 
         if (input_method_changed.exchange(false))
@@ -155,17 +184,9 @@ void mouseThreadFunction(MouseThread& mouseThread)
             {
                 std::lock_guard<std::mutex> cfgLock(configMutex);
                 appliedDetectionResolution = config.detection_resolution;
-                mouseThread.updateConfig(
-                    config.detection_resolution,
-                    config.fovX,
-                    config.fovY,
-                    config.minSpeedMultiplier,
-                    config.maxSpeedMultiplier,
-                    config.predictionInterval,
-                    config.auto_shoot,
-                    config.bScope_multiplier
-                );
+                mouseThread.updateConfig(config);
             }
+            mouseThread.applyPendingConfig();
             targetTracker.reset();
             {
                 std::lock_guard<std::mutex> lk(g_trackerDebugMutex);
@@ -173,6 +194,12 @@ void mouseThreadFunction(MouseThread& mouseThread)
                 g_trackerLockedId = -1;
             }
             resetActiveTarget();
+        }
+
+        if (pausedNow)
+        {
+            mouseThread.releaseMouse();
+            continue;
         }
 
         if (trackerEnabled != appliedTrackerEnabled)
@@ -311,18 +338,6 @@ void mouseThreadFunction(MouseThread& mouseThread)
             if (activeTarget && hasAimObservation)
             {
                 mouseThread.moveMousePivot(activeTarget->pivotX, activeTarget->pivotY, detectionTimestamp);
-
-                if (autoShoot)
-                {
-                    if (activeTargetObserved)
-                    {
-                        mouseThread.pressMouse(*activeTarget);
-                    }
-                    else
-                    {
-                        mouseThread.releaseMouse();
-                    }
-                }
             }
             else
             {
@@ -330,20 +345,19 @@ void mouseThreadFunction(MouseThread& mouseThread)
                 {
                     mouseThread.clearQueuedMoves();
                 }
-
-                if (autoShoot)
-                {
-                    mouseThread.releaseMouse();
-                }
             }
+
+            // Keep our press across polling timeouts while the observed target
+            // remains valid. Disabling auto-shoot always releases our button.
+            if (autoShoot && activeTarget && activeTargetObserved)
+                mouseThread.pressMouse(*activeTarget);
+            else
+                mouseThread.releaseMouse();
         }
         else
         {
             mouseThread.clearQueuedMoves();
-            if (autoShoot)
-            {
-                mouseThread.releaseMouse();
-            }
+            mouseThread.releaseMouse();
         }
 
         handleEasyNoRecoil(mouseThread);

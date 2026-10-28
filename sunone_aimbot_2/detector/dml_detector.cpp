@@ -27,7 +27,6 @@
 
 extern std::atomic<bool> detector_model_changed;
 extern std::atomic<bool> detection_resolution_changed;
-extern std::atomic<bool> detectionPaused;
 
 namespace
 {
@@ -833,19 +832,18 @@ void DirectMLDetector::processFrame(
     const cv::Mat& source_frame,
     std::chrono::steady_clock::time_point frameTimestamp)
 {
-    if (detectionPaused)
-    {
-        detectionBuffer.clear();
-        return;
-    }
-    std::unique_lock<std::mutex> lock(inferenceMutex);
-    currentFrame = detection_frame;
-    currentSourceFrame = source_frame.empty() ? detection_frame : source_frame;
-    currentFrameTimestamp = (frameTimestamp.time_since_epoch().count() != 0)
-        ? frameTimestamp
-        : std::chrono::steady_clock::now();
-    frameReady = true;
-    inferenceCV.notify_one();
+    const auto generation = detectionBuffer.currentGeneration();
+    detectionBuffer.withCurrentGeneration(generation, [&] {
+        std::unique_lock<std::mutex> lock(inferenceMutex);
+        currentFrame = detection_frame;
+        currentSourceFrame = source_frame.empty() ? detection_frame : source_frame;
+        currentFrameTimestamp = (frameTimestamp.time_since_epoch().count() != 0)
+            ? frameTimestamp
+            : std::chrono::steady_clock::now();
+        currentFrameGeneration = generation;
+        frameReady = true;
+        inferenceCV.notify_one();
+    });
 }
 
 void DirectMLDetector::dmlInferenceThread()
@@ -880,9 +878,8 @@ void DirectMLDetector::dmlInferenceThread()
                 continue;
             }
 
-            if (detectionPaused)
+            if (detectionBuffer.isPaused())
             {
-                detectionBuffer.clear();
                 std::this_thread::sleep_for(std::chrono::milliseconds(10));
                 continue;
             }
@@ -890,6 +887,7 @@ void DirectMLDetector::dmlInferenceThread()
             cv::Mat frame;
             cv::Mat sourceFrame;
             std::chrono::steady_clock::time_point frameTimestamp{};
+            std::uint64_t frameGeneration = 0;
             bool hasNewFrame = false;
             {
                 std::unique_lock<std::mutex> lock(inferenceMutex);
@@ -903,6 +901,7 @@ void DirectMLDetector::dmlInferenceThread()
                     frame = std::move(currentFrame);
                     sourceFrame = std::move(currentSourceFrame);
                     frameTimestamp = currentFrameTimestamp;
+                    frameGeneration = currentFrameGeneration;
                     frameReady = false;
                     hasNewFrame = true;
                 }
@@ -910,6 +909,8 @@ void DirectMLDetector::dmlInferenceThread()
 
             if (hasNewFrame && !frame.empty())
             {
+                if (!detectionBuffer.withCurrentGeneration(frameGeneration, [] {}))
+                    continue;
                 std::vector<cv::Mat> batchFrames = { frame };
                 auto detectionsBatch = detectBatch(batchFrames);
                 if (detectionsBatch.empty())
@@ -934,7 +935,8 @@ void DirectMLDetector::dmlInferenceThread()
                     confidences.push_back(d.confidence);
                 }
 
-                detectionBuffer.set(boxes, classes, confidences, frameTimestamp);
+                if (!detectionBuffer.setForGeneration(frameGeneration, boxes, classes, confidences, frameTimestamp))
+                    continue;
 
                 const cv::Mat& frameForCollection = sourceFrame.empty() ? frame : sourceFrame;
                 cvm::MaybeCollectDataSample(

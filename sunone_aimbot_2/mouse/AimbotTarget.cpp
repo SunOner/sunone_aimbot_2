@@ -1,5 +1,8 @@
 #define WIN32_LEAN_AND_MEAN
 #define _WINSOCKAPI_
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <winsock2.h>
 #include <Windows.h>
 
@@ -10,7 +13,7 @@
 #include <mutex>
 #include <opencv2/opencv.hpp>
 
-#include "sunone_aimbot_2.h"
+#include "runtime/input_state.h"
 #include "AimbotTarget.h"
 #include "config.h"
 

@@ -544,3 +544,38 @@ if(NOT AIMBOT_USE_CUDA)
     message(STATUS "DirectML package: ${AIMBOT_DIRECTML_DIR}")
 endif()
 message(STATUS "C++/WinRT include: ${AIMBOT_CPPWINRT_INCLUDE_DIR}")
+
+include(CTest)
+if(BUILD_TESTING)
+    # Exercise the real worker and control loop against fake input. This target
+    # is backend independent and does not initialize CUDA, ORT or capture.
+    add_executable(input_runtime_tests
+        "${CMAKE_SOURCE_DIR}/tests/input_runtime_tests.cpp"
+        "${SRC_DIR}/mouse/mouse.cpp"
+        "${SRC_DIR}/mouse/AimbotTarget.cpp"
+        "${SRC_DIR}/runtime/mouse_thread_loop.cpp"
+        "${SRC_DIR}/config/config.cpp"
+        "${SRC_DIR}/detector/detection_buffer.cpp"
+    )
+    target_include_directories(input_runtime_tests PRIVATE
+        "${SRC_DIR}"
+        "${SRC_DIR}/capture"
+        "${SRC_DIR}/config"
+        "${SRC_DIR}/detector"
+        "${SRC_DIR}/include"
+        "${SRC_DIR}/mouse"
+        "${AIMBOT_OPENCV_INCLUDE_DIR}"
+    )
+    target_compile_definitions(input_runtime_tests PRIVATE UNICODE _UNICODE _CONSOLE)
+    target_link_libraries(input_runtime_tests PRIVATE "${AIMBOT_OPENCV_LIBRARY}")
+    if(MSVC)
+        set_target_properties(input_runtime_tests PROPERTIES
+            MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+        target_compile_options(input_runtime_tests PRIVATE /W3 /sdl /permissive- /EHsc)
+    endif()
+    # Both executables use the same runtime directory. Let ai stage its DLLs
+    # first instead of concurrently copying the same OpenCV DLL twice.
+    add_dependencies(input_runtime_tests ai)
+    add_test(NAME input_runtime_regressions COMMAND input_runtime_tests)
+    set_tests_properties(input_runtime_regressions PROPERTIES TIMEOUT 30)
+endif()

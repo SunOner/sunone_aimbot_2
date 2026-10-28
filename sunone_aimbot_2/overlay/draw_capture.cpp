@@ -101,15 +101,7 @@ void draw_capture_settings()
                 detection_resolution_changed.store(true);
                 detector_model_changed.store(true);
 
-                globalMouseThread->updateConfig(
-                    config.detection_resolution,
-                    config.fovX,
-                    config.fovY,
-                    config.minSpeedMultiplier,
-                    config.maxSpeedMultiplier,
-                    config.predictionInterval,
-                    config.auto_shoot,
-                    config.bScope_multiplier);
+                globalMouseThread->updateConfig(config);
                 OverlayConfig_MarkDirty();
             }
             OverlayUI::EndSettingRow(row);

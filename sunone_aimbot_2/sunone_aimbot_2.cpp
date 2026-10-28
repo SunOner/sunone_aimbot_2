@@ -44,7 +44,6 @@
 std::condition_variable frameCV;
 std::atomic<bool> shouldExit(false);
 std::atomic<bool> aiming(false);
-std::atomic<bool> detectionPaused(false);
 std::mutex configMutex;
 std::mutex inputDevicesMutex;
 
@@ -465,6 +464,9 @@ int main(int argc, char** argv)
 
         mouseMovThread.join();
         overlayThread.join();
+
+        mouseThread.stop();
+        globalMouseThread = nullptr;
 
         {
             std::lock_guard<std::mutex> deviceLock(inputDevicesMutex);

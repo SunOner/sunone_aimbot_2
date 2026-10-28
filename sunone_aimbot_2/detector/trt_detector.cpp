@@ -30,7 +30,6 @@
 #include "capture/circle_fov.h"
 #include "scr/data_collector.h"
 
-extern std::atomic<bool> detectionPaused;
 int model_quant;
 std::vector<float> outputData;
 
@@ -632,44 +631,40 @@ void TrtDetector::processFrame(
     const cv::Mat& source_frame,
     std::chrono::steady_clock::time_point frameTimestamp)
 {
-    if (detectionPaused)
-    {
-        detectionBuffer.clear();
-        return;
-    }
-
-    std::unique_lock<std::mutex> lock(inferenceMutex);
-    currentFrame = detection_frame;
-    currentSourceFrame = source_frame.empty() ? detection_frame : source_frame;
-    currentFrameGpu.release();
-    currentFrameTimestamp = (frameTimestamp.time_since_epoch().count() != 0)
-        ? frameTimestamp
-        : std::chrono::steady_clock::now();
-    pendingFrameType = PendingFrameType::Cpu;
-    frameReady = true;
-    inferenceCV.notify_one();
+    const auto generation = detectionBuffer.currentGeneration();
+    detectionBuffer.withCurrentGeneration(generation, [&] {
+        std::unique_lock<std::mutex> lock(inferenceMutex);
+        currentFrame = detection_frame;
+        currentSourceFrame = source_frame.empty() ? detection_frame : source_frame;
+        currentFrameGpu.release();
+        currentFrameTimestamp = (frameTimestamp.time_since_epoch().count() != 0)
+            ? frameTimestamp
+            : std::chrono::steady_clock::now();
+        currentFrameGeneration = generation;
+        pendingFrameType = PendingFrameType::Cpu;
+        frameReady = true;
+        inferenceCV.notify_one();
+    });
 }
 
 void TrtDetector::processFrameGpu(
     const cv::cuda::GpuMat& frame,
     std::chrono::steady_clock::time_point frameTimestamp)
 {
-    if (detectionPaused)
-    {
-        detectionBuffer.clear();
-        return;
-    }
-
-    std::unique_lock<std::mutex> lock(inferenceMutex);
-    currentFrame.release();
-    currentSourceFrame.release();
-    currentFrameGpu = frame;
-    currentFrameTimestamp = (frameTimestamp.time_since_epoch().count() != 0)
-        ? frameTimestamp
-        : std::chrono::steady_clock::now();
-    pendingFrameType = PendingFrameType::Gpu;
-    frameReady = true;
-    inferenceCV.notify_one();
+    const auto generation = detectionBuffer.currentGeneration();
+    detectionBuffer.withCurrentGeneration(generation, [&] {
+        std::unique_lock<std::mutex> lock(inferenceMutex);
+        currentFrame.release();
+        currentSourceFrame.release();
+        currentFrameGpu = frame;
+        currentFrameTimestamp = (frameTimestamp.time_since_epoch().count() != 0)
+            ? frameTimestamp
+            : std::chrono::steady_clock::now();
+        currentFrameGeneration = generation;
+        pendingFrameType = PendingFrameType::Gpu;
+        frameReady = true;
+        inferenceCV.notify_one();
+    });
 }
 
 std::vector<Detection> TrtDetector::detect(const cv::Mat& frame)
@@ -817,6 +812,7 @@ void TrtDetector::inferenceThread()
         cv::Mat sourceFrame;
         cv::cuda::GpuMat frameGpu;
         std::chrono::steady_clock::time_point frameTimestamp{};
+        std::uint64_t frameGeneration = 0;
         PendingFrameType frameType = PendingFrameType::None;
         bool hasNewFrame = false;
 
@@ -831,6 +827,7 @@ void TrtDetector::inferenceThread()
             {
                 frameType = pendingFrameType;
                 frameTimestamp = currentFrameTimestamp;
+                frameGeneration = currentFrameGeneration;
                 if (frameType == PendingFrameType::Gpu)
                 {
                     frameGpu = currentFrameGpu;
@@ -867,6 +864,8 @@ void TrtDetector::inferenceThread()
 
         if (hasNewFrame)
         {
+            if (!detectionBuffer.withCurrentGeneration(frameGeneration, [] {}))
+                continue;
             const bool hasCpuFrame = (frameType == PendingFrameType::Cpu && !frame.empty());
             const bool hasGpuFrame = (frameType == PendingFrameType::Gpu && !frameGpu.empty());
             if (!hasCpuFrame && !hasGpuFrame)
@@ -960,7 +959,8 @@ void TrtDetector::inferenceThread()
                     confidences.push_back(det.confidence);
                 }
 
-                detectionBuffer.set(boxes, classes, confidences, frameTimestamp);
+                if (!detectionBuffer.setForGeneration(frameGeneration, boxes, classes, confidences, frameTimestamp))
+                    continue;
 
                 if (hasGpuFrame)
                 {

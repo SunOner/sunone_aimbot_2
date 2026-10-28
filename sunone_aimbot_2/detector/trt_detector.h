@@ -14,6 +14,7 @@
 #include <memory>
 #include <thread>
 #include <chrono>
+#include <cstdint>
 #include <functional>
 #include <cuda_runtime_api.h>
 
@@ -75,6 +76,7 @@ private:
     cv::Mat currentSourceFrame;
     cv::cuda::GpuMat currentFrameGpu;
     std::chrono::steady_clock::time_point currentFrameTimestamp{};
+    std::uint64_t currentFrameGeneration = 0;
     bool frameReady;
 
     enum class PendingFrameType

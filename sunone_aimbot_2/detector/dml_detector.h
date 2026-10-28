@@ -7,6 +7,7 @@
 #include <condition_variable>
 #include <mutex>
 #include <chrono>
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -69,6 +70,7 @@ private:
     cv::Mat currentFrame;
     cv::Mat currentSourceFrame;
     std::chrono::steady_clock::time_point currentFrameTimestamp{};
+    std::uint64_t currentFrameGeneration = 0;
     bool frameReady = false;
 
     bool initializeModel(const std::string& model_path);

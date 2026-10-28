@@ -21,7 +21,6 @@ extern std::atomic<bool> shouldExit;
 extern std::atomic<bool> aiming;
 extern std::atomic<bool> shooting;
 extern std::atomic<bool> zooming;
-extern std::atomic<bool> detectionPaused;
 extern std::atomic<bool> detector_model_changed;
 
 extern MouseThread* globalMouseThread;
@@ -186,7 +185,7 @@ void keyboardListener()
         {
             if (!pausePressed)
             {
-                detectionPaused = !detectionPaused;
+                detectionBuffer.togglePaused();
                 pausePressed = true;
             }
         }
@@ -259,16 +258,7 @@ void keyboardListener()
 
                     if (globalMouseThread)
                     {
-                        globalMouseThread->updateConfig(
-                            config.detection_resolution,
-                            config.fovX,
-                            config.fovY,
-                            config.minSpeedMultiplier,
-                            config.maxSpeedMultiplier,
-                            config.predictionInterval,
-                            config.auto_shoot,
-                            config.bScope_multiplier
-                        );
+                        globalMouseThread->updateConfig(config);
                     }
                 }
                 reloadPressed = true;
