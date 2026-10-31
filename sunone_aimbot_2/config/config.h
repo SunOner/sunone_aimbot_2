@@ -13,6 +13,7 @@ public:
     std::string capture_method; // "duplication_api", "winrt", "virtual_camera", "udp_capture"
     std::string capture_target;
     std::string capture_window_title;
+    std::string capture_monitor_device; // Runtime monitor identity owned by the graph.
     std::string udp_ip;
     int udp_port;
     int detection_resolution;
@@ -151,6 +152,7 @@ public:
     // Overlay
     int overlay_opacity;
     float overlay_ui_scale;
+    bool overlay_sidebar_collapsed = false;
     bool overlay_exclude_from_capture;
     int overlay_x;
     int overlay_y;

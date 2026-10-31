@@ -6,6 +6,7 @@
 #include <opencv2/opencv.hpp>
 #include <memory>
 #include <cstdint>
+#include <string>
 
 #ifdef USE_CUDA
 #include <cuda_runtime_api.h>
@@ -45,7 +46,7 @@ class DDAManager;
 class DuplicationAPIScreenCapture : public IScreenCapture
 {
 public:
-    DuplicationAPIScreenCapture(int desiredWidth, int desiredHeight, int monitorIndex);
+    DuplicationAPIScreenCapture(int desiredWidth, int desiredHeight, int monitorIndex,const std::string& monitorDevice={});
     ~DuplicationAPIScreenCapture();
 
     cv::Mat GetNextFrameCpu() override;

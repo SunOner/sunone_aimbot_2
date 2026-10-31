@@ -3,17 +3,23 @@
 #include <Windows.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
+#include <cmath>
 #include <memory>
+#include <limits>
 #include <optional>
+#include <unordered_map>
 #include <vector>
 
 #include "capture.h"
 #include "mouse.h"
+#include "AimbotTarget.h"
 #include "config.h"
 #include "detection_buffer.h"
 #include "runtime/input_state.h"
 #include "runtime/thread_loops.h"
+#include "nodes/node_graph.h"
 
 namespace
 {
@@ -24,26 +30,16 @@ constexpr int kPredictedOnlyMoveStalePadMs = 16;
 
 double trackerFrameIntervalSec(int captureFpsValue)
 {
-    const double fps = std::clamp(
-        static_cast<double>((captureFpsValue > 0) ? captureFpsValue : 60),
-        15.0,
-        500.0);
-    return 1.0 / fps;
+    return 1.0 / std::clamp(
+        static_cast<double>((captureFpsValue > 0) ? captureFpsValue : 60), 15.0, 500.0);
 }
 
 bool allowPredictedOnlyMove(
-    int activeTrackId,
-    bool hasActiveTarget,
-    const LockedTargetInfo& lockInfo,
-    int captureFpsValue)
+    int activeTrackId, bool hasActiveTarget,
+    const LockedTargetInfo& lockInfo, int captureFpsValue)
 {
-    if (activeTrackId != lockInfo.trackId ||
-        !hasActiveTarget ||
-        lockInfo.missedFrames <= 0)
-    {
+    if (activeTrackId != lockInfo.trackId || !hasActiveTarget || lockInfo.missedFrames <= 0)
         return false;
-    }
-
     const double frameDtSec = trackerFrameIntervalSec(captureFpsValue);
     const double missedSec = static_cast<double>(lockInfo.missedFrames) * frameDtSec;
     return missedSec <= kPredictedOnlyMoveGraceSec + frameDtSec * 0.51;
@@ -51,113 +47,111 @@ bool allowPredictedOnlyMove(
 
 int trackerStaleTimeoutMs(int captureFpsValue)
 {
-    const int fps = std::max(1, captureFpsValue);
-    const int frameBasedMs = 2000 / fps;
-    const int graceBasedMs =
-        static_cast<int>(kPredictedOnlyMoveGraceSec * 1000.0 + 0.5) +
+    const int frameBasedMs = 2000 / std::max(1, captureFpsValue);
+    const int graceBasedMs = static_cast<int>(kPredictedOnlyMoveGraceSec * 1000.0 + 0.5) +
         kPredictedOnlyMoveStalePadMs;
     return std::clamp(std::max(frameBasedMs, graceBasedMs), 25, 180);
 }
+
+struct SelectionState
+{
+    MultiTargetTracker tracker;
+    std::optional<AimbotTarget> target;
+    int trackId = -1;
+    std::int64_t version = -1;
+    bool observed = false;
+    bool moveEligible = false;
+    double confidence = 0.0;
+    double velocityX = 0.0, velocityY = 0.0;
+    int missedFrames = 0;
+    std::chrono::steady_clock::time_point updatedAt{};
+};
 }
 
 void createInputDevices();
 void assignInputDevices();
-void handleEasyNoRecoil(MouseThread& mouseThread)
-{
-    bool easyNoRecoil = false;
-    int recoil_compensation = 0;
-    {
-        std::lock_guard<std::mutex> cfgLock(configMutex);
-        easyNoRecoil = config.easynorecoil;
-        recoil_compensation = static_cast<int>(config.easynorecoilstrength);
-    }
-
-    if (easyNoRecoil && shooting.load() && zooming.load())
-    {
-        mouseThread.moveRelative(0, recoil_compensation);
-    }
-}
 
 void mouseThreadFunction(MouseThread& mouseThread)
 {
     struct StopOnExit
     {
         MouseThread& mouse;
-        ~StopOnExit() { mouse.stop(); }
+        ~StopOnExit() { graphAimActive = false; mouse.stop(); }
     } stopOnExit{ mouseThread };
 
     int lastVersion = -1;
-    std::vector<cv::Rect> boxes;
-    std::vector<int> classes;
+    const auto runtimeStartedAt = std::chrono::steady_clock::now();
+    NodeGraph::DetectionStream detections;
     std::chrono::steady_clock::time_point detectionTimestamp{};
-    MultiTargetTracker targetTracker;
-    std::optional<AimbotTarget> activeTarget;
-    int activeTrackId = -1;
-    bool activeTargetObserved = false;
-    bool wasAiming = false;
+    auto lastDetectionArrival = std::chrono::steady_clock::time_point::min();
+    // Selection is state owned by Target Selection nodes. No tracker or target
+    // algorithm executes unless an evaluated graph requests its selection mode.
+    std::unordered_map<int, SelectionState> selectionStates;
     int appliedDetectionResolution = -1;
-    bool appliedTrackerEnabled = true;
     std::uint64_t controlGeneration = detectionBuffer.currentGeneration();
-    auto lastTrackerUpdate = std::chrono::steady_clock::time_point::min();
+    std::uint64_t graphRevision = 0;
+    struct PredictionCache { NodeGraph::Point input; NodeGraph::Point output; };
+    std::unordered_map<int, PredictionCache> predictionCache;
+    std::unordered_map<int, NodeGraph::Movement> windCache;
+    bool inputWasCaptured = false;
 
-    auto resetActiveTarget = [&]() {
-        activeTarget.reset();
-        activeTrackId = -1;
-        activeTargetObserved = false;
+    auto resetSelections = [&]() {
+        selectionStates.clear();
+        predictionCache.clear();
+        windCache.clear();
         mouseThread.clearFuturePositions();
         mouseThread.resetPrediction();
+        std::lock_guard<std::mutex> lk(g_trackerDebugMutex);
+        g_trackerDebugTracks.clear();
+        g_trackerLockedId = -1;
     };
 
     while (!shouldExit)
     {
         if (mouseThread.applyPendingConfig())
-            resetActiveTarget();
+            resetSelections();
 
         bool hasNewDetection = false;
-        bool hasAimObservation = false;
         int detectionResolution = 0;
-        bool disableHeadshot = false;
-        bool trackerEnabled = true;
-        int predictionFuturePositions = 0;
-        bool autoShoot = false;
         bool pausedNow = false;
         std::uint64_t observationGeneration = controlGeneration;
 
         {
             std::lock_guard<std::mutex> cfgLock(configMutex);
             detectionResolution = config.detection_resolution;
-            disableHeadshot = config.disable_headshot;
-            trackerEnabled = config.tracker_enabled;
-            predictionFuturePositions = config.prediction_futurePositions;
-            autoShoot = config.auto_shoot;
         }
 
         const bool aimingNow = aiming.load();
-        if (aimingNow != wasAiming)
-        {
-            resetActiveTarget();
-            wasAiming = aimingNow;
-        }
 
         {
             std::unique_lock<std::mutex> lock(detectionBuffer.mutex);
             detectionBuffer.cv.wait_for(lock, std::chrono::milliseconds(1), [&] {
                 return detectionBuffer.version > lastVersion || shouldExit;
-                }
-            );
-
-            if (shouldExit) break;
-
+            });
+            if (shouldExit)
+                break;
             pausedNow = detectionBuffer.paused;
             observationGeneration = detectionBuffer.generation;
-
             if (detectionBuffer.version > lastVersion)
             {
-                boxes = detectionBuffer.boxes;
-                classes = detectionBuffer.classes;
                 detectionTimestamp = detectionBuffer.frameTimestamp;
                 lastVersion = detectionBuffer.version;
                 hasNewDetection = true;
+                lastDetectionArrival = std::chrono::steady_clock::now();
+                auto frame=std::make_shared<NodeGraph::DetectionFrame>();
+                frame->version=lastVersion;frame->generation=observationGeneration;frame->fresh=true;
+                frame->timestampSeconds=std::chrono::duration<double>(detectionTimestamp.time_since_epoch()).count();
+                frame->width=frame->height=detectionResolution;
+                const auto count=std::min(detectionBuffer.boxes.size(),detectionBuffer.classes.size());
+                frame->objects.reserve(count);
+                for(std::size_t i=0;i<count;++i)
+                {
+                    const auto& box=detectionBuffer.boxes[i];
+                    frame->objects.push_back({static_cast<double>(box.x),static_cast<double>(box.y),
+                        static_cast<double>(box.width),static_cast<double>(box.height),detectionBuffer.classes[i],
+                        i<detectionBuffer.confidences.size()?detectionBuffer.confidences[i]:0.0});
+                }
+                detections=std::move(frame);
             }
         }
 
@@ -165,12 +159,8 @@ void mouseThreadFunction(MouseThread& mouseThread)
         if (observationGeneration != controlGeneration)
         {
             controlGeneration = observationGeneration;
-            targetTracker.reset();
-            resetActiveTarget();
+            resetSelections();
             mouseThread.releaseMouse();
-            std::lock_guard<std::mutex> lk(g_trackerDebugMutex);
-            g_trackerDebugTracks.clear();
-            g_trackerLockedId = -1;
         }
 
         if (input_method_changed.exchange(false))
@@ -187,183 +177,222 @@ void mouseThreadFunction(MouseThread& mouseThread)
                 mouseThread.updateConfig(config);
             }
             mouseThread.applyPendingConfig();
-            targetTracker.reset();
-            {
-                std::lock_guard<std::mutex> lk(g_trackerDebugMutex);
-                g_trackerDebugTracks.clear();
-                g_trackerLockedId = -1;
-            }
-            resetActiveTarget();
+            resetSelections();
         }
 
-        if (pausedNow)
+        const auto requestedRevision = NodeGraph::service().revision();
+        if (requestedRevision != graphRevision)
         {
+            resetSelections();
+            mouseThread.releaseMouse();
+            graphRevision = requestedRevision;
+        }
+
+        const bool inputCaptured = editorInputCaptured.load();
+        if(inputCaptured!=inputWasCaptured)
+        {
+            resetSelections();
+            inputWasCaptured=inputCaptured;
+        }
+        if (pausedNow || inputCaptured)
+        {
+            graphAimActive = false;
+            NodeGraph::Context pausedContext;
+            pausedContext.inputCaptured = inputCaptured;
+            pausedContext.captureFps = captureFps.load();
+            NodeGraph::service().evaluate(pausedContext);
+            mouseThread.clearQueuedMoves();
             mouseThread.releaseMouse();
             continue;
         }
 
-        if (trackerEnabled != appliedTrackerEnabled)
-        {
-            appliedTrackerEnabled = trackerEnabled;
-            targetTracker.reset();
-            {
-                std::lock_guard<std::mutex> lk(g_trackerDebugMutex);
-                g_trackerDebugTracks.clear();
-                g_trackerLockedId = -1;
-            }
-            resetActiveTarget();
-        }
+        NodeGraph::Context context;
+        context.inputCaptured = editorInputCaptured.load();
+        context.inputCapturedNow = []{return editorInputCaptured.load();};
+        context.aimHeld = aimingNow;
+        context.shootHeld = shooting.load();
+        context.zoomHeld = zooming.load();
+        context.center = { detectionResolution * 0.5, detectionResolution * 0.5 };
+        context.captureFps = captureFps.load();
+        context.elapsedSeconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - runtimeStartedAt).count();
+        context.detectionsAvailable = lastVersion >= 0;
+        context.detections = detections;
 
-        if (hasNewDetection)
-        {
-            if (trackerEnabled)
+        context.selectTarget = [&](int nodeKey,const NodeGraph::DetectionStream& stream,bool lockTarget,const NodeGraph::Node& node) {
+            NodeGraph::TargetData selected;
+            if(!stream || stream->generation!=controlGeneration) return selected;
+            auto& state=selectionStates[nodeKey];
+            const int mode=node.kind==NodeGraph::NodeKind::TargetNearest?1:
+                node.kind==NodeGraph::NodeKind::TargetTracker?2:static_cast<int>(NodeGraph::parameter(node,"mode"));
+            TargetSelectionSettings settings;
+            settings.classPlayer=static_cast<int>(NodeGraph::parameter(node,"class_player"));
+            settings.classHead=static_cast<int>(NodeGraph::parameter(node,"class_head"));
+            settings.applyOffsets=NodeGraph::parameter(node,"legacy_offsets")!=0;
+            settings.bodyOffset=NodeGraph::parameter(node,"body_y_offset");
+            settings.headOffset=NodeGraph::parameter(node,"head_y_offset");
+            settings.filterClasses=NodeGraph::parameter(node,"filter_classes")!=0;
+            settings.preferHead=NodeGraph::parameter(node,"prefer_head")!=0;
+            settings.mergeHeadBody=NodeGraph::parameter(node,"merge_head_body")!=0;
+            settings.maxMissedFrames=static_cast<int>(NodeGraph::parameter(node,"max_missed_frames"));
+            const bool disableHeadshot=NodeGraph::parameter(node,"disable_headshot")!=0;
+            const auto now=std::chrono::steady_clock::now();
+            if(state.version!=stream->version)
             {
-                targetTracker.update(
-                    boxes,
-                    classes,
-                    detectionResolution,
-                    detectionResolution,
-                    disableHeadshot,
-                    aimingNow,
-                    detectionTimestamp
-                );
-                lastTrackerUpdate = std::chrono::steady_clock::now();
+                std::vector<cv::Rect> boxes;
+                std::vector<int> classes;
+                std::vector<float> confidences;
+                boxes.reserve(stream->objects.size());classes.reserve(stream->objects.size());confidences.reserve(stream->objects.size());
+                for(const auto& detection:stream->objects)
                 {
-                    std::lock_guard<std::mutex> lk(g_trackerDebugMutex);
-                    g_trackerDebugTracks = targetTracker.getDebugTracks();
-                    g_trackerLockedId = targetTracker.getLockedTrackId();
+                    boxes.emplace_back(static_cast<int>(std::lround(detection.x)),static_cast<int>(std::lround(detection.y)),
+                        static_cast<int>(std::lround(detection.width)),static_cast<int>(std::lround(detection.height)));
+                    classes.push_back(detection.classId);confidences.push_back(static_cast<float>(detection.confidence));
                 }
-
-                LockedTargetInfo lockInfo;
-                if (targetTracker.getLockedTarget(lockInfo))
+                state.version=stream->version;state.updatedAt=lastDetectionArrival;
+                const int previousTrackId=state.trackId;const bool hadTarget=state.target.has_value();
+                const auto observedAt=std::chrono::steady_clock::time_point(
+                    std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(stream->timestampSeconds)));
+                if(mode==2)
                 {
-                    const int previousActiveTrackId = activeTrackId;
-                    const bool hadActiveTarget = activeTarget.has_value();
-                    if (activeTrackId != -1 && activeTrackId != lockInfo.trackId)
+                    state.tracker.update(boxes,classes,static_cast<int>(stream->width),static_cast<int>(stream->height),
+                        disableHeadshot,lockTarget,settings,confidences,observedAt);
                     {
-                        mouseThread.resetPrediction();
-                        mouseThread.clearFuturePositions();
+                        std::lock_guard<std::mutex> lock(g_trackerDebugMutex);
+                        g_trackerDebugTracks=state.tracker.getDebugTracks();g_trackerLockedId=state.tracker.getLockedTrackId();
                     }
-
-                    activeTarget = lockInfo.target;
-                    activeTrackId = lockInfo.trackId;
-                    activeTargetObserved = lockInfo.observedThisFrame;
-                    mouseThread.setTargetDetected(true);
-
-                    if (lockInfo.observedThisFrame)
+                    LockedTargetInfo info;
+                    if(state.tracker.getLockedTarget(info))
                     {
-                        hasAimObservation = true;
-                        mouseThread.setLastTargetTime(std::chrono::steady_clock::now());
-
-                        auto futurePositions = mouseThread.predictFuturePositions(
-                            activeTarget->pivotX,
-                            activeTarget->pivotY,
-                            predictionFuturePositions
-                        );
-                        mouseThread.storeFuturePositions(futurePositions);
+                        state.target=info.target;state.trackId=info.trackId;state.observed=info.observedThisFrame;
+                        state.confidence=info.confidence;state.velocityX=info.velocityX;state.velocityY=info.velocityY;state.missedFrames=info.missedFrames;
+                        state.moveEligible=state.observed||allowPredictedOnlyMove(previousTrackId,hadTarget,info,captureFps.load());
                     }
-                    else if (allowPredictedOnlyMove(
-                        previousActiveTrackId,
-                        hadActiveTarget,
-                        lockInfo,
-                        captureFps.load()))
-                    {
-                        hasAimObservation = true;
-
-                        auto futurePositions = mouseThread.predictFuturePositions(
-                            activeTarget->pivotX,
-                            activeTarget->pivotY,
-                            predictionFuturePositions
-                        );
-                        mouseThread.storeFuturePositions(futurePositions);
-                    }
+                    else {state.target.reset();state.trackId=-1;state.observed=state.moveEligible=false;}
                 }
                 else
                 {
-                    resetActiveTarget();
+                    std::unique_ptr<AimbotTarget> nearest(sortTargets(boxes,classes,static_cast<int>(stream->width),static_cast<int>(stream->height),disableHeadshot,settings));
+                    state.target=nearest?std::optional<AimbotTarget>(*nearest):std::nullopt;
+                    state.trackId=-1;state.observed=state.moveEligible=nearest!=nullptr;
+                    state.velocityX=state.velocityY=0;state.missedFrames=0;state.confidence=0;
+                    if(nearest)
+                    {
+                        double closest=std::numeric_limits<double>::max();
+                        for(const auto& detection:stream->objects) if(detection.classId==nearest->classId)
+                        {
+                            const double offset=settings.applyOffsets?(detection.classId==settings.classHead?settings.headOffset:settings.bodyOffset):0.5;
+                            const double distance=std::hypot(detection.x+detection.width*0.5-nearest->pivotX,detection.y+detection.height*offset-nearest->pivotY);
+                            if(distance<closest){closest=distance;state.confidence=detection.confidence;}
+                        }
+                    }
                 }
             }
-            else
+            if(state.target&&now-state.updatedAt<=std::chrono::milliseconds(trackerStaleTimeoutMs(captureFps.load())))
             {
-                targetTracker.reset();
+                const auto& target=*state.target;
+                selected.point={target.pivotX,target.pivotY};
+                selected.x=target.x;selected.y=target.y;selected.width=target.w;selected.height=target.h;
+                selected.valid=state.observed||state.moveEligible;selected.observed=state.observed;
+                selected.fresh=hasNewDetection&&state.moveEligible;selected.classId=target.classId;
+                selected.confidence=state.confidence;selected.trackId=state.trackId;
+                selected.velocityX=state.velocityX;selected.velocityY=state.velocityY;
+                selected.missedFrames=state.missedFrames;
+                selected.ageSeconds=std::max(0.0,std::chrono::duration<double>(now-state.updatedAt).count());
+                selected.pointPrepared=settings.applyOffsets;
+                if(node.kind==NodeGraph::NodeKind::Target&&NodeGraph::parameter(node,"legacy_camera_compensation")!=0)
                 {
-                    std::lock_guard<std::mutex> lk(g_trackerDebugMutex);
-                    g_trackerDebugTracks.clear();
-                    g_trackerLockedId = -1;
-                }
-
-                std::unique_ptr<AimbotTarget> selected(
-                    sortTargets(
-                        boxes,
-                        classes,
-                        detectionResolution,
-                        detectionResolution,
-                        disableHeadshot));
-                lastTrackerUpdate = std::chrono::steady_clock::now();
-
-                if (selected)
-                {
-                    activeTarget = *selected;
-                    activeTrackId = -1;
-                    activeTargetObserved = true;
-                    hasAimObservation = true;
-                    mouseThread.setTargetDetected(true);
-                    mouseThread.setLastTargetTime(std::chrono::steady_clock::now());
-
-                    auto futurePositions = mouseThread.predictFuturePositions(
-                        activeTarget->pivotX,
-                        activeTarget->pivotY,
-                        predictionFuturePositions
-                    );
-                    mouseThread.storeFuturePositions(futurePositions);
-                }
-                else
-                {
-                    resetActiveTarget();
+                    const auto delta=mouseThread.getMotionCompensationSince(detectionTimestamp);
+                    selected.point.x-=delta.first;selected.point.y-=delta.second;
                 }
             }
-        }
+            else if(state.target){state.target.reset();state.trackId=-1;state.observed=state.moveEligible=false;}
+            return selected;
+        };
+        context.inScope = [&](const NodeGraph::TargetData& target,double multiplier) {
+            return target.valid&&target.observed&&mouseThread.check_target_in_scope(target.x,target.y,target.width,target.height,multiplier);
+        };
+        context.predict = [&](int nodeKey,NodeGraph::Point point,const NodeGraph::Node& node,double lookahead,bool reset) {
+            if(hasNewDetection)
+            {
+                auto predicted=mouseThread.graphPredict(nodeKey,point.x,point.y,detectionTimestamp,node,lookahead,reset);
+                predictionCache[nodeKey]={point,{predicted.first,predicted.second}};
+                if(NodeGraph::parameter(node,"draw_futurePositions")!=0)
+                    mouseThread.storeFuturePositions(mouseThread.graphFuturePositions(nodeKey,static_cast<int>(NodeGraph::parameter(node,"prediction_futurePositions"))));
+            }
+            else if(reset)
+            {
+                predictionCache.erase(nodeKey);
+                mouseThread.graphPredict(nodeKey,point.x,point.y,detectionTimestamp,node,lookahead,true);
+            }
+            const auto found=predictionCache.find(nodeKey);
+            return found==predictionCache.end()?point:NodeGraph::Point{
+                point.x+found->second.output.x-found->second.input.x,
+                point.y+found->second.output.y-found->second.input.y};
+        };
+        context.speedCurve = [&](NodeGraph::Point point,const NodeGraph::Node& node) {
+            return mouseThread.graphSpeedCurve(point.x,point.y,node);
+        };
+        context.mouseDelta = [&](NodeGraph::Point point,double speed,NodeGraph::Point center,const NodeGraph::Node& node) {
+            return mouseThread.graphMouseDelta(point.x,point.y,speed,center,node);
+        };
+        context.windMotion = [&](int nodeKey,const NodeGraph::Movement& movement,const NodeGraph::Node& node) {
+            if(hasNewDetection)windCache[nodeKey]=mouseThread.graphWindMotion(nodeKey,movement,node);
+            const auto found=windCache.find(nodeKey);
+            return found==windCache.end()?NodeGraph::Movement{}:found->second;
+        };
+        context.motionCompensation = [&](NodeGraph::Point point) {
+            const auto delta=mouseThread.getMotionCompensationSince(detectionTimestamp);
+            return NodeGraph::Point{point.x-delta.first,point.y-delta.second};
+        };
+        context.keyDown = [](int virtualKey) {return !editorInputCaptured.load()&&virtualKey>0&&virtualKey<256&&(GetAsyncKeyState(virtualKey)&0x8000)!=0;};
 
-        if (activeTarget)
+        const auto actions = NodeGraph::service().evaluate(context);
+        if(editorInputCaptured.load())
         {
-            const int staleMs = trackerStaleTimeoutMs(captureFps.load());
-            if (std::chrono::steady_clock::now() - lastTrackerUpdate > std::chrono::milliseconds(staleMs))
-            {
-                resetActiveTarget();
-            }
+            graphAimActive=false;mouseThread.clearQueuedMoves();mouseThread.releaseMouse();continue;
         }
-
-        if (aimingNow)
+        // If publication raced the pre-evaluation revision snapshot, discard
+        // this iteration. The next iteration resets state before using it.
+        if (actions.revision != graphRevision)
         {
-            if (activeTarget && hasAimObservation)
-            {
-                mouseThread.moveMousePivot(activeTarget->pivotX, activeTarget->pivotY, detectionTimestamp);
-            }
-            else
-            {
-                if (!activeTarget || !activeTargetObserved)
-                {
-                    mouseThread.clearQueuedMoves();
-                }
-            }
-
-            // Keep our press across polling timeouts while the observed target
-            // remains valid. Disabling auto-shoot always releases our button.
-            if (autoShoot && activeTarget && activeTargetObserved)
-                mouseThread.pressMouse(*activeTarget);
-            else
-                mouseThread.releaseMouse();
-        }
-        else
-        {
-            mouseThread.clearQueuedMoves();
+            graphAimActive = false;
+            resetSelections();
             mouseThread.releaseMouse();
+            graphRevision = actions.revision;
+            continue;
         }
 
-        handleEasyNoRecoil(mouseThread);
+        graphAimActive = actions.valid && actions.aim;
 
-        mouseThread.checkAndResetPredictions();
+        if (actions.valid && actions.aim && hasNewDetection)
+            mouseThread.dispatchGraphMovement(actions.movement);
+        else if (!actions.valid || !actions.aim)
+            mouseThread.clearQueuedMoves();
+
+        // Stateful nodes belong to every evaluated branch, including conditions
+        // in Auto Shoot/Recoil. An inactive Aim output cannot clear their history.
+        mouseThread.retainGraphStates(actions.activePredictionKeys,actions.activeWindKeys);
+        if(actions.activePredictionKeys.empty())mouseThread.clearFuturePositions();
+        for(auto it=predictionCache.begin();it!=predictionCache.end();)
+            if(std::find(actions.activePredictionKeys.begin(),actions.activePredictionKeys.end(),it->first)==actions.activePredictionKeys.end())it=predictionCache.erase(it);else++it;
+        for(auto it=windCache.begin();it!=windCache.end();)
+            if(std::find(actions.activeWindKeys.begin(),actions.activeWindKeys.end(),it->first)==actions.activeWindKeys.end())it=windCache.erase(it);else++it;
+        for(auto it=selectionStates.begin();it!=selectionStates.end();)
+            if(std::find(actions.activeSelectionKeys.begin(),actions.activeSelectionKeys.end(),it->first)==actions.activeSelectionKeys.end())it=selectionStates.erase(it);else++it;
+
+        // Scope and activation are explicit graph nodes. Runtime only enforces
+        // current observed-target ownership and the capture generation gate.
+        if (actions.valid && actions.autoShoot && actions.shootTarget.valid && actions.shootTarget.observed)
+            mouseThread.pressMouse();
+        else
+            mouseThread.releaseMouse();
+
+        if (actions.valid && actions.recoil && std::isfinite(actions.recoilStrength))
+        {
+            const int compensation = static_cast<int>(std::clamp(actions.recoilStrength, -1000.0, 1000.0));
+            mouseThread.moveRelative(0, compensation);
+        }
     }
 }
-
 

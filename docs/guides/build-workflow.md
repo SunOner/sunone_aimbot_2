@@ -1,27 +1,19 @@
 # Build Workflow for Everyday Changes
 
-Use the full builder when setting up a backend or changing dependencies:
+Set up a backend or update dependencies:
 
 ```powershell
 .\BUILDER.bat
-```
-
-Use the no-options builder after the backend already builds and you only changed app code:
-
-```powershell
-.\build_no-options.bat
-```
-
-The no-options builder only asks DML or CUDA and then builds the existing CMake target. It does not download, restore, update, or rebuild OpenCV.
-
-Project builds should always go through the provided batch wrappers:
-
-```powershell
+# Or choose the backend directly:
 .\build_dml.bat
 .\build_cuda.bat
 ```
 
-Related docs:
+Rebuild an already configured app target:
 
-- [Build from source](../build.md)
-- [Common recipes](recipes.md)
+```powershell
+.\build_no-options.bat -Backend DML
+.\build_no-options.bat -Backend CUDA
+```
+
+The no-options wrapper reuses the build tree without dependency setup or reconfiguration. Use a full wrapper after dependency or build-system changes. See [build requirements and validation](../build.md).

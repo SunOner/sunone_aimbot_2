@@ -6,11 +6,16 @@
 #include <iostream>
 #include <fstream>
 #include <vector>
+#include <cstdint>
+#include <filesystem>
+#include <memory>
+#include <sstream>
+#include <stdexcept>
+#include <NvInferVersion.h>
 #include <NvOnnxParser.h>
 #include <cuda_runtime.h>
 
 #include "nvinf.h"
-#include "sunone_aimbot_2.h"
 #include "trt_monitor.h"
 
 Logger gLogger;
@@ -65,7 +70,8 @@ nvinfer1::IBuilderConfig* createBuilderConfig(nvinfer1::IBuilder* builder)
 
 nvinfer1::ICudaEngine* loadEngineFromFile(const std::string& engineFile, nvinfer1::IRuntime* runtime)
 {
-    std::ifstream file(engineFile, std::ios::binary);
+    if(!runtime)return nullptr;
+    std::ifstream file(std::filesystem::u8path(engineFile), std::ios::binary);
     if (!file.good())
     {
         std::cerr << "[TensorRT] Error opening the engine file: " << engineFile << std::endl;
@@ -73,10 +79,12 @@ nvinfer1::ICudaEngine* loadEngineFromFile(const std::string& engineFile, nvinfer
     }
 
     file.seekg(0, std::ios::end);
-    size_t size = file.tellg();
+    const auto length=file.tellg();
+    if(length<=0)return nullptr;
+    const size_t size=static_cast<size_t>(length);
     file.seekg(0, std::ios::beg);
     std::vector<char> engineData(size);
-    file.read(engineData.data(), size);
+    if(!file.read(engineData.data(), static_cast<std::streamsize>(size)))return nullptr;
     file.close();
 
     nvinfer1::ICudaEngine* engine = runtime->deserializeCudaEngine(engineData.data(), size);
@@ -86,160 +94,86 @@ nvinfer1::ICudaEngine* loadEngineFromFile(const std::string& engineFile, nvinfer
         return nullptr;
     }
 
-    if (config.verbose)
-    {
-        std::cout << "[TensorRT] The engine was successfully loaded from the file: " << engineFile << std::endl;
-    }
     return engine;
 }
 
-nvinfer1::ICudaEngine* buildEngineFromOnnx(const std::string& onnxFile, nvinfer1::ILogger& logger)
+std::string trtEngineCachePath(const std::string& onnxFile, const TrtBuildOptions& options)
 {
-    nvinfer1::IBuilder* builder = nvinfer1::createInferBuilder(logger);
-    const auto explicitBatch = 1U << static_cast<uint32_t>(nvinfer1::NetworkDefinitionCreationFlag::kEXPLICIT_BATCH);
-    nvinfer1::INetworkDefinition* network = builder->createNetworkV2(explicitBatch);
+    std::ostringstream identity;
+    identity << NV_TENSORRT_MAJOR << '.' << NV_TENSORRT_MINOR << '.' << NV_TENSORRT_PATCH
+        << '|' << options.fixedInputSize << '|' << options.enableFp16 << '|' << options.enableFp8
+        << '|' << options.minProfileSize << '|' << options.optProfileSize << '|' << options.maxProfileSize;
+    if(options.fixedInputSize)identity << '|' << options.inputWidth << 'x' << options.inputHeight;
+    std::error_code error;
+    const std::filesystem::path path=std::filesystem::u8path(onnxFile);
+    const auto modified=std::filesystem::last_write_time(path,error);
+    if(!error)identity << '|' << modified.time_since_epoch().count();
+    error.clear();
+    const auto bytes=std::filesystem::file_size(path,error);
+    if(!error)identity << '|' << bytes;
+    int device=0;cudaDeviceProp properties{};
+    if(cudaGetDevice(&device)==cudaSuccess&&cudaGetDeviceProperties(&properties,device)==cudaSuccess)
+        identity << '|' << properties.name << '|' << properties.major << '.' << properties.minor;
+    std::uint64_t hash=14695981039346656037ull;
+    for(const unsigned char value:identity.str()){hash^=value;hash*=1099511628211ull;}
+    std::ostringstream suffix;suffix << ".nodes-" << std::hex << hash << ".engine";
+    return (path.parent_path()/(path.stem().string()+suffix.str())).string();
+}
 
-    nvinfer1::IBuilderConfig* cfg = builder->createBuilderConfig();
-
-    nvonnxparser::IParser* parser = nvonnxparser::createParser(*network, logger);
-
+nvinfer1::ICudaEngine* buildEngineFromOnnx(const std::string& onnxFile,nvinfer1::ILogger& logger,
+    const TrtBuildOptions& options,nvinfer1::IRuntime& runtime)
+{
+    if(options.inputWidth<=0||options.inputHeight<=0||options.minProfileSize<=0||
+        options.minProfileSize>options.optProfileSize||options.optProfileSize>options.maxProfileSize)
+        throw std::runtime_error("TensorRT profile requires minimum <= optimal <= maximum and positive input dimensions.");
+    std::unique_ptr<nvinfer1::IBuilder> builder(nvinfer1::createInferBuilder(logger));
+    if(!builder)throw std::runtime_error("TensorRT builder creation failed.");
+    const auto explicitBatch=1U<<static_cast<uint32_t>(nvinfer1::NetworkDefinitionCreationFlag::kEXPLICIT_BATCH);
+    std::unique_ptr<nvinfer1::INetworkDefinition> network(builder->createNetworkV2(explicitBatch));
+    if(!network)throw std::runtime_error("TensorRT network creation failed.");
     ImGuiProgressMonitor progressMonitor;
-    cfg->setProgressMonitor(&progressMonitor);
-    TrtExportResetState();
-    gIsTrtExporting = true;
+    std::unique_ptr<nvinfer1::IBuilderConfig> settings(builder->createBuilderConfig());
+    if(!settings)throw std::runtime_error("TensorRT build configuration creation failed.");
+    std::unique_ptr<nvonnxparser::IParser> parser(nvonnxparser::createParser(*network,logger));
+    if(!parser)throw std::runtime_error("ONNX parser creation failed.");
+    settings->setProgressMonitor(&progressMonitor);
+    TrtExportResetState();gIsTrtExporting=true;
     struct ScopedExportState
     {
         ~ScopedExportState()
         {
             std::lock_guard<std::mutex> lock(gProgressMutex);
-            gProgressPhases.clear();
-            gIsTrtExporting = false;
-            gTrtExportCancelRequested = false;
-            gTrtExportLastUpdateMs = TrtNowMs();
+            gProgressPhases.clear();gIsTrtExporting=false;gTrtExportCancelRequested=false;
+            gTrtExportLastUpdateMs=TrtNowMs();
         }
     } exportState;
-
-    if (!parser->parseFromFile(onnxFile.c_str(), static_cast<int>(nvinfer1::ILogger::Severity::kWARNING)))
-    {
-        std::cerr << "[TensorRT] ERROR: Error parsing the ONNX file: " << onnxFile << std::endl;
-        delete parser;
-        delete network;
-        delete builder;
-        delete cfg;
-        return nullptr;
-    }
-
-    nvinfer1::ITensor* inputTensor = network->getInput(0);
-    const char* inName = inputTensor->getName();
-    nvinfer1::Dims inDims = inputTensor->getDimensions();
-    int H = (inDims.nbDims >= 4) ? inDims.d[2] : -1;
-    int W = (inDims.nbDims >= 4) ? inDims.d[3] : -1;
-
-    bool fixedByModel = (H > 0 && W > 0);
-    bool fixedByConfig = config.fixed_input_size;
-    bool makeStatic = fixedByModel || fixedByConfig;
-
-    if (fixedByConfig && (H <= 0 || W <= 0))
-        H = W = config.detection_resolution;
-
-    nvinfer1::IOptimizationProfile* profile = builder->createOptimizationProfile();
-    if (makeStatic)
-    {
-        nvinfer1::Dims4 d{ 1, 3, H, W };
-        profile->setDimensions(inName, nvinfer1::OptProfileSelector::kMIN, d);
-        profile->setDimensions(inName, nvinfer1::OptProfileSelector::kOPT, d);
-        profile->setDimensions(inName, nvinfer1::OptProfileSelector::kMAX, d);
-        if (config.verbose)
-            std::cout << "[TensorRT] Static profile " << H << "x" << W << std::endl;
-    }
-    else
-    {
-        profile->setDimensions(inName, nvinfer1::OptProfileSelector::kMIN, nvinfer1::Dims4{ 1, 3, 160, 160 });
-        profile->setDimensions(inName, nvinfer1::OptProfileSelector::kOPT, nvinfer1::Dims4{ 1, 3, 320, 320 });
-        profile->setDimensions(inName, nvinfer1::OptProfileSelector::kMAX, nvinfer1::Dims4{ 1, 3, 640, 640 });
-        if (config.verbose)
-            std::cout << "[TensorRT] Dynamic profile 160/320/640" << std::endl;
-    }
-
-    cfg->addOptimizationProfile(profile);
-
-
-    if (config.export_enable_fp16)
-    {
-        if (config.verbose)
-            std::cout << "[TensorRT] Set FP16" << std::endl;
-        cfg->setFlag(nvinfer1::BuilderFlag::kFP16);
-    }
-    if (config.export_enable_fp8)
-    {
-        if (config.verbose)
-            std::cout << "[TensorRT] Set FP8" << std::endl;
-        cfg->setFlag(nvinfer1::BuilderFlag::kFP8);
-    }
-
-    cudaStream_t stream;
-    cudaStreamCreate(&stream);
-
-    std::cout << "[TensorRT] Building engine (this may take several minutes)..." << std::endl;
-
-    auto plan = builder->buildSerializedNetwork(*network, *cfg);
-    if (!plan)
-    {
-        std::cerr << "[TensorRT] ERROR: Could not build the engine" << std::endl;
-        cudaStreamDestroy(stream);
-        delete parser;
-        delete network;
-        delete builder;
-        delete cfg;
-        return nullptr;
-    }
-
-    nvinfer1::IRuntime* runtime = nvinfer1::createInferRuntime(logger);
-    nvinfer1::ICudaEngine* engine = runtime->deserializeCudaEngine(plan->data(), plan->size());
-
-    cudaStreamSynchronize(stream);
-    cudaStreamDestroy(stream);
-
-    if (!engine)
-    {
-        std::cerr << "[TensorRT] ERROR: Could not create engine" << std::endl;
-        delete plan;
-        delete runtime;
-        delete parser;
-        delete network;
-        delete builder;
-        delete cfg;
-        return nullptr;
-    }
-
-    nvinfer1::IHostMemory* serializedModel = engine->serialize();
-    std::string engineFile = onnxFile.substr(0, onnxFile.find_last_of('.')) + ".engine";
-    std::ofstream p(engineFile, std::ios::binary);
-    if (!p)
-    {
-        std::cerr << "[TensorRT] ERROR: Could not open file to write: " << engineFile << std::endl;
-        delete serializedModel;
-        delete engine;
-        delete plan;
-        delete runtime;
-        delete parser;
-        delete network;
-        delete builder;
-        delete cfg;
-        return nullptr;
-    }
-    p.write(static_cast<const char*>(plan->data()), plan->size());
-    p.close();
-
-    delete plan;
-    delete serializedModel;
-    delete runtime;
-    delete parser;
-    delete network;
-    delete cfg;
-    delete builder;
-
-    std::cout << "[TensorRT] The engine was built and saved to the file: " << engineFile << std::endl;
+    if(!parser->parseFromFile(onnxFile.c_str(),static_cast<int>(nvinfer1::ILogger::Severity::kWARNING)))
+        throw std::runtime_error("TensorRT could not parse this ONNX model.");
+    if(network->getNbInputs()!=1)throw std::runtime_error("Inference requires a model with one image input.");
+    auto* input=network->getInput(0);const auto dimensions=input->getDimensions();
+    if(dimensions.nbDims!=4||(dimensions.d[0]>0&&dimensions.d[0]!=1)||(dimensions.d[1]>0&&dimensions.d[1]!=3))
+        throw std::runtime_error("Inference requires a single NCHW RGB image input.");
+    const int height=dimensions.d[2],width=dimensions.d[3];
+    const bool fixed=(height>0&&width>0)||options.fixedInputSize;
+    // TensorRT's builder owns optimization profiles.
+    auto* profile=builder->createOptimizationProfile();
+    if(!profile)throw std::runtime_error("TensorRT optimization profile creation failed.");
+    auto shape=[&](int size){return nvinfer1::Dims4{1,3,height>0?height:size,width>0?width:size};};
+    const auto minimum=fixed?nvinfer1::Dims4{1,3,height>0?height:options.inputHeight,width>0?width:options.inputWidth}:shape(options.minProfileSize);
+    const auto optimal=fixed?minimum:shape(options.optProfileSize);
+    const auto maximum=fixed?minimum:shape(options.maxProfileSize);
+    if(!profile->setDimensions(input->getName(),nvinfer1::OptProfileSelector::kMIN,minimum)||
+        !profile->setDimensions(input->getName(),nvinfer1::OptProfileSelector::kOPT,optimal)||
+        !profile->setDimensions(input->getName(),nvinfer1::OptProfileSelector::kMAX,maximum)||
+        settings->addOptimizationProfile(profile)<0)
+        throw std::runtime_error("TensorRT rejected this node's input profile.");
+    if(options.enableFp16)settings->setFlag(nvinfer1::BuilderFlag::kFP16);
+    if(options.enableFp8)settings->setFlag(nvinfer1::BuilderFlag::kFP8);
+    std::cout << "[TensorRT] Building engine with the Inference node's profile and precision..." << std::endl;
+    std::unique_ptr<nvinfer1::IHostMemory> plan(builder->buildSerializedNetwork(*network,*settings));
+    if(!plan)throw std::runtime_error("TensorRT engine build failed or was cancelled.");
+    auto* engine=runtime.deserializeCudaEngine(plan->data(),plan->size());
+    if(!engine)throw std::runtime_error("TensorRT could not deserialize the built engine.");
     return engine;
 }
 #endif

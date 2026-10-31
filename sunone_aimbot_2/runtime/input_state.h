@@ -13,6 +13,9 @@ extern std::mutex inputDevicesMutex;
 extern DetectionBuffer detectionBuffer;
 extern MouseThread* globalMouseThread;
 extern std::atomic<bool> aiming;
+extern std::atomic<bool> graphAimActive;
+// The native menu owns operational input while it is the foreground UI.
+extern std::atomic<bool> editorInputCaptured;
 extern std::atomic<bool> shooting;
 extern std::atomic<bool> zooming;
 extern std::atomic<bool> input_method_changed;

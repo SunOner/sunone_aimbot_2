@@ -203,7 +203,7 @@ static void draw_mouse_page(MouseSettingsPage page)
         {
             config.active_game = profile_names[selected_index];
             OverlayConfig_MarkDirty();
-            globalMouseThread->updateConfig(config);
+            if (globalMouseThread) globalMouseThread->updateConfig(config);
         }
 
         const auto& gp = config.currentProfile();
@@ -979,7 +979,7 @@ static void draw_mouse_page(MouseSettingsPage page)
         prev_speedCurveExponent = config.speedCurveExponent;
         prev_snapBoostFactor = config.snapBoostFactor;
 
-        globalMouseThread->updateConfig(config);
+        if (globalMouseThread) globalMouseThread->updateConfig(config);
 
         OverlayConfig_MarkDirty();
     }
@@ -996,7 +996,7 @@ static void draw_mouse_page(MouseSettingsPage page)
         prev_wind_M = config.wind_M;
         prev_wind_D = config.wind_D;
 
-        globalMouseThread->updateConfig(config);
+        if (globalMouseThread) globalMouseThread->updateConfig(config);
 
         OverlayConfig_MarkDirty();
     }
@@ -1007,7 +1007,7 @@ static void draw_mouse_page(MouseSettingsPage page)
         prev_auto_shoot = config.auto_shoot;
         prev_bScope_multiplier = config.bScope_multiplier;
 
-        globalMouseThread->updateConfig(config);
+        if (globalMouseThread) globalMouseThread->updateConfig(config);
 
         OverlayConfig_MarkDirty();
     }

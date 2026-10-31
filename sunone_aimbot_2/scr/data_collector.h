@@ -28,7 +28,13 @@ struct DataCollectionUiState
 std::filesystem::path ResolveCollectOutputDir(const std::string& root_dir, const char* output_dir_raw);
 bool IsDataCollectionEnabled(const Config& cfg);
 DataCollectionUiState GetDataCollectionUiState(const std::string& root_dir, const char* model_name, const Config& cfg);
+DataCollectionUiState GetDataCollectionNodeUiState(int nodeKey);
 void ResetDataCollectionRuntime();
+void RetainDataCollectionNodes(const std::vector<int>& activeKeys);
+bool CollectDataSampleForNode(int nodeKey, const std::string& root_dir, const char* model_name,
+    const cv::Mat& frame, const std::vector<cv::Rect>& boxes, const std::vector<int>& classes,
+    const std::vector<float>& confidences, bool aimbot_enabled, const Config& settings,
+    double cooldownMs = 500.0);
 
 void MaybeCollectDataSample(const std::string& root_dir,
                             const char* model_name,

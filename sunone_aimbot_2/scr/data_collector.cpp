@@ -17,6 +17,7 @@
 #include <sstream>
 #include <string>
 #include <utility>
+#include <unordered_map>
 
 namespace cvm {
 namespace {
@@ -48,15 +49,18 @@ struct CollectConfigSnapshot
     float auto_label_min_conf = 0.25f;
     int auto_label_max_boxes = 20;
     std::string auto_label_record_classes;
+    int64_t cooldown_ns = kCollectSaveCooldownNs;
 };
 
 struct CollectAttempt
 {
     CollectConfigSnapshot cfg;
     std::uint64_t sample_id = 0;
+    int nodeKey = 0;
 };
 
 CollectRuntimeState g_collectRuntimeState;
+std::unordered_map<int,CollectRuntimeState> g_collectNodeRuntimeStates;
 std::mutex g_collectRuntimeMutex;
 
 std::string GetExecutableDir()
@@ -162,21 +166,27 @@ CollectConfigSnapshot SnapshotCollectConfig(const Config& cfg)
     snapshot.only_when_aimbot_running = cfg.collect_only_when_aimbot_running;
     snapshot.only_when_targets_present = cfg.collect_only_when_targets_present;
     snapshot.save_every_n_frames = std::max(1, cfg.collect_save_every_n_frames);
-    snapshot.jpeg_quality = std::clamp(cfg.collect_jpeg_quality, 50, 100);
+    snapshot.jpeg_quality = std::clamp(cfg.collect_jpeg_quality, 1, 100);
     snapshot.output_dir = cfg.collect_output_dir;
     snapshot.auto_label_data = cfg.auto_label_data;
-    snapshot.auto_label_min_conf = std::clamp(cfg.auto_label_min_conf, 0.01f, 0.99f);
+    snapshot.auto_label_min_conf = std::clamp(cfg.auto_label_min_conf, 0.0f, 1.0f);
     snapshot.auto_label_max_boxes = std::max(1, cfg.auto_label_max_boxes);
     snapshot.auto_label_record_classes = cfg.auto_label_record_classes;
     return snapshot;
 }
 
-void UpdateRuntimeStatus(const std::string& output_dir, const std::string& status)
+void UpdateRuntimeStatus(const std::string& output_dir, const std::string& status, int nodeKey = 0)
 {
     std::lock_guard<std::mutex> lock(g_collectRuntimeMutex);
     if (!output_dir.empty())
         g_collectRuntimeState.last_output_dir = output_dir;
     g_collectRuntimeState.last_status = status;
+    if(nodeKey)
+    {
+        auto& state=g_collectNodeRuntimeStates[nodeKey];
+        if(!output_dir.empty())state.last_output_dir=output_dir;
+        state.last_status=status;
+    }
 }
 
 std::string WriteYoloLabelFile(const fs::path& label_path,
@@ -249,7 +259,7 @@ bool BuildSaveFrame(const cv::Mat& frame, cv::Mat& save_frame)
 bool TryBeginCollectAttempt(const CollectConfigSnapshot& cfg,
                             const std::vector<cv::Rect>& boxes,
                             bool aimbot_enabled,
-                            std::uint64_t& sample_id)
+                            std::uint64_t& sample_id, int nodeKey = 0)
 {
     if (!cfg.enabled)
         return false;
@@ -264,22 +274,25 @@ bool TryBeginCollectAttempt(const CollectConfigSnapshot& cfg,
         std::chrono::steady_clock::now().time_since_epoch()).count();
 
     std::lock_guard<std::mutex> lock(g_collectRuntimeMutex);
-    ++g_collectRuntimeState.frame_counter;
-    if ((g_collectRuntimeState.frame_counter % static_cast<std::uint64_t>(cfg.save_every_n_frames)) != 0)
+    auto& state=nodeKey?g_collectNodeRuntimeStates[nodeKey]:g_collectRuntimeState;
+    ++state.frame_counter;
+    if(nodeKey)++g_collectRuntimeState.frame_counter;
+    if ((state.frame_counter % static_cast<std::uint64_t>(cfg.save_every_n_frames)) != 0)
         return false;
 
-    if (g_collectRuntimeState.last_collect_save_ns > 0 &&
-        (now_ns - g_collectRuntimeState.last_collect_save_ns) < kCollectSaveCooldownNs)
+    if (state.last_collect_save_ns > 0 &&
+        (now_ns - state.last_collect_save_ns) < cfg.cooldown_ns)
     {
         return false;
     }
 
-    g_collectRuntimeState.last_collect_save_ns = now_ns;
-    sample_id = ++g_collectRuntimeState.sample_counter;
+    state.last_collect_save_ns = now_ns;
+    sample_id = ++state.sample_counter;
+    if(nodeKey)++g_collectRuntimeState.sample_counter;
     return true;
 }
 
-void SaveCollectedFrame(const std::string& root_dir,
+bool SaveCollectedFrame(const std::string& root_dir,
                         const char* model_name,
                         const cv::Mat& frame,
                         const std::vector<cv::Rect>& boxes,
@@ -289,7 +302,7 @@ void SaveCollectedFrame(const std::string& root_dir,
 {
     cv::Mat save_frame;
     if (!BuildSaveFrame(frame, save_frame))
-        return;
+        return false;
 
     const auto [images_dir, labels_dir] = ResolveModelOutputDirs(root_dir, model_name, attempt.cfg);
     const fs::path model_root = images_dir.parent_path();
@@ -298,19 +311,19 @@ void SaveCollectedFrame(const std::string& root_dir,
     fs::create_directories(images_dir, ec);
     if (ec)
     {
-        UpdateRuntimeStatus(model_root.string(), "Collect save failed: create images folder.");
-        return;
+        UpdateRuntimeStatus(model_root.string(), "Collect save failed: create images folder.",attempt.nodeKey);
+        return false;
     }
 
     ec.clear();
     fs::create_directories(labels_dir, ec);
     if (ec)
     {
-        UpdateRuntimeStatus(model_root.string(), "Collect save failed: create labels folder.");
-        return;
+        UpdateRuntimeStatus(model_root.string(), "Collect save failed: create labels folder.",attempt.nodeKey);
+        return false;
     }
 
-    const std::string stem = BuildCollectSampleStem(attempt.sample_id);
+    const std::string stem = BuildCollectSampleStem(attempt.sample_id)+(attempt.nodeKey?"_n"+std::to_string(attempt.nodeKey):std::string());
     const fs::path image_path = images_dir / (stem + ".jpg");
     const fs::path label_path = labels_dir / (stem + ".txt");
 
@@ -331,8 +344,8 @@ void SaveCollectedFrame(const std::string& root_dir,
 
     if (!image_ok)
     {
-        UpdateRuntimeStatus(model_root.string(), "Collect save failed: image write.");
-        return;
+        UpdateRuntimeStatus(model_root.string(), "Collect save failed: image write.",attempt.nodeKey);
+        return false;
     }
 
     bool label_ok = true;
@@ -363,7 +376,14 @@ void SaveCollectedFrame(const std::string& root_dir,
         g_collectRuntimeState.last_status = attempt.cfg.auto_label_data
             ? ("Saved image + " + label_result)
             : "Saved image only";
+        if(attempt.nodeKey)
+        {
+            auto& state=g_collectNodeRuntimeStates[attempt.nodeKey];
+            ++state.saved_image_count;if(attempt.cfg.auto_label_data&&label_ok)++state.saved_label_count;
+            state.last_output_dir=model_root.string();state.last_status=g_collectRuntimeState.last_status;
+        }
     }
+    return label_ok;
 }
 
 }  // namespace
@@ -412,7 +432,37 @@ void ResetDataCollectionRuntime()
 {
     std::lock_guard<std::mutex> lock(g_collectRuntimeMutex);
     g_collectRuntimeState = {};
+    g_collectNodeRuntimeStates.clear();
     g_collectRuntimeState.last_status = "Counters reset.";
+}
+
+DataCollectionUiState GetDataCollectionNodeUiState(int nodeKey)
+{
+    DataCollectionUiState ui;
+    std::lock_guard<std::mutex> lock(g_collectRuntimeMutex);
+    const auto found=g_collectNodeRuntimeStates.find(nodeKey);if(found==g_collectNodeRuntimeStates.end())return ui;
+    const auto& state=found->second;ui.enabled=true;ui.observed_frame_count=state.frame_counter;
+    ui.attempted_sample_count=state.sample_counter;ui.saved_image_count=state.saved_image_count;ui.saved_label_count=state.saved_label_count;
+    ui.resolved_output_dir=state.last_output_dir;ui.status=state.last_status;return ui;
+}
+
+void RetainDataCollectionNodes(const std::vector<int>& activeKeys)
+{
+    std::lock_guard<std::mutex> lock(g_collectRuntimeMutex);
+    for(auto it=g_collectNodeRuntimeStates.begin();it!=g_collectNodeRuntimeStates.end();)
+        if(std::find(activeKeys.begin(),activeKeys.end(),it->first)==activeKeys.end())it=g_collectNodeRuntimeStates.erase(it);else++it;
+}
+
+bool CollectDataSampleForNode(int nodeKey,const std::string& root_dir,const char* model_name,
+    const cv::Mat& frame,const std::vector<cv::Rect>& boxes,const std::vector<int>& classes,
+    const std::vector<float>& confidences,bool aimbot_enabled,const Config& settings,double cooldownMs)
+{
+    if(nodeKey<=0||frame.empty())return false;
+    auto snapshot=SnapshotCollectConfig(settings);
+    snapshot.cooldown_ns=static_cast<int64_t>(std::clamp(cooldownMs,0.0,60000.0)*1000000.0);
+    std::uint64_t sampleId=0;
+    if(!TryBeginCollectAttempt(snapshot,boxes,aimbot_enabled,sampleId,nodeKey))return false;
+    return SaveCollectedFrame(root_dir,model_name,frame,boxes,classes,confidences,CollectAttempt{snapshot,sampleId,nodeKey});
 }
 
 void MaybeCollectDataSample(const std::string& root_dir,

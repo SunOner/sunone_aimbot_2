@@ -29,6 +29,11 @@
 #include "overlay.h"
 #include "overlay/draw_settings.h"
 #include "overlay/config_dirty.h"
+#include "overlay/node_editor.h"
+#include "overlay/window_geometry.h"
+#include "nodes/node_graph.h"
+#include "nodes/vision_runtime.h"
+#include "runtime/input_state.h"
 #include "include/other_tools.h"
 #include "config.h"
 #include "keycodes.h"
@@ -66,30 +71,35 @@ ID3D11BlendState* g_pBlendState = nullptr;
 LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
-const int BASE_OVERLAY_WIDTH = 860;
-const int BASE_OVERLAY_HEIGHT = 526;
+const int BASE_OVERLAY_WIDTH = 1180;
+const int BASE_OVERLAY_HEIGHT = 740;
 static const int MIN_EDITOR_OPACITY = 252;
 
 int overlayWidth = 0;
 int overlayHeight = 0;
 
 static const int DRAG_BAR_HEIGHT_PX = 34;
-static const int MIN_OVERLAY_W = 560;
-static const int MIN_OVERLAY_H = 340;
 static const int RESIZE_BORDER_PX = 8;
-static const int WORKAREA_MARGIN_PX = 20;
 
 static bool g_autoResizeEnabled = true;
 static ImGuiStyle g_baseStyle{};
 static bool g_baseStyleReady = false;
 static float g_runtimeUiScale = -1.0f;
 static bool g_overlayVisible = false;
+static bool OverlayOwnsForegroundInput()
+{
+    const HWND foreground=::GetForegroundWindow();
+    return g_hwnd&&foreground&&(foreground==g_hwnd||::IsChild(g_hwnd,foreground)||
+        ::GetAncestor(foreground,GA_ROOTOWNER)==g_hwnd);
+}
+static bool g_overlayPreview = false;
 static bool g_renderingOverlayFrame = false;
 static bool g_manualWindowDragActive = false;
 static WPARAM g_manualWindowDragHit = HTNOWHERE;
 static POINT g_manualWindowDragStartPoint{};
 static RECT g_manualWindowDragStartRect{};
 static int g_activeOverlayTab = 0;
+static RECT g_sidebarToggleRect{};
 static bool g_pendingOverlayGeometryDirty = false;
 
 std::vector<std::string> availableModels;
@@ -118,6 +128,7 @@ static inline int ClampInt(int v, int lo, int hi)
 struct OverlayThreadConfigSnapshot
 {
     std::vector<std::string> buttonOpenOverlay;
+    std::vector<std::string> buttonExit;
     bool excludeFromCapture = true;
 };
 
@@ -126,6 +137,7 @@ static OverlayThreadConfigSnapshot SnapshotOverlayThreadConfig()
     std::lock_guard<std::mutex> lock(configMutex);
     OverlayThreadConfigSnapshot snapshot;
     snapshot.buttonOpenOverlay = config.button_open_overlay;
+    snapshot.buttonExit = config.button_exit;
     snapshot.excludeFromCapture = config.overlay_exclude_from_capture;
     return snapshot;
 }
@@ -368,24 +380,14 @@ struct OverlayTabItem
 };
 
 static const OverlayTabItem kOverlayTabs[] = {
-    { "Capture",       "Vision",  "Frame source, monitor/window selection and preview.", draw_capture_settings,        SidebarIconKind::Camera },
-    { "AI Model",      "Vision",  "Model, backend and detector thresholds.",             draw_ai,                      SidebarIconKind::Chip },
-    { "Depth",         "Vision",  "Depth inference, masks and depth debug overlay.",     draw_depth,                   SidebarIconKind::Layers },
-
-    { "Target",        "Aim",     "Target selection and aim point offsets.",             draw_target,                  SidebarIconKind::Crosshair },
-    { "Tracker",       "Aim",     "Current target identity lock status.",                draw_tracker,                 SidebarIconKind::Crosshair },
-    { "Movement",      "Aim",     "FOV, speed, target correction and motion profile.",   draw_mouse_movement,          SidebarIconKind::Move },
-    { "Prediction",    "Aim",     "Prediction points and Kalman filter tuning.",         draw_mouse_prediction,        SidebarIconKind::Curve },
-    { "Assist",        "Aim",     "Auto shoot, recoil compensation and assist toggles.", draw_mouse_assist,            SidebarIconKind::Spark },
-    { "Profiles",      "Aim",     "Per-game sensitivity and profile management.",        draw_mouse_profiles,          SidebarIconKind::User },
+    { "Aim Graph",     "Nodes",   "Target, prediction and movement graph.",             draw_node_aim,                SidebarIconKind::Crosshair },
+    { "Auto Shoot",    "Nodes",   "Conditions for automatic shooting.",                  draw_node_auto_shoot,         SidebarIconKind::Spark },
+    { "Recoil",        "Nodes",   "Recoil conditions and compensation graph.",           draw_node_recoil,             SidebarIconKind::Curve },
+    { "Vision",        "Nodes",   "Capture, inference, filtering, depth and visual outputs.",draw_node_vision,             SidebarIconKind::Camera },
 
     { "Input Device",  "Control", "Mouse backend, device connection and reconnect data.",draw_mouse_input,             SidebarIconKind::Mouse },
     { "Hotkeys",       "Control", "Bindings for aiming, shooting and runtime actions.",  draw_buttons,                 SidebarIconKind::Keyboard },
     { "Overlay",       "Control", "Overlay appearance and privacy options.",             draw_overlay,                 SidebarIconKind::Sliders },
-
-    { "Game Render",   "Visuals", "In-game overlay lifetime, FPS and render toggles.",   draw_game_overlay_general,    SidebarIconKind::Monitor },
-    { "Render Style",  "Visuals", "Boxes, capture frame and future point styling.",      draw_game_overlay_visuals,    SidebarIconKind::Palette },
-    { "Icon Overlay",  "Visuals", "Per-target icon image, size, anchor and class filter.",draw_game_overlay_icon,      SidebarIconKind::Image },
 
     { "Stats",         "Monitor", "Performance, capture source and timing graphs.",      draw_stats,                   SidebarIconKind::Bars },
     { "Debug",         "Monitor", "Screenshots, data collection and diagnostics.",        draw_debug,                   SidebarIconKind::Debug },
@@ -404,11 +406,6 @@ static void DrawMainPanelBackground(const ImVec2& pos, const ImVec2& size)
         IM_COL32(24, 25, 27, 60),
         IM_COL32(35, 38, 45, 58));
     draw->AddRect(pos, max, IM_COL32(92, 92, 92, 128), 10.0f, 0, 1.0f);
-}
-
-static void DrawSidebarTitle()
-{
-    ImGui::Dummy(ImVec2(0.0f, 8.0f));
 }
 
 static void DrawSidebarIcon(ImDrawList* draw, SidebarIconKind icon, const char* group, const ImVec2& pos, bool selected)
@@ -529,7 +526,112 @@ static void DrawSidebarIcon(ImDrawList* draw, SidebarIconKind icon, const char* 
     }
 }
 
-static bool DrawSidebarTabButton(const OverlayTabItem& tab, bool selected)
+struct SidebarAnimation
+{
+    bool initialized = false;
+    bool targetCollapsed = false;
+    double expansion = 1.0, velocity = 0.0;
+    std::chrono::steady_clock::time_point updatedAt{};
+
+    float update(bool collapsed)
+    {
+        const auto now = std::chrono::steady_clock::now();
+        const double target = collapsed ? 0.0 : 1.0;
+        if (!initialized)
+        {
+            initialized = true;
+            expansion = target;
+        }
+        else if (expansion != target || velocity != 0.0)
+        {
+            // Exact critically damped motion stays consistent across frame rates
+            // and retains velocity when the user reverses an unfinished transition.
+            const double elapsed = std::chrono::duration<double>(now - updatedAt).count();
+            constexpr double speed = 30.0;
+            const double offset = expansion - target;
+            const double impulse = velocity + speed * offset;
+            const double decay = std::exp(-speed * elapsed);
+            expansion = std::clamp(target + (offset + impulse * elapsed) * decay, 0.0, 1.0);
+            velocity = (velocity - speed * impulse * elapsed) * decay;
+            if (std::abs(expansion - target) < 0.001 && std::abs(velocity) < 0.03)
+            {
+                expansion = target;
+                velocity = 0.0;
+            }
+        }
+        targetCollapsed = collapsed;
+        updatedAt = now;
+        return static_cast<float>(expansion);
+    }
+
+    bool running() const { return expansion != (targetCollapsed ? 0.0 : 1.0); }
+};
+static SidebarAnimation g_sidebarAnimation;
+
+static ImU32 SidebarFade(ImU32 color, float opacity)
+{
+    ImVec4 value = ImGui::ColorConvertU32ToFloat4(color);
+    value.w *= opacity;
+    return ImGui::ColorConvertFloat4ToU32(value);
+}
+
+static bool DrawSidebarHeader(bool collapsed, float expansion)
+{
+    const ImVec2 pos = ImGui::GetCursorScreenPos();
+    const float width = ImGui::GetContentRegionAvail().x;
+    const float size = 24.0f * g_runtimeUiScale;
+    const float offset = width - size - 10.0f * g_runtimeUiScale * (1.0f - expansion);
+    ImGui::SetCursorScreenPos(ImVec2(pos.x + offset, pos.y));
+    const bool pressed = ImGui::InvisibleButton("##toggle_sidebar", ImVec2(size, size));
+    g_sidebarToggleRect = {static_cast<LONG>(std::floor(pos.x + offset)), static_cast<LONG>(std::floor(pos.y)),
+        static_cast<LONG>(std::ceil(pos.x + offset + size)), static_cast<LONG>(std::ceil(pos.y + size))};
+    const bool hovered = ImGui::IsItemHovered();
+    ImDrawList* draw = ImGui::GetWindowDrawList();
+    if (hovered)
+        draw->AddRectFilled(ImVec2(pos.x + offset, pos.y), ImVec2(pos.x + offset + size, pos.y + size), IM_COL32(54, 55, 60, 230), 5.0f);
+    const ImVec2 center(pos.x + offset + size * 0.5f, pos.y + size * 0.5f);
+    const float scale = g_runtimeUiScale;
+    const ImU32 color = hovered ? IM_COL32(96, 205, 255, 255) : IM_COL32(177, 187, 199, 255);
+    const float angle = expansion * 3.14159265f;
+    const float cosine = std::cos(angle), sine = std::sin(angle);
+    const auto arrowPoint = [&](float x, float y) {
+        return ImVec2(center.x + (x * cosine - y * sine) * scale, center.y + (x * sine + y * cosine) * scale);
+    };
+    draw->AddLine(arrowPoint(-2.5f, -4.5f), arrowPoint(2.0f, 0.0f), color, 1.6f * scale);
+    draw->AddLine(arrowPoint(2.0f, 0.0f), arrowPoint(-2.5f, 4.5f), color, 1.6f * scale);
+    if (expansion > 0.001f && offset > 4.0f * scale)
+    {
+        draw->PushClipRect(pos, ImVec2(pos.x + offset - 4.0f * scale, pos.y + size), true);
+        draw->AddText(ImVec2(pos.x, pos.y + (size - ImGui::GetTextLineHeight()) * 0.5f), SidebarFade(IM_COL32(177, 177, 177, 230), expansion * expansion), kOverlayTabs[0].group);
+        draw->PopClipRect();
+    }
+    if (hovered) ImGui::SetTooltip("%s sidebar", collapsed ? "Expand" : "Collapse");
+    return pressed;
+}
+
+static void DrawSidebarGroup(const char* group, float expansion)
+{
+    ImGui::Dummy(ImVec2(0.0f, 5.0f * g_runtimeUiScale));
+    const ImVec2 pos = ImGui::GetCursorScreenPos();
+    const float width = ImGui::GetContentRegionAvail().x;
+    const float height = 1.0f + (ImGui::GetTextLineHeight() - 1.0f) * expansion;
+    const float opacity = expansion * expansion;
+    ImGui::Dummy(ImVec2(width, height));
+    ImDrawList* draw = ImGui::GetWindowDrawList();
+    if (opacity < 1.0f)
+    {
+        const float y = pos.y + height * 0.5f;
+        draw->AddLine(ImVec2(pos.x + 5.0f * g_runtimeUiScale, y), ImVec2(pos.x + width - 5.0f * g_runtimeUiScale, y), SidebarFade(ImGui::GetColorU32(ImGuiCol_Separator), 1.0f - opacity));
+    }
+    if (opacity > 0.001f)
+    {
+        draw->PushClipRect(pos, ImVec2(pos.x + width, pos.y + height), true);
+        draw->AddText(pos, SidebarFade(IM_COL32(177, 177, 177, 230), opacity), group);
+        draw->PopClipRect();
+    }
+}
+
+static bool DrawSidebarTabButton(const OverlayTabItem& tab, bool selected, float expansion)
 {
     const ImVec2 pos = ImGui::GetCursorScreenPos();
     const ImGuiStyle& style = ImGui::GetStyle();
@@ -562,8 +664,26 @@ static bool DrawSidebarTabButton(const OverlayTabItem& tab, bool selected)
 
     const float textY = pos.y + (size.y - ImGui::GetTextLineHeight()) * 0.5f;
     const ImU32 textCol = selected ? IM_COL32(255, 255, 255, 255) : (hovered ? IM_COL32(238, 238, 238, 255) : IM_COL32(202, 202, 202, 240));
-    DrawSidebarIcon(draw, tab.icon, tab.group, ImVec2(pos.x + style.FramePadding.x + 4.0f, pos.y + (size.y - 18.0f) * 0.5f), selected);
-    draw->AddText(ImVec2(pos.x + style.FramePadding.x + 31.0f, textY), textCol, tab.label);
+    const float closedIconX = (44.0f * g_runtimeUiScale - 18.0f) * 0.5f;
+    const float iconX = closedIconX + (style.FramePadding.x + 4.0f - closedIconX) * expansion;
+    DrawSidebarIcon(draw, tab.icon, tab.group, ImVec2(pos.x + iconX, pos.y + (size.y - 18.0f) * 0.5f), selected);
+    const float textX = pos.x + style.FramePadding.x + 31.0f;
+    const float textRight = max.x - 8.0f * g_runtimeUiScale;
+    if (expansion > 0.001f && textRight > textX)
+    {
+        draw->PushClipRect(ImVec2(textX, pos.y), ImVec2(textRight, max.y), true);
+        draw->AddText(ImVec2(textX, textY), SidebarFade(textCol, expansion * expansion), tab.label);
+        draw->PopClipRect();
+    }
+    if (hovered && expansion < 0.95f)
+    {
+        ImGui::BeginTooltip();
+        ImGui::TextUnformatted(tab.label);
+        ImGui::PushTextWrapPos(ImGui::GetFontSize() * 22.0f);
+        ImGui::TextDisabled("%s", tab.description);
+        ImGui::PopTextWrapPos();
+        ImGui::EndTooltip();
+    }
 
     return pressed;
 }
@@ -578,75 +698,91 @@ static UINT GetDpiForWindowSafe(HWND hwnd)
         if (pGetDpiForWindow)
             dpi = pGetDpiForWindow(hwnd);
     }
-    return dpi;
+    return dpi ? dpi : 96;
+}
+
+static HMONITOR GetCursorMonitor()
+{
+    POINT pt{};
+    ::GetCursorPos(&pt);
+    return ::MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+}
+
+static RECT GetMonitorWorkArea(HMONITOR monitor)
+{
+    MONITORINFO mi{};
+    mi.cbSize = sizeof(mi);
+    if (monitor && ::GetMonitorInfo(monitor, &mi))
+        return mi.rcWork;
+
+    RECT work{};
+    if (::SystemParametersInfo(SPI_GETWORKAREA, 0, &work, 0))
+        return work;
+    work.right = std::max(1, ::GetSystemMetrics(SM_CXSCREEN));
+    work.bottom = std::max(1, ::GetSystemMetrics(SM_CYSCREEN));
+    return work;
 }
 
 static RECT GetOverlayWorkArea(HWND hwnd)
 {
-    RECT work{};
-    HMONITOR monitor = nullptr;
-
-    if (hwnd)
-    {
-        monitor = ::MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
-    }
-    else
-    {
-        POINT pt{};
-        ::GetCursorPos(&pt);
-        monitor = ::MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
-    }
-
-    MONITORINFO mi{};
-    mi.cbSize = sizeof(mi);
-    if (monitor && ::GetMonitorInfo(monitor, &mi))
-        return mi.rcWork;
-
-    work.left = 0;
-    work.top = 0;
-    work.right = ::GetSystemMetrics(SM_CXSCREEN);
-    work.bottom = ::GetSystemMetrics(SM_CYSCREEN);
-    return work;
+    return GetMonitorWorkArea(hwnd ? ::MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) : GetCursorMonitor());
 }
 
-static RECT GetOverlayWorkAreaForRect(const RECT& rect)
+static OverlayWindowGeometry::Rect GeometryRect(const RECT& rect)
 {
-    HMONITOR monitor = ::MonitorFromRect(&rect, MONITOR_DEFAULTTONEAREST);
-    MONITORINFO mi{};
-    mi.cbSize = sizeof(mi);
-    if (monitor && ::GetMonitorInfo(monitor, &mi))
-        return mi.rcWork;
+    return {static_cast<int>(rect.left), static_cast<int>(rect.top),
+        static_cast<int>(rect.right - rect.left), static_cast<int>(rect.bottom - rect.top)};
+}
 
-    return GetOverlayWorkArea(nullptr);
+static UINT GetDpiForMonitorSafe(HMONITOR monitor)
+{
+    return static_cast<UINT>(std::max(1.0f, std::round(ImGui_ImplWin32_GetDpiScaleForMonitor(monitor) * 96)));
+}
+
+static OverlayWindowGeometry::Limits GetOverlayWindowLimits(HWND hwnd)
+{
+    return OverlayWindowGeometry::limits(GeometryRect(GetOverlayWorkArea(hwnd)), GetDpiForWindowSafe(hwnd));
+}
+
+static void FitOverlayToMonitor(HMONITOR monitor, UINT dpi, int& x, int& y, int& w, int& h, bool center = false)
+{
+    const auto fitted = OverlayWindowGeometry::fit({x, y, w, h}, GeometryRect(GetMonitorWorkArea(monitor)), dpi, center);
+    x = fitted.x; y = fitted.y; w = fitted.width; h = fitted.height;
 }
 
 static void ClampOverlayToWorkArea(HWND hwnd, int& x, int& y, int& w, int& h)
 {
-    const RECT desiredRect = {
-        x,
-        y,
-        x + OtherTools::MaxInt(1, w),
-        y + OtherTools::MaxInt(1, h)
-    };
-    const RECT work = hwnd ? GetOverlayWorkArea(hwnd) : GetOverlayWorkAreaForRect(desiredRect);
-    const UINT dpi = hwnd ? GetDpiForWindowSafe(hwnd) : 96;
+    const RECT desired{x, y, x + std::max(1, w), y + std::max(1, h)};
+    const auto monitor = ::MonitorFromRect(&desired, MONITOR_DEFAULTTONEAREST);
+    const UINT dpi = hwnd && monitor == ::MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) ?
+        GetDpiForWindowSafe(hwnd) : GetDpiForMonitorSafe(monitor);
+    FitOverlayToMonitor(monitor, dpi, x, y, w, h);
+}
 
-    const int minW = ::MulDiv(MIN_OVERLAY_W, (int)dpi, 96);
-    const int minH = ::MulDiv(MIN_OVERLAY_H, (int)dpi, 96);
+static void PlaceOverlayAtStartup(int& x, int& y, int& w, int& h)
+{
+    const RECT desired{x, y, x + std::max(1, w), y + std::max(1, h)};
+    auto monitor = ::MonitorFromRect(&desired, MONITOR_DEFAULTTONULL);
+    const bool missingMonitor = monitor == nullptr;
+    if (missingMonitor) monitor = GetCursorMonitor();
+    const UINT dpi = GetDpiForMonitorSafe(monitor);
+    const auto bounds = OverlayWindowGeometry::limits(GeometryRect(GetMonitorWorkArea(monitor)), dpi);
+    const bool oversized = w > bounds.available.width || h > bounds.available.height;
+    FitOverlayToMonitor(monitor, dpi, x, y, w, h, missingMonitor || oversized);
+}
 
-    const int workW = OtherTools::MaxInt(1, static_cast<int>(work.right - work.left - WORKAREA_MARGIN_PX));
-    const int workH = OtherTools::MaxInt(1, static_cast<int>(work.bottom - work.top - WORKAREA_MARGIN_PX));
-
-    const int maxW = OtherTools::MaxInt(minW, workW);
-    const int maxH = OtherTools::MaxInt(minH, workH);
-
-    w = ClampInt(w, minW, maxW);
-    h = ClampInt(h, minH, maxH);
-
-    const int maxX = OtherTools::MaxInt(static_cast<int>(work.left), static_cast<int>(work.right - w));
-    const int maxY = OtherTools::MaxInt(static_cast<int>(work.top), static_cast<int>(work.bottom - h));
-    x = ClampInt(x, static_cast<int>(work.left), maxX);
-    y = ClampInt(y, static_cast<int>(work.top), maxY);
+static void ApplyOverlayWindowRect(HWND hwnd, const RECT& desired, UINT dpi)
+{
+    int x = desired.left, y = desired.top, w = desired.right - desired.left, h = desired.bottom - desired.top;
+    const auto monitor = ::MonitorFromRect(&desired, MONITOR_DEFAULTTONEAREST);
+    FitOverlayToMonitor(monitor, dpi, x, y, w, h);
+    ::SetWindowPos(hwnd, nullptr, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
+    if (g_manualWindowDragActive)
+    {
+        ::GetWindowRect(hwnd, &g_manualWindowDragStartRect);
+        ::GetCursorPos(&g_manualWindowDragStartPoint);
+    }
+    StoreOverlayWindowGeometry(hwnd, true);
 }
 
 static void MarkOverlayGeometryDirty()
@@ -700,26 +836,23 @@ static bool StoreOverlayWindowGeometry(HWND hwnd, bool markDirty)
 
 static void EnsureOverlayInsideWorkArea(HWND hwnd, bool persistGeometry)
 {
-    if (!hwnd)
+    if (!hwnd || ::IsIconic(hwnd))
         return;
 
     RECT wndRect{};
-    ::GetWindowRect(hwnd, &wndRect);
-
-    const int oldW = overlayWidth;
-    const int oldH = overlayHeight;
+    if (!::GetWindowRect(hwnd, &wndRect)) return;
 
     int x = wndRect.left;
     int y = wndRect.top;
-    int w = overlayWidth;
-    int h = overlayHeight;
+    int w = wndRect.right - wndRect.left;
+    int h = wndRect.bottom - wndRect.top;
     ClampOverlayToWorkArea(hwnd, x, y, w, h);
 
     overlayWidth = w;
     overlayHeight = h;
 
-    if (x != wndRect.left || y != wndRect.top || w != oldW || h != oldH)
-        ::SetWindowPos(hwnd, NULL, x, y, w, h, SWP_NOZORDER);
+    if (x != wndRect.left || y != wndRect.top || w != wndRect.right - wndRect.left || h != wndRect.bottom - wndRect.top)
+        ::SetWindowPos(hwnd, NULL, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
 
     if (persistGeometry)
         StoreOverlayWindowGeometry(hwnd, true);
@@ -985,12 +1118,9 @@ static void UpdateManualOverlayWindowDrag(HWND hwnd)
     }
     else
     {
-        const UINT dpi = GetDpiForWindowSafe(hwnd);
-        const int minW = ::MulDiv(MIN_OVERLAY_W, (int)dpi, 96);
-        const int minH = ::MulDiv(MIN_OVERLAY_H, (int)dpi, 96);
-        const RECT work = GetOverlayWorkArea(hwnd);
-        const int maxW = OtherTools::MaxInt(minW, static_cast<int>((work.right - work.left) - WORKAREA_MARGIN_PX));
-        const int maxH = OtherTools::MaxInt(minH, static_cast<int>((work.bottom - work.top) - WORKAREA_MARGIN_PX));
+        const auto bounds = GetOverlayWindowLimits(hwnd);
+        const int minW = bounds.minWidth, minH = bounds.minHeight;
+        const int maxW = bounds.available.width, maxH = bounds.available.height;
 
         const bool left = g_manualWindowDragHit == HTLEFT ||
                           g_manualWindowDragHit == HTTOPLEFT ||
@@ -1033,8 +1163,33 @@ static void UpdateManualOverlayWindowDrag(HWND hwnd)
 
 LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
+    if(msg==WM_ACTIVATE)
+    {
+        if(LOWORD(wParam)==WA_INACTIVE)NodeEditor_EndInteraction();
+        editorInputCaptured.store(g_overlayVisible&&LOWORD(wParam)!=WA_INACTIVE);
+    }
+    else if(msg==WM_DESTROY)
+        editorInputCaptured.store(false);
     switch (msg)
     {
+        case WM_KEYDOWN:
+        case WM_SYSKEYDOWN:
+            if (g_overlayPreview)
+            {
+                const auto snapshot = SnapshotOverlayThreadConfig();
+                for (const auto& key : snapshot.buttonExit)
+                {
+                    const int code = KeyCodes::getKeyCode(key);
+                    if (code != -1 && static_cast<WPARAM>(code) == wParam)
+                    {
+                        shouldExit = true;
+                        ::PostQuitMessage(0);
+                        return 0;
+                    }
+                }
+            }
+            break;
+
         case WM_NCHITTEST:
         {
             POINT pt = { (int)(short)LOWORD(lParam), (int)(short)HIWORD(lParam) };
@@ -1060,23 +1215,23 @@ LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
             if (bottom) return HTBOTTOM;
 
             if (pt.y >= rc.top && pt.y < rc.top + DRAG_BAR_HEIGHT_PX)
+            {
+                if (::PtInRect(&g_sidebarToggleRect, pt) ||
+                    (g_activeOverlayTab < static_cast<int>(NodeGraph::GraphCount) && NodeEditor_ToolbarContainsPoint(static_cast<float>(pt.x), static_cast<float>(pt.y))))
+                    return HTCLIENT;
                 return HTCAPTION;
+            }
 
             return HTCLIENT;
         }
         case WM_GETMINMAXINFO:
         {
             MINMAXINFO* mmi = reinterpret_cast<MINMAXINFO*>(lParam);
-            const UINT dpi = GetDpiForWindowSafe(hWnd);
-            const int minW = ::MulDiv(MIN_OVERLAY_W, (int)dpi, 96);
-            const int minH = ::MulDiv(MIN_OVERLAY_H, (int)dpi, 96);
-            const RECT work = GetOverlayWorkArea(hWnd);
-            const int maxW = OtherTools::MaxInt(minW, static_cast<int>((work.right - work.left) - WORKAREA_MARGIN_PX));
-            const int maxH = OtherTools::MaxInt(minH, static_cast<int>((work.bottom - work.top) - WORKAREA_MARGIN_PX));
-            mmi->ptMinTrackSize.x = minW;
-            mmi->ptMinTrackSize.y = minH;
-            if (maxW > 0) mmi->ptMaxTrackSize.x = maxW;
-            if (maxH > 0) mmi->ptMaxTrackSize.y = maxH;
+            const auto bounds = GetOverlayWindowLimits(hWnd);
+            mmi->ptMinTrackSize.x = bounds.minWidth;
+            mmi->ptMinTrackSize.y = bounds.minHeight;
+            mmi->ptMaxTrackSize.x = bounds.available.width;
+            mmi->ptMaxTrackSize.y = bounds.available.height;
             return 0;
         }
         case WM_NCLBUTTONDOWN:
@@ -1129,8 +1284,17 @@ LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
         EnsureOverlayInsideWorkArea(hWnd, true);
         return 0;
 
+    case WM_SETTINGCHANGE:
+        if (wParam == SPI_SETWORKAREA)
+        {
+            EnsureOverlayInsideWorkArea(hWnd, true);
+            return 0;
+        }
+        return ::DefWindowProc(hWnd, msg, wParam, lParam);
+
     case WM_DPICHANGED:
-        EnsureOverlayInsideWorkArea(hWnd, true);
+        if (lParam) ApplyOverlayWindowRect(hWnd, *reinterpret_cast<const RECT*>(lParam), LOWORD(wParam));
+        else EnsureOverlayInsideWorkArea(hWnd, true);
         return 0;
 
     case WM_SIZE:
@@ -1198,17 +1362,7 @@ bool CreateOverlayWindow()
     overlayWidth = config.overlay_width > 0 ? config.overlay_width : BASE_OVERLAY_WIDTH;
     overlayHeight = config.overlay_height > 0 ? config.overlay_height : BASE_OVERLAY_HEIGHT;
 
-    {
-        int x = overlayX;
-        int y = overlayY;
-        int w = overlayWidth;
-        int h = overlayHeight;
-        ClampOverlayToWorkArea(nullptr, x, y, w, h);
-        overlayX = x;
-        overlayY = y;
-        overlayWidth = w;
-        overlayHeight = h;
-    }
+    PlaceOverlayAtStartup(overlayX, overlayY, overlayWidth, overlayHeight);
 
     WNDCLASSEX wc = {
         sizeof(WNDCLASSEX),
@@ -1226,7 +1380,7 @@ bool CreateOverlayWindow()
     };
     ::RegisterClassEx(&wc);
 
-    const DWORD exStyle = WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED;
+    const DWORD exStyle = WS_EX_TOPMOST | (g_overlayPreview ? WS_EX_APPWINDOW : WS_EX_TOOLWINDOW) | WS_EX_LAYERED;
     const DWORD style = WS_POPUP;
 
     RECT wr = { overlayX, overlayY, overlayX + overlayWidth, overlayY + overlayHeight };
@@ -1237,7 +1391,7 @@ bool CreateOverlayWindow()
 
     g_hwnd = ::CreateWindowEx(
         exStyle,
-        wc.lpszClassName, _T("Chrome"),
+        wc.lpszClassName, g_overlayPreview ? _T("Node editor preview") : _T("Chrome"),
         style,
         wr.left, wr.top, wndW, wndH,
         NULL, NULL, wc.hInstance, NULL);
@@ -1290,12 +1444,18 @@ static HRESULT RenderOverlayFrame(bool allowAutoResize, bool allowConfigSave)
 
     ImGui_ImplDX11_NewFrame();
     ImGui_ImplWin32_NewFrame();
+    NodeEditor_PrepareFrame();
     ImGui::NewFrame();
+    editorInputCaptured.store(g_overlayVisible&&OverlayOwnsForegroundInput());
 
-    const float sidebarWidth = std::clamp(w * 0.27f, 216.0f, 224.0f);
+    float sidebarLabelWidth = 0.0f;
+    for (const auto& tab : kOverlayTabs)
+        sidebarLabelWidth = std::max(sidebarLabelWidth, ImGui::CalcTextSize(tab.label).x);
+    const float expandedSidebarWidth = std::ceil(sidebarLabelWidth + ImGui::GetStyle().FramePadding.x + 31.0f + 12.0f * g_runtimeUiScale);
 
     ImGui::SetNextWindowPos(ImVec2(0.0f, 0.0f), ImGuiCond_Always);
     ImGui::SetNextWindowSize(ImVec2(w, h), ImGuiCond_Always);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(6.0f * g_runtimeUiScale, 8.0f * g_runtimeUiScale));
     ImGui::PushStyleColor(ImGuiCol_WindowBg, IM_COL32(0, 0, 0, 0));
     ImGui::Begin("##editor_root", nullptr,
         ImGuiWindowFlags_NoDecoration |
@@ -1306,54 +1466,162 @@ static HRESULT RenderOverlayFrame(bool allowAutoResize, bool allowConfigSave)
         ImGuiWindowFlags_NoScrollbar |
         ImGuiWindowFlags_NoScrollWithMouse);
     ImGui::PopStyleColor();
+    ImGui::PopStyleVar();
 
     DrawMainPanelBackground(ImGui::GetWindowPos(), ImGui::GetWindowSize());
 
     {
         std::lock_guard<std::mutex> lock(configMutex);
 
+        if (g_overlayPreview)
+        {
+            // Exercise the graph and its live visual state with synthetic
+            // observations. No capture, input device or mouse worker exists.
+            NodeGraph::Context preview;
+            preview.elapsedSeconds = ImGui::GetTime();
+            preview.aimHeld = true;
+            preview.shootHeld = true;
+            preview.zoomHeld = true;
+            preview.detectionsAvailable = true;
+            preview.captureFps = 120;
+            preview.center = {160,160};
+            const double t=preview.elapsedSeconds;
+            auto frame=std::make_shared<NodeGraph::DetectionFrame>();
+            frame->version=static_cast<std::int64_t>(t*120);frame->fresh=true;
+            frame->timestampSeconds=t;frame->width=frame->height=320;
+            const double x=180+std::sin(t*0.8)*40,y=160+std::cos(t*0.6)*24;
+            frame->objects.push_back({x-25,y-40,50,80,0,0.96});
+            frame->objects.push_back({x-10,y-46,20,20,1,0.91});
+            NodeGraph::Context visionPreview;
+            visionPreview.elapsedSeconds=t;visionPreview.center=preview.center;
+            visionPreview.captureFps=preview.captureFps;visionPreview.controlActive=true;
+            const auto clockTime=std::chrono::steady_clock::now();
+            const auto image=NodeVision::makeFrame(cv::Mat(320,320,CV_8UC3,cv::Scalar(35,45,60)),{},clockTime,0);
+            visionPreview.frame=image;
+            visionPreview.captureFrame=[image](int,const NodeGraph::Node&){return image;};
+            visionPreview.infer=[frame](int,const NodeGraph::FrameStream& input,const NodeGraph::Node& node){
+                auto result=std::make_shared<NodeGraph::DetectionFrame>(*frame);
+                result->timestampSeconds=input->timestampSeconds;result->version=input->version;result->generation=input->generation;
+                result->modelName=NodeGraph::textParameter(node,"model_path");return result;
+            };
+            visionPreview.depth=[](int,const NodeGraph::FrameStream& input,const NodeGraph::Node&){
+                auto native=std::make_shared<NodeVision::FrameStorage>();native->image=cv::Mat(320,320,CV_32FC1,cv::Scalar(0.5));
+                auto depth=std::make_shared<NodeGraph::FrameData>(*input);depth->gpu=false;depth->storage=native;return depth;
+            };
+            visionPreview.depthToMask=[](const NodeGraph::FrameStream& input,const NodeGraph::Node&){
+                auto native=std::make_shared<NodeVision::MaskStorage>();native->mask=cv::Mat::zeros(input->height,input->width,CV_8UC1);
+                auto mask=std::make_shared<NodeGraph::MaskData>();mask->width=input->width;mask->height=input->height;
+                mask->version=input->version;mask->generation=input->generation;mask->timestampSeconds=input->timestampSeconds;mask->storage=native;return mask;
+            };
+            visionPreview.applyMask=[](const NodeGraph::FrameStream& input,const NodeGraph::MaskStream&,const NodeGraph::Node&){return input;};
+            visionPreview.filterMask=[](const NodeGraph::DetectionStream& input,const NodeGraph::MaskStream&,const NodeGraph::Node&){return input;};
+            // Preview evaluates data flow, never dataset writes or real overlays.
+            visionPreview.collect=[](int,const NodeGraph::FrameStream&,const NodeGraph::DetectionStream&,const NodeGraph::Node&){return true;};
+            visionPreview.screenshot=[](int,const NodeGraph::FrameStream&,const NodeGraph::Node&){return true;};
+            visionPreview.render=[](int,const NodeGraph::FrameStream&,const NodeGraph::DetectionStream&,const NodeGraph::MaskStream&,const NodeGraph::FrameStream&,const NodeGraph::Node&){return true;};
+            visionPreview.keyDown=[](int key){return (GetAsyncKeyState(key)&0x8000)!=0;};
+            preview.detections=NodeGraph::service().evaluateVision(visionPreview).visionDetections;
+            preview.selectTarget = [](int nodeKey,const NodeGraph::DetectionStream& stream,bool,const NodeGraph::Node& node) {
+                NodeGraph::TargetData target;
+                if(!stream||stream->objects.empty())return target;
+                const NodeGraph::Detection* selected=&stream->objects.front();
+                for(const auto& item:stream->objects)
+                    if(std::hypot(item.x+item.width*0.5-160,item.y+item.height*0.5-160)<
+                       std::hypot(selected->x+selected->width*0.5-160,selected->y+selected->height*0.5-160))selected=&item;
+                target.x=selected->x;target.y=selected->y;target.width=selected->width;target.height=selected->height;
+                target.point={target.x+target.width*0.5,target.y+target.height*0.5};
+                target.classId=selected->classId;target.confidence=selected->confidence;target.trackId=nodeKey;
+                target.valid=target.observed=target.fresh=true;
+                if(node.kind==NodeGraph::NodeKind::Target&&NodeGraph::parameter(node,"legacy_offsets")!=0)
+                {
+                    const bool head=target.classId==static_cast<int>(NodeGraph::parameter(node,"class_head"));
+                    target.point.y=target.y+target.height*NodeGraph::parameter(node,head?"head_y_offset":"body_y_offset");
+                    target.pointPrepared=true;
+                }
+                return target;
+            };
+            preview.inScope=[](const NodeGraph::TargetData& target,double multiplier) {
+                return target.valid&&std::abs(target.x+target.width*0.5-160)<target.width*multiplier*0.5&&
+                       std::abs(target.y+target.height*0.5-160)<target.height*multiplier*0.5;
+            };
+            preview.predict=[t](int,NodeGraph::Point point,const NodeGraph::Node&,double lookahead,bool) {
+                return NodeGraph::Point{point.x+std::cos(t*0.8)*32*lookahead,point.y-std::sin(t*0.6)*14.4*lookahead};
+            };
+            preview.speedCurve=[](NodeGraph::Point point,const NodeGraph::Node& node) {
+                const double distance=std::hypot(point.x-160,point.y-160);
+                const double nearRadius=std::max(0.001,NodeGraph::parameter(node,"near_radius"));
+                const double amount=std::clamp(distance/nearRadius,0.0,1.0);
+                return NodeGraph::parameter(node,"min_speed")+(NodeGraph::parameter(node,"max_speed")-NodeGraph::parameter(node,"min_speed"))*amount;
+            };
+            preview.mouseDelta=[](NodeGraph::Point point,double speed,NodeGraph::Point center,const NodeGraph::Node& node) {
+                NodeGraph::Movement movement;
+                const double sensitivity=NodeGraph::parameter(node,"sens");
+                const double yaw=NodeGraph::parameter(node,"yaw"),pitch=NodeGraph::parameter(node,"pitch");
+                if(sensitivity<=0||yaw<=0||pitch<=0)return movement;
+                movement.steps.push_back({static_cast<int>(std::clamp((point.x-center.x)*NodeGraph::parameter(node,"fov_x")/320*speed/(sensitivity*yaw),-32767.0,32767.0)),
+                    static_cast<int>(std::clamp((point.y-center.y)*NodeGraph::parameter(node,"fov_y")/320*speed/(sensitivity*pitch),-32767.0,32767.0))});
+                return movement;
+            };
+            preview.windMotion=[](int,const NodeGraph::Movement& movement,const NodeGraph::Node&) { return movement; };
+            preview.motionCompensation=[](NodeGraph::Point point){return point;};
+            preview.keyDown=[](int key){return (GetAsyncKeyState(key)&0x8000)!=0;};
+            NodeGraph::service().evaluate(preview);
+        }
+
         const int tabCount = static_cast<int>(sizeof(kOverlayTabs) / sizeof(kOverlayTabs[0]));
         if (g_activeOverlayTab < 0 || g_activeOverlayTab >= tabCount)
             g_activeOverlayTab = 0;
 
+        const bool sidebarCollapsed = config.overlay_sidebar_collapsed;
+        if (g_sidebarAnimation.initialized && g_sidebarAnimation.targetCollapsed != sidebarCollapsed)
+            NodeEditor_EndInteraction(true);
+        const float sidebarExpansion = g_sidebarAnimation.update(sidebarCollapsed);
+        const float collapsedSidebarWidth = 44.0f * g_runtimeUiScale;
+        const float sidebarWidth = collapsedSidebarWidth + (expandedSidebarWidth - collapsedSidebarWidth) * sidebarExpansion;
+        if (g_sidebarAnimation.running()) NodeEditor_PreserveViewport();
         ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 8.0f);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 4.0f * g_runtimeUiScale));
         ImGui::PushStyleColor(ImGuiCol_ChildBg, IM_COL32(0, 0, 0, 0));
         ImGui::PushStyleColor(ImGuiCol_Border, IM_COL32(0, 0, 0, 0));
         ImGui::BeginChild("##options_nav", ImVec2(sidebarWidth, 0.0f),
             ImGuiChildFlags_AlwaysUseWindowPadding,
             ImGuiWindowFlags_NoScrollbar);
+        ImGui::PopStyleVar();
 
-        DrawSidebarTitle();
-
+        if (DrawSidebarHeader(sidebarCollapsed, sidebarExpansion))
+        {
+            config.overlay_sidebar_collapsed = !sidebarCollapsed;
+            OverlayConfig_MarkDirty();
+        }
         const char* lastGroup = nullptr;
         for (int i = 0; i < tabCount; ++i)
         {
             const char* group = kOverlayTabs[i].group;
-            if (!lastGroup || std::strcmp(lastGroup, group) != 0)
+            if (lastGroup && std::strcmp(lastGroup, group) != 0)
+                DrawSidebarGroup(group, sidebarExpansion);
+            if (DrawSidebarTabButton(kOverlayTabs[i], g_activeOverlayTab == i, sidebarExpansion))
             {
-                if (lastGroup)
-                    ImGui::Dummy(ImVec2(0.0f, 5.0f));
-                ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(177, 177, 177, 230));
-                ImGui::TextUnformatted(group);
-                ImGui::PopStyleColor();
-            }
-            if (DrawSidebarTabButton(kOverlayTabs[i], g_activeOverlayTab == i))
+                if(g_activeOverlayTab!=i)NodeEditor_EndInteraction();
                 g_activeOverlayTab = i;
+            }
             lastGroup = group;
         }
         ImGui::EndChild();
         ImGui::PopStyleColor(2);
         ImGui::PopStyleVar();
 
-        ImGui::SameLine(0.0f, 12.0f);
+        ImGui::SameLine(0.0f, 8.0f * g_runtimeUiScale);
 
         float contentExtraW = 0.0f;
+        const bool graphTab = g_activeOverlayTab < static_cast<int>(NodeGraph::GraphCount);
         ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 8.0f);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, graphTab ? ImVec2(0.0f, 0.0f) : ImGui::GetStyle().WindowPadding);
         ImGui::PushStyleColor(ImGuiCol_ChildBg, IM_COL32(0, 0, 0, 0));
         ImGui::PushStyleColor(ImGuiCol_Border, IM_COL32(0, 0, 0, 0));
         ImGui::BeginChild("##options_content", ImVec2(0.0f, 0.0f),
             ImGuiChildFlags_AlwaysUseWindowPadding,
-            ImGuiWindowFlags_AlwaysVerticalScrollbar);
+            graphTab ? (ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse) : ImGuiWindowFlags_AlwaysVerticalScrollbar);
+        ImGui::PopStyleVar();
 
         kOverlayTabs[g_activeOverlayTab].draw();
 
@@ -1370,6 +1638,11 @@ static HRESULT RenderOverlayFrame(bool allowAutoResize, bool allowConfigSave)
     }
 
     ImGui::End();
+    const auto& input=ImGui::GetIO();
+    const bool uiOwnsInput=ImGui::IsWindowFocused(ImGuiFocusedFlags_AnyWindow)||
+        ImGui::IsWindowHovered(ImGuiHoveredFlags_AnyWindow)||ImGui::IsAnyItemActive()||
+        input.WantCaptureMouse||input.WantCaptureKeyboard||input.WantTextInput;
+    editorInputCaptured.store(g_overlayVisible&&OverlayOwnsForegroundInput()&&uiOwnsInput);
     ImGui::Render();
 
     const float clear_color_with_alpha[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
@@ -1379,11 +1652,13 @@ static HRESULT RenderOverlayFrame(bool allowAutoResize, bool allowConfigSave)
 
     const HRESULT result = g_pSwapChain->Present(0, 0);
     g_renderingOverlayFrame = false;
+    NodeEditor_RunFileActions();
     return result;
 }
 
 void OverlayThread()
 {
+    NodeGraph::service().setTelemetryEnabled(g_overlayPreview);
     if (!CreateOverlayWindow())
     {
         std::cout << "[Overlay] Can't create overlay window!" << std::endl;
@@ -1392,7 +1667,13 @@ void OverlayThread()
 
     SetupImGui();
 
-    bool show_overlay = false;
+    bool show_overlay = g_overlayPreview;
+    if (g_overlayPreview)
+    {
+        g_overlayVisible = true;
+        ShowWindow(g_hwnd, SW_SHOW);
+        SetForegroundWindow(g_hwnd);
+    }
 
     for (const auto& pair : KeyCodes::key_code_map)
         key_names.push_back(pair.first);
@@ -1427,6 +1708,14 @@ void OverlayThread()
 
         overlayCfg = SnapshotOverlayThreadConfig();
 
+        // Preview has no keyboard listener. Keep its configured exit hotkey
+        // available while retaining the normal flush and window cleanup path.
+        if (g_overlayPreview && isAnyKeyPressedWin32Only(overlayCfg.buttonExit))
+        {
+            shouldExit = true;
+            break;
+        }
+
         if (lastExcludeFromCapture != overlayCfg.excludeFromCapture)
         {
             lastExcludeFromCapture = overlayCfg.excludeFromCapture;
@@ -1438,6 +1727,7 @@ void OverlayThread()
         {
             show_overlay = !show_overlay;
             g_overlayVisible = show_overlay;
+            NodeGraph::service().setTelemetryEnabled(show_overlay);
 
             if (show_overlay)
             {
@@ -1448,6 +1738,8 @@ void OverlayThread()
             }
             else
             {
+                NodeEditor_EndInteraction();
+                NodeEditor_Flush();
                 StoreOverlayWindowGeometry(g_hwnd, true);
                 {
                     std::lock_guard<std::mutex> lock(configMutex);
@@ -1457,6 +1749,7 @@ void OverlayThread()
             }
         }
         overlayHotkeyWasDown = overlayHotkeyDown;
+        editorInputCaptured.store(show_overlay&&OverlayOwnsForegroundInput());
 
         if (!show_overlay)
         {
@@ -1464,19 +1757,23 @@ void OverlayThread()
             continue;
         }
 
-        HRESULT result = RenderOverlayFrame(true, true);
+        HRESULT result = RenderOverlayFrame(true, !g_overlayPreview);
         if (result == DXGI_STATUS_OCCLUDED || result == DXGI_ERROR_ACCESS_LOST)
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 
+    NodeEditor_EndInteraction();
+    NodeGraph::service().setTelemetryEnabled(false);
+    editorInputCaptured.store(false);
     {
-        StoreOverlayWindowGeometry(g_hwnd, true);
+        if (!g_overlayPreview) StoreOverlayWindowGeometry(g_hwnd, true);
         std::lock_guard<std::mutex> lock(configMutex);
-        OverlayConfig_SaveNow();
+        if (!g_overlayPreview) OverlayConfig_SaveNow();
     }
 
+    NodeEditor_Flush();
     release_body_texture();
 
     ImGui_ImplDX11_Shutdown();
@@ -1486,6 +1783,24 @@ void OverlayThread()
     CleanupDeviceD3D();
     ::DestroyWindow(g_hwnd);
     ::UnregisterClass(_T("Chrome"), GetModuleHandle(NULL));
+}
+
+void OverlayPreview()
+{
+    g_overlayPreview = true;
+    NodeEditor_SetPreview(true);
+    config.overlay_exclude_from_capture = false;
+    OverlayThread();
+}
+
+void Overlay_ExpandForNodes()
+{
+    RECT current{};
+    if (!g_hwnd || !GetWindowRect(g_hwnd, &current)) return;
+    int x = current.left, y = current.top;
+    int width = std::max(1180, overlayWidth), height = std::max(740, overlayHeight);
+    ClampOverlayToWorkArea(g_hwnd, x, y, width, height);
+    SetWindowPos(g_hwnd, nullptr, x, y, width, height, SWP_NOZORDER | SWP_NOACTIVATE);
 }
 
 int APIENTRY _tWinMain(_In_ HINSTANCE hInstance,

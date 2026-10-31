@@ -29,6 +29,7 @@ public:
         std::string target;
         std::string windowTitle;
         int monitorIndex = 0;
+        std::string monitorDevice;
         bool captureBorders = true;
         bool captureCursor = true;
     };

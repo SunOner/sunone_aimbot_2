@@ -1,6 +1,6 @@
 # Data Collection
 
-Data collection can be useful for model work but can affect performance:
+Configure the Collect Dataset node. For a new workspace, these config values seed its settings:
 
 ```ini
 collect_data_while_playing = false

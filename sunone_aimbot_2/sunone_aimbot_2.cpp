@@ -33,6 +33,8 @@
 #include "mem/cpu_affinity_manager.h"
 #include "runtime/thread_loops.h"
 #include "benchmarks/provider_benchmark.h"
+#include "overlay/node_editor.h"
+#include "nodes/vision_runtime.h"
 
 #ifdef USE_CUDA
 #include "mem/gpu_resource_manager.h"
@@ -44,6 +46,8 @@
 std::condition_variable frameCV;
 std::atomic<bool> shouldExit(false);
 std::atomic<bool> aiming(false);
+std::atomic<bool> graphAimActive(false);
+std::atomic<bool> editorInputCaptured(false);
 std::mutex configMutex;
 std::mutex inputDevicesMutex;
 
@@ -104,41 +108,6 @@ static void SetWorkingDirectoryToExecutable()
                       << " (" << ec.message() << ")" << std::endl;
         }
     }
-}
-
-static bool SelectCompatibleAiModel()
-{
-    std::vector<std::string> availableModels = getAvailableModels();
-    if (!config.ai_model.empty())
-    {
-        const std::string modelPath = "models/" + config.ai_model;
-        if (!std::filesystem::exists(modelPath))
-        {
-            std::cerr << "[MAIN] Specified model does not exist: " << modelPath << std::endl;
-        }
-        else if (std::find(availableModels.begin(), availableModels.end(), config.ai_model) != availableModels.end())
-        {
-            return true;
-        }
-        else
-        {
-            std::cerr << "[MAIN] Specified model is not compatible with backend "
-                      << config.backend << ": " << config.ai_model << std::endl;
-        }
-    }
-
-    if (availableModels.empty())
-    {
-        std::cerr << "[MAIN] No compatible AI models found in 'models' directory for backend "
-                  << config.backend << "." << std::endl;
-        return false;
-    }
-
-    config.ai_model = availableModels[0];
-    config.saveConfig("config.ini");
-    std::cout << "[MAIN] Loaded first compatible " << config.backend
-              << " model: " << config.ai_model << std::endl;
-    return true;
 }
 
 static void HandleThreadCrash(const char* name, const std::exception* ex)
@@ -256,6 +225,17 @@ int main(int argc, char** argv)
         return -1;
     }
 
+    NodeEditor_Load();
+
+    // Inspect the native editor without starting capture, inference or input.
+    if (argc > 1 && std::string(argv[1]) == "--node-editor-preview")
+    {
+        OverlayPreview();
+        return 0;
+    }
+
+    NodeVision::syncCaptureConfiguration();
+
     CPUAffinityManager cpuManager;
 
     if (config.cpuCoreReserveCount > 0)
@@ -358,12 +338,6 @@ int main(int argc, char** argv)
             }
         }
 
-        if (!SelectCompatibleAiModel())
-        {
-            std::cin.get();
-            return -1;
-        }
-
         createInputDevices();
 
         MouseThread mouseThread(
@@ -373,22 +347,18 @@ int main(int argc, char** argv)
             config.minSpeedMultiplier,
             config.maxSpeedMultiplier,
             config.predictionInterval,
-            config.auto_shoot,
-            config.bScope_multiplier,
             activeMouseInputOwner.get()
         );
 
         globalMouseThread = &mouseThread;
         assignInputDevices();
 
-#ifdef USE_CUDA
-        trt_detector.initialize("models/" + config.ai_model);
-#else
+#ifndef USE_CUDA
         std::thread dml_detThread;
         DirectMLDetector* newDmlDetector = nullptr;
         try
         {
-            newDmlDetector = new DirectMLDetector("models/" + config.ai_model);
+            newDmlDetector = new DirectMLDetector();
             dml_detector = newDmlDetector;
             std::cout << "[MAIN] DML detector created"
                       << (dml_detector->isReady() ? "." : " without an active model.") << std::endl;

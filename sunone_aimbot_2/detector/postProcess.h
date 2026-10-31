@@ -27,7 +27,8 @@ std::vector<Detection> postProcessYolo(
     float confThreshold,
     float nmsThreshold,
     int maxDetections = 100,
-    std::chrono::duration<double, std::milli>* nmsTime = nullptr
+    std::chrono::duration<double, std::milli>* nmsTime = nullptr,
+    float imageScale = 1.0f
 );
 #endif
 

@@ -21,11 +21,9 @@
 #include <vector>
 
 #include "capture.h"
+#include "nodes/vision_runtime.h"
 #ifdef USE_CUDA
 #include "trt_detector.h"
-#include "depth/depth_anything_trt.h"
-#include "depth/depth_mask.h"
-#include "tensorrt/nvinf.h"
 #endif
 #include "sunone_aimbot_2.h"
 #include "keycodes.h"
@@ -109,24 +107,16 @@ struct CaptureThreadConfig
     bool capture_cursor = true;
     std::string capture_target;
     std::string capture_window_title;
+    std::string capture_monitor_device;
     std::string virtual_camera_name;
     int virtual_camera_width = 0;
     int virtual_camera_heigth = 0;
     std::string udp_ip;
     int udp_port = 0;
     std::string backend;
-    std::vector<std::string> screenshot_button;
-    int screenshot_delay = 0;
     bool show_window = false;
     bool verbose = false;
 #ifdef USE_CUDA
-    bool depth_inference_enabled = false;
-    bool depth_mask_enabled = false;
-    std::string depth_model_path;
-    int depth_mask_fps = 0;
-    int depth_mask_near_percent = 0;
-    int depth_mask_expand = 0;
-    bool depth_mask_invert = false;
     bool capture_use_cuda = true;
 #endif
 };
@@ -145,24 +135,16 @@ CaptureThreadConfig SnapshotCaptureConfig()
     snapshot.capture_cursor = config.capture_cursor;
     snapshot.capture_target = config.capture_target;
     snapshot.capture_window_title = config.capture_window_title;
+    snapshot.capture_monitor_device = config.capture_monitor_device;
     snapshot.virtual_camera_name = config.virtual_camera_name;
     snapshot.virtual_camera_width = config.virtual_camera_width;
     snapshot.virtual_camera_heigth = config.virtual_camera_heigth;
     snapshot.udp_ip = config.udp_ip;
     snapshot.udp_port = config.udp_port;
     snapshot.backend = config.backend;
-    snapshot.screenshot_button = config.screenshot_button;
-    snapshot.screenshot_delay = config.screenshot_delay;
     snapshot.show_window = config.show_window;
     snapshot.verbose = config.verbose;
 #ifdef USE_CUDA
-    snapshot.depth_inference_enabled = config.depth_inference_enabled;
-    snapshot.depth_mask_enabled = config.depth_mask_enabled;
-    snapshot.depth_model_path = config.depth_model_path;
-    snapshot.depth_mask_fps = config.depth_mask_fps;
-    snapshot.depth_mask_near_percent = config.depth_mask_near_percent;
-    snapshot.depth_mask_expand = config.depth_mask_expand;
-    snapshot.depth_mask_invert = config.depth_mask_invert;
     snapshot.capture_use_cuda = config.capture_use_cuda;
 #endif
     return snapshot;
@@ -241,7 +223,6 @@ void MaybeLogCudaCaptureDiagnostics(CudaCaptureDiagnostics& diag, const CaptureT
         << " show_window=" << (cfg.show_window ? "true" : "false")
         << " circle_fov=" << (cfg.circle_fov_enabled ? "true" : "false")
         << " circle_fov_radius=" << cfg.circle_fov_radius_percent
-        << " depth_mask=" << ((cfg.depth_inference_enabled && cfg.depth_mask_enabled) ? "true" : "false")
         << " prefer_gpu=" << (diag.lastPreferGpu ? "true" : "false")
         << " need_cpu_copy=" << (diag.lastNeedCpuCopy ? "true" : "false")
         << " gpu_attempts=" << diag.gpuAttempts
@@ -352,93 +333,6 @@ private:
     bool initialized_{ false };
 };
 
-class ScreenshotWriter
-{
-public:
-    ScreenshotWriter()
-    {
-        writerThread_ = std::thread([this]() { Run(); });
-    }
-
-    ~ScreenshotWriter()
-    {
-        Stop();
-    }
-
-    void Enqueue(const std::string& filename, cv::Mat frame)
-    {
-        if (filename.empty() || frame.empty())
-            return;
-
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (queue_.size() >= maxPendingFrames_)
-            queue_.pop();
-        queue_.emplace(filename, std::move(frame));
-        cv_.notify_one();
-    }
-
-private:
-    void Stop()
-    {
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            stop_ = true;
-        }
-        cv_.notify_one();
-
-        if (writerThread_.joinable())
-            writerThread_.join();
-    }
-
-    void Run()
-    {
-        while (true)
-        {
-            std::pair<std::string, cv::Mat> job;
-            {
-                std::unique_lock<std::mutex> lock(mutex_);
-                cv_.wait(lock, [this]() { return stop_ || !queue_.empty(); });
-                if (stop_ && queue_.empty())
-                    break;
-
-                job = std::move(queue_.front());
-                queue_.pop();
-            }
-
-            try
-            {
-                const std::filesystem::path screenshotsDir("screenshots");
-                std::error_code ec;
-                std::filesystem::create_directories(screenshotsDir, ec);
-                if (ec)
-                {
-                    std::cerr << "[Capture] Screenshot folder create failed: " << ec.message() << std::endl;
-                    continue;
-                }
-
-                const std::filesystem::path outputPath = screenshotsDir / job.first;
-                cv::imwrite(outputPath.string(), job.second);
-            }
-            catch (const std::exception& e)
-            {
-                std::cerr << "[Capture] Screenshot save failed: " << e.what() << std::endl;
-            }
-            catch (...)
-            {
-                std::cerr << "[Capture] Screenshot save failed: unknown exception." << std::endl;
-            }
-        }
-    }
-
-private:
-    static constexpr size_t maxPendingFrames_ = 8;
-
-    std::mutex mutex_;
-    std::condition_variable cv_;
-    std::queue<std::pair<std::string, cv::Mat>> queue_;
-    std::thread writerThread_;
-    bool stop_{ false };
-};
 } // namespace
 
 std::vector<cv::Mat> getBatchFromQueue(int batch_size)
@@ -460,6 +354,7 @@ void captureThread(int CAPTURE_WIDTH, int CAPTURE_HEIGHT)
 {
     try
     {
+        const bool initiallyRequested=NodeVision::syncCaptureConfiguration();
         CaptureThreadConfig currentCfg = SnapshotCaptureConfig();
         if (currentCfg.verbose)
             std::cout << "[Capture] OpenCV version: " << CV_VERSION << std::endl;
@@ -471,11 +366,6 @@ void captureThread(int CAPTURE_WIDTH, int CAPTURE_HEIGHT)
             captureWidth = currentCfg.detection_resolution;
             captureHeight = currentCfg.detection_resolution;
         }
-
-#ifdef USE_CUDA
-        depth_anything::DepthAnythingTrt depthMaskFallbackModel;
-        std::string depthMaskFallbackModelPath;
-#endif
 
         WinrtApartmentGuard winrtApartment;
         auto createCapturer = [&](const CaptureThreadConfig& cfg, int width, int height) -> std::unique_ptr<IScreenCapture>
@@ -490,7 +380,7 @@ void captureThread(int CAPTURE_WIDTH, int CAPTURE_HEIGHT)
                 {
                     if (cfg.verbose)
                         std::cout << "[Capture] Using Duplication API" << std::endl;
-                    auto capture = std::make_unique<DuplicationAPIScreenCapture>(width, height, cfg.monitor_idx);
+                    auto capture = std::make_unique<DuplicationAPIScreenCapture>(width, height, cfg.monitor_idx,cfg.capture_monitor_device);
                     if (!capture->isInitialized())
                         return nullptr;
                     return capture;
@@ -505,6 +395,7 @@ void captureThread(int CAPTURE_WIDTH, int CAPTURE_HEIGHT)
                     options.target = cfg.capture_target;
                     options.windowTitle = cfg.capture_window_title;
                     options.monitorIndex = cfg.monitor_idx;
+                    options.monitorDevice = cfg.capture_monitor_device;
                     options.captureBorders = cfg.capture_borders;
                     options.captureCursor = cfg.capture_cursor;
 
@@ -557,9 +448,9 @@ void captureThread(int CAPTURE_WIDTH, int CAPTURE_HEIGHT)
         };
 
         std::string desiredCaptureMethod = NormalizeCaptureMethod(currentCfg.capture_method);
-        winrtApartment.Ensure(desiredCaptureMethod == "winrt");
+        winrtApartment.Ensure(initiallyRequested&&desiredCaptureMethod == "winrt");
 
-        std::unique_ptr<IScreenCapture> capturer = createCapturer(currentCfg, captureWidth, captureHeight);
+        std::unique_ptr<IScreenCapture> capturer = initiallyRequested?createCapturer(currentCfg, captureWidth, captureHeight):nullptr;
         publishCaptureSourceSize(capturer.get());
         std::string activeCapturerMethod = capturer ? desiredCaptureMethod : std::string();
         auto lastCapturerCreateAttempt = std::chrono::steady_clock::now();
@@ -648,11 +539,9 @@ void captureThread(int CAPTURE_WIDTH, int CAPTURE_HEIGHT)
             frameStartTime = std::chrono::steady_clock::now();
         };
 
-        ScreenshotWriter screenshotWriter;
 #ifdef USE_CUDA
         CudaCaptureDiagnostics cudaDiag;
 #endif
-        auto lastSaveTime = std::chrono::steady_clock::now();
         auto lastSuccessfulFrameTime = std::chrono::steady_clock::now();
         constexpr auto staleFrameTimeout = std::chrono::milliseconds(500);
 
@@ -660,6 +549,14 @@ void captureThread(int CAPTURE_WIDTH, int CAPTURE_HEIGHT)
         {
             try
             {
+                if(!NodeVision::syncCaptureConfiguration())
+                {
+                    setCaptureUnavailable();
+                    capturer.reset();activeCapturerMethod.clear();winrtApartment.Ensure(false);
+                    lastCapturerCreateAttempt=std::chrono::steady_clock::now()-std::chrono::seconds(1);
+                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                    continue;
+                }
                 currentCfg = SnapshotCaptureConfig();
 
             if (capture_fps_changed.exchange(false))
@@ -772,21 +669,11 @@ void captureThread(int CAPTURE_WIDTH, int CAPTURE_HEIGHT)
                 continue;
             }
 
-            const bool screenshotEnabled =
-                !currentCfg.screenshot_button.empty() && currentCfg.screenshot_button[0] != "None";
-            const auto screenshotNow = std::chrono::steady_clock::now();
-            const auto screenshotElapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
-                screenshotNow - lastSaveTime
-            ).count();
-            const bool screenshotRequested =
-                screenshotEnabled &&
-                isAnyKeyPressed(currentCfg.screenshot_button) &&
-                screenshotElapsedMs >= currentCfg.screenshot_delay;
 #ifdef USE_CUDA
-            const bool needCpuCopyFromGpu = screenshotRequested || currentCfg.show_window;
+            const bool needCpuCopyFromGpu = currentCfg.show_window;
 #endif
 
-            cv::Mat screenshotCpu;
+            cv::Mat sourceCpu;
             cv::Mat detectionFrame;
             std::chrono::steady_clock::time_point frameTimestamp{};
             bool frameSubmittedToDetector = false;
@@ -794,31 +681,9 @@ void captureThread(int CAPTURE_WIDTH, int CAPTURE_HEIGHT)
             bool keepCaptureAliveThisFrame = false;
 
 #ifdef USE_CUDA
-            static bool lastDepthInferenceEnabled = true;
-            if (!currentCfg.depth_inference_enabled)
-            {
-                if (lastDepthInferenceEnabled)
-                {
-                    auto& depthMask = depth_anything::GetDepthMaskGenerator();
-                    depthMask.reset();
-                    depthMaskFallbackModel.reset();
-                    depthMaskFallbackModelPath.clear();
-                }
-                UpdateDetectionSuppressionMask(cv::Mat());
-                lastDepthInferenceEnabled = false;
-            }
-            else
-            {
-                lastDepthInferenceEnabled = true;
-            }
-
-            const bool depthMaskEnabled = currentCfg.depth_inference_enabled && currentCfg.depth_mask_enabled;
             const bool preferGpuCapturePath =
-                currentCfg.backend == "TRT" &&
                 NormalizeCaptureMethod(currentCfg.capture_method) == "duplication_api" &&
-                currentCfg.capture_use_cuda &&
-                !depthMaskEnabled;
-
+                currentCfg.capture_use_cuda;
             cudaDiag.lastPreferGpu = preferGpuCapturePath;
             cudaDiag.lastNeedCpuCopy = needCpuCopyFromGpu;
 
@@ -827,7 +692,7 @@ void captureThread(int CAPTURE_WIDTH, int CAPTURE_HEIGHT)
                 auto* duplicationCapture = dynamic_cast<DuplicationAPIScreenCapture*>(capturer.get());
                 if (duplicationCapture)
                 {
-                    cv::cuda::GpuMat screenshotGpu;
+                    cv::cuda::GpuMat capturedGpu;
                     GpuCaptureStatus gpuStatus = GpuCaptureStatus::NotReady;
                     uint32_t accumulatedFrames = 0;
                     DdaCaptureFrameInfo ddaFrameInfo;
@@ -857,7 +722,7 @@ void captureThread(int CAPTURE_WIDTH, int CAPTURE_HEIGHT)
 
                     cudaDiag.gpuAttempts++;
                     captureGpuAttemptsTotal.fetch_add(1, std::memory_order_relaxed);
-                    if (duplicationCapture->GetNextFrameGpu(screenshotGpu, &gpuStatus, &accumulatedFrames, &ddaFrameInfo))
+                    if (duplicationCapture->GetNextFrameGpu(capturedGpu, &gpuStatus, &accumulatedFrames, &ddaFrameInfo))
                     {
                         CountGpuCaptureStatus(cudaDiag, gpuStatus);
                         const uint64_t accumulated = accumulatedFrames;
@@ -868,13 +733,13 @@ void captureThread(int CAPTURE_WIDTH, int CAPTURE_HEIGHT)
                         captureGpuMissedFramesTotal.fetch_add(missed, std::memory_order_relaxed);
                         countDdaFrameInfo(ddaFrameInfo);
                         frameTimestamp = std::chrono::steady_clock::now();
-                        trt_detector.processFrameGpu(screenshotGpu, frameTimestamp);
+                        trt_detector.processFrameGpu(capturedGpu, frameTimestamp);
                         cudaDiag.gpuSubmitted++;
                         frameSubmittedToDetector = true;
 
                         if (needCpuCopyFromGpu)
                         {
-                            screenshotGpu.download(screenshotCpu);
+                            capturedGpu.download(sourceCpu);
                             cudaDiag.gpuCpuCopies++;
                         }
                     }
@@ -930,10 +795,10 @@ void captureThread(int CAPTURE_WIDTH, int CAPTURE_HEIGHT)
                     captureCpuFallbackAttemptsTotal.fetch_add(1, std::memory_order_relaxed);
                 }
 #endif
-                screenshotCpu = capturer->GetNextFrameCpu();
+                sourceCpu = capturer->GetNextFrameCpu();
                 frameTimestamp = std::chrono::steady_clock::now();
 
-                if (screenshotCpu.empty())
+                if (sourceCpu.empty())
                 {
 #ifdef USE_CUDA
                     if (cpuFallbackFromGpu)
@@ -965,8 +830,8 @@ void captureThread(int CAPTURE_WIDTH, int CAPTURE_HEIGHT)
                 {
                     const int targetW = std::max(1, captureWidth);
                     const int targetH = std::max(1, captureHeight);
-                    const int roiW = std::min(targetW, screenshotCpu.cols);
-                    const int roiH = std::min(targetH, screenshotCpu.rows);
+                    const int roiW = std::min(targetW, sourceCpu.cols);
+                    const int roiH = std::min(targetH, sourceCpu.rows);
 
                     if (roiW <= 0 || roiH <= 0)
                     {
@@ -977,191 +842,49 @@ void captureThread(int CAPTURE_WIDTH, int CAPTURE_HEIGHT)
                         continue;
                     }
 
-                    const int x = std::max(0, (screenshotCpu.cols - roiW) / 2);
-                    const int y = std::max(0, (screenshotCpu.rows - roiH) / 2);
-                    cv::Mat centered = screenshotCpu(cv::Rect(x, y, roiW, roiH));
+                    const int x = std::max(0, (sourceCpu.cols - roiW) / 2);
+                    const int y = std::max(0, (sourceCpu.rows - roiH) / 2);
+                    cv::Mat centered = sourceCpu(cv::Rect(x, y, roiW, roiH));
 
                     if (roiW != targetW || roiH != targetH)
                     {
-                        cv::resize(centered, screenshotCpu, cv::Size(targetW, targetH), 0, 0, cv::INTER_LINEAR);
+                        cv::resize(centered, sourceCpu, cv::Size(targetW, targetH), 0, 0, cv::INTER_LINEAR);
                     }
                     else
                     {
-                        screenshotCpu = centered;
+                        sourceCpu = centered;
                     }
                 }
 
-                detectionFrame = screenshotCpu;
-#ifdef USE_CUDA
-                if (currentCfg.depth_inference_enabled && currentCfg.depth_mask_enabled)
-                {
-                    if (currentCfg.verbose)
-                    {
-                        static auto lastMaskLog = std::chrono::steady_clock::time_point::min();
-                        auto now = std::chrono::steady_clock::now();
-                        if (now - lastMaskLog > std::chrono::seconds(2))
-                        {
-                            std::cout << "[DepthMask] update frame " << screenshotCpu.cols << "x" << screenshotCpu.rows
-                                      << " model=" << currentCfg.depth_model_path
-                                      << " fps=" << currentCfg.depth_mask_fps
-                                      << " near=" << currentCfg.depth_mask_near_percent
-                                      << " expand=" << currentCfg.depth_mask_expand
-                                      << " invert=" << (currentCfg.depth_mask_invert ? "true" : "false")
-                                      << std::endl;
-                            lastMaskLog = now;
-                        }
-                    }
-
-                    cv::Mat mask;
-                    depth_anything::DepthMaskOptions maskOptions;
-                    maskOptions.enabled = currentCfg.depth_mask_enabled;
-                    maskOptions.fps = currentCfg.depth_mask_fps;
-                    maskOptions.near_percent = currentCfg.depth_mask_near_percent;
-                    maskOptions.expand = currentCfg.depth_mask_expand;
-                    maskOptions.invert = currentCfg.depth_mask_invert;
-
-                    auto& depthMask = depth_anything::GetDepthMaskGenerator();
-                    depthMask.update(screenshotCpu, maskOptions, currentCfg.depth_model_path, gLogger);
-                    mask = depthMask.getMask();
-
-                    if (!mask.empty() && mask.size() != screenshotCpu.size())
-                        mask.release();
-
-                    if (mask.empty())
-                    {
-                        if (currentCfg.depth_model_path.empty())
-                        {
-                            if (depthMaskFallbackModel.ready())
-                                depthMaskFallbackModel.reset();
-                            depthMaskFallbackModelPath.clear();
-                        }
-                        else if (depthMaskFallbackModelPath != currentCfg.depth_model_path || !depthMaskFallbackModel.ready())
-                        {
-                            if (depthMaskFallbackModel.initialize(currentCfg.depth_model_path, gLogger))
-                            {
-                                depthMaskFallbackModelPath = currentCfg.depth_model_path;
-                            }
-                        }
-
-                        if (depthMaskFallbackModel.ready())
-                        {
-                            cv::Mat depthLocal = depthMaskFallbackModel.predictDepth(screenshotCpu);
-                            if (!depthLocal.empty())
-                            {
-                                const int nearPercent = std::clamp(currentCfg.depth_mask_near_percent, 1, 100);
-                                const bool invertMask = currentCfg.depth_mask_invert;
-                                const int total = depthLocal.rows * depthLocal.cols;
-                                if (total > 0)
-                                {
-                                    int hist[256] = {};
-                                    for (int y = 0; y < depthLocal.rows; ++y)
-                                    {
-                                        const uint8_t* row = depthLocal.ptr<uint8_t>(y);
-                                        for (int x = 0; x < depthLocal.cols; ++x)
-                                            hist[row[x]]++;
-                                    }
-
-                                    const int target = std::max(1, (total * nearPercent) / 100);
-                                    int threshold = 0;
-                                    if (!invertMask)
-                                    {
-                                        int count = 0;
-                                        for (int i = 0; i < 256; ++i)
-                                        {
-                                            count += hist[i];
-                                            if (count >= target)
-                                            {
-                                                threshold = i;
-                                                break;
-                                            }
-                                        }
-                                        cv::compare(depthLocal, threshold, mask, cv::CMP_LE);
-                                    }
-                                    else
-                                    {
-                                        int count = 0;
-                                        for (int i = 255; i >= 0; --i)
-                                        {
-                                            count += hist[i];
-                                            if (count >= target)
-                                            {
-                                                threshold = i;
-                                                break;
-                                            }
-                                        }
-                                        cv::compare(depthLocal, threshold, mask, cv::CMP_GE);
-                                    }
-
-                                    const int expand = std::clamp(currentCfg.depth_mask_expand, 0, 128);
-                                    if (expand > 0)
-                                    {
-                                        const int kernelSize = 2 * expand + 1;
-                                        cv::Mat kernel = cv::getStructuringElement(
-                                            cv::MORPH_ELLIPSE, cv::Size(kernelSize, kernelSize));
-                                        cv::dilate(mask, mask, kernel);
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    UpdateDetectionSuppressionMask(mask);
-                    if (!mask.empty() && mask.size() == screenshotCpu.size())
-                    {
-                        detectionFrame = screenshotCpu.clone();
-                        detectionFrame.setTo(cv::Scalar(0, 0, 0), mask);
-                    }
-                }
-                else
-                {
-                    UpdateDetectionSuppressionMask(cv::Mat());
-                }
-#endif
+                detectionFrame = sourceCpu;
 
 #ifdef USE_CUDA
-                if (currentCfg.backend == "TRT")
-                {
-                    trt_detector.processFrame(detectionFrame, screenshotCpu, frameTimestamp);
-                    cudaDiag.trtCpuSubmitted++;
-                }
+                trt_detector.processFrame(detectionFrame, sourceCpu, frameTimestamp);
+                cudaDiag.trtCpuSubmitted++;
 #else
                 if (dml_detector)
                 {
-                    dml_detector->processFrame(detectionFrame, screenshotCpu, frameTimestamp);
+                    dml_detector->processFrame(detectionFrame, sourceCpu, frameTimestamp);
                 }
 #endif
             }
 
-            if (frameSubmittedToDetector || !screenshotCpu.empty())
+            if (frameSubmittedToDetector || !sourceCpu.empty())
             {
                 lastSuccessfulFrameTime = std::chrono::steady_clock::now();
                 publishCaptureSourceSize(capturer.get());
                 setCaptureAvailable();
             }
 
-            if (!screenshotCpu.empty())
+            if (!sourceCpu.empty())
             {
                 std::lock_guard<std::mutex> lock(frameMutex);
-                latestFrame = screenshotCpu;
+                latestFrame = sourceCpu;
                 if (frameQueue.size() >= 1)
                     frameQueue.pop_front();
                 frameQueue.push_back(latestFrame);
             }
             frameCV.notify_one();
-
-            if (screenshotRequested)
-            {
-                cv::Mat saveMat = screenshotCpu.clone();
-                if (!saveMat.empty())
-                {
-                    auto epoch_time = std::chrono::duration_cast<std::chrono::milliseconds>(
-                        std::chrono::system_clock::now().time_since_epoch()
-                    ).count();
-                    std::string filename = std::to_string(epoch_time) + ".jpg";
-                    screenshotWriter.Enqueue(filename, std::move(saveMat));
-                    lastSaveTime = screenshotNow;
-                }
-            }
 
             captureFrameCount++;
             auto currentTime = std::chrono::high_resolution_clock::now();

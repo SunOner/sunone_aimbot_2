@@ -202,11 +202,12 @@ bool Config::loadConfig(const std::string& filename)
         // Overlay
         overlay_opacity = 225;
         overlay_ui_scale = 1.0f;
+        overlay_sidebar_collapsed = false;
         overlay_exclude_from_capture = true;
         overlay_x = 0;
         overlay_y = 0;
-        overlay_width = 860;
-        overlay_height = 526;
+        overlay_width = 1180;
+        overlay_height = 740;
 
         // Depth
         depth_inference_enabled = true;
@@ -527,11 +528,12 @@ bool Config::loadConfig(const std::string& filename)
     // Overlay
     overlay_opacity = get_long("overlay_opacity", 225);
     overlay_ui_scale = (float)get_double("overlay_ui_scale", 1.0);
+    overlay_sidebar_collapsed = get_bool("overlay_sidebar_collapsed", false);
     overlay_exclude_from_capture = get_bool("overlay_exclude_from_capture", true);
     overlay_x = get_long("overlay_x", 0);
     overlay_y = get_long("overlay_y", 0);
-    overlay_width = get_long("overlay_width", 860);
-    overlay_height = get_long("overlay_height", 526);
+    overlay_width = get_long("overlay_width", 1180);
+    overlay_height = get_long("overlay_height", 740);
 
     // Depth
     depth_inference_enabled = get_bool("depth_inference_enabled", true);
@@ -832,6 +834,7 @@ bool Config::saveConfig(const std::string& filename)
         << "overlay_opacity = " << overlay_opacity << "\n"
         << std::fixed << std::setprecision(2)
         << "overlay_ui_scale = " << overlay_ui_scale << "\n"
+        << "overlay_sidebar_collapsed = " << (overlay_sidebar_collapsed ? "true" : "false") << "\n"
         << "overlay_exclude_from_capture = " << (overlay_exclude_from_capture ? "true" : "false") << "\n"
         << std::setprecision(0)
         << "overlay_x = " << overlay_x << "\n"

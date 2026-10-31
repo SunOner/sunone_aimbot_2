@@ -16,6 +16,9 @@
 #include "sunone_aimbot_2.h"
 #include "capture.h"
 #include "runtime/thread_loops.h"
+#include "runtime/input_state.h"
+#include "nodes/node_graph.h"
+#include "nodes/vision_runtime.h"
 
 extern std::atomic<bool> shouldExit;
 extern std::atomic<bool> aiming;
@@ -45,7 +48,6 @@ namespace
 {
 struct KeyboardConfigSnapshot
 {
-    bool autoAim = false;
     bool enableArrowsSettings = false;
     std::vector<std::string> buttonTargeting;
     std::vector<std::string> buttonShoot;
@@ -60,7 +62,6 @@ KeyboardConfigSnapshot SnapshotKeyboardConfig()
 {
     std::lock_guard<std::mutex> lock(configMutex);
     KeyboardConfigSnapshot snapshot;
-    snapshot.autoAim = config.auto_aim;
     snapshot.enableArrowsSettings = config.enable_arrows_settings;
     snapshot.buttonTargeting = config.button_targeting;
     snapshot.buttonShoot = config.button_shoot;
@@ -151,24 +152,18 @@ void keyboardListener()
     {
         KeyboardConfigSnapshot cfg = SnapshotKeyboardConfig();
 
-        // Aiming
-        if (!cfg.autoAim)
-        {
-            aiming = isAnyKeyPressedInternal(cfg.buttonTargeting) ||
-                isAimingActiveFromDevices();
-        }
-        else
-        {
-            aiming = true;
-        }
+        // Publish physical inputs. Activation policy belongs to the graphs.
+        const bool operationalInput = !editorInputCaptured.load();
+        aiming = operationalInput && (isAnyKeyPressedInternal(cfg.buttonTargeting) ||
+            isAimingActiveFromDevices());
 
         // Shooting
-        shooting = isAnyKeyPressedInternal(cfg.buttonShoot) ||
-            isShootingActiveFromDevices();
+        shooting = operationalInput && (isAnyKeyPressedInternal(cfg.buttonShoot) ||
+            isShootingActiveFromDevices());
 
         // Zooming
-        zooming = isAnyKeyPressedInternal(cfg.buttonZoom) ||
-            isZoomingActiveFromDevices();
+        zooming = operationalInput && (isAnyKeyPressedInternal(cfg.buttonZoom) ||
+            isZoomingActiveFromDevices());
 
         // Exit - Win32
         if (isAnyKeyPressedWin32Only(cfg.buttonExit))
@@ -261,6 +256,7 @@ void keyboardListener()
                         globalMouseThread->updateConfig(config);
                     }
                 }
+                NodeVision::syncCaptureConfiguration(true);
                 reloadPressed = true;
             }
         }
@@ -291,49 +287,26 @@ void keyboardListener()
         bool shiftKey = isAnyKeyPressedWin32Only(shiftKeys);
 
         // Adjust offsets based on arrow keys and shift combination
-        if (cfg.enableArrowsSettings)
+        if (cfg.enableArrowsSettings && operationalInput && !editorInputCaptured.load())
         {
-            if (upArrow && !prevUpArrow)
+            const int offsetDirection=(downArrow&&!prevDownArrow)-(upArrow&&!prevUpArrow);
+            const int recoilDirection=(rightArrow&&!prevRightArrow)-(leftArrow&&!prevLeftArrow);
+            if(offsetDirection||recoilDirection)
             {
-                std::lock_guard<std::mutex> lock(configMutex);
-                if (shiftKey)
+                auto workspace=NodeGraph::service().workspace();
+                for(auto& graph:workspace.graphs)for(auto& node:graph.nodes)
                 {
-                    // Shift + Up Arrow: Decrease head offset
-                    config.head_y_offset = std::max(0.0f, config.head_y_offset - OFFSET_STEP);
+                    if(offsetDirection&&(node.kind==NodeGraph::NodeKind::AimPoint||
+                        (node.kind==NodeGraph::NodeKind::Target&&NodeGraph::parameter(node,"legacy_offsets")!=0)))
+                    {
+                        const char* key=shiftKey?"head_y_offset":"body_y_offset";
+                        node.parameters[key]=std::clamp(NodeGraph::parameter(node,key)+offsetDirection*OFFSET_STEP,0.0,1.0);
+                    }
+                    if(recoilDirection&&node.kind==NodeGraph::NodeKind::RecoilStrength)
+                        node.parameters["strength"]=std::clamp(NodeGraph::parameter(node,"strength")+recoilDirection*NORECOIL_STEP,0.0,1000.0);
                 }
-                else
-                {
-                    // Up Arrow: Decrease body offset
-                    config.body_y_offset = std::max(0.0f, config.body_y_offset - OFFSET_STEP);
-                }
-            }
-            if (downArrow && !prevDownArrow)
-            {
-                std::lock_guard<std::mutex> lock(configMutex);
-                if (shiftKey)
-                {
-                    // Shift + Down Arrow: Increase head offset
-                    config.head_y_offset = std::min(1.0f, config.head_y_offset + OFFSET_STEP);
-                }
-                else
-                {
-                    // Down Arrow: Increase body offset
-                    config.body_y_offset = std::min(1.0f, config.body_y_offset + OFFSET_STEP);
-                }
-            }
-
-
-            // Adjust norecoil strength based on left and right arrow keys
-            if (leftArrow && !prevLeftArrow)
-            {
-                std::lock_guard<std::mutex> lock(configMutex);
-                config.easynorecoilstrength = std::max(0.1f, config.easynorecoilstrength - NORECOIL_STEP);
-            }
-
-            if (rightArrow && !prevRightArrow)
-            {
-                std::lock_guard<std::mutex> lock(configMutex);
-                config.easynorecoilstrength = std::min(500.0f, config.easynorecoilstrength + NORECOIL_STEP);
+                std::string error;
+                if(NodeGraph::service().publish(workspace,error))NodeGraph::service().save("node_graphs.ini",error);
             }
         }
         

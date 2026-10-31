@@ -13,11 +13,15 @@
 #include <opencv2/dnn.hpp>
 #include <algorithm>
 #include <atomic>
+#include <cmath>
+#include <cctype>
+#include <filesystem>
 #include <limits>
 #include <numeric>
 #include <vector>
 #include <queue>
 #include <mutex>
+#include <stdexcept>
 
 #include "trt_detector.h"
 #include "nvinf.h"
@@ -25,16 +29,12 @@
 #include "other_tools.h"
 #include "postProcess.h"
 #include "cuda_preprocess.h"
-#include "depth/depth_mask.h"
 #include "capture.h"
-#include "capture/circle_fov.h"
-#include "scr/data_collector.h"
+#include "nodes/vision_runtime.h"
+#include "runtime/input_state.h"
 
 int model_quant;
 std::vector<float> outputData;
-
-extern std::atomic<bool> detector_model_changed;
-extern std::atomic<bool> detection_resolution_changed;
 
 static bool error_logged = false;
 
@@ -54,97 +54,19 @@ bool tryGetPositiveDimInt(int64_t value, int* out)
     return tryGetDimInt(value, out);
 }
 
-bool intersectsDepthMask(const cv::Rect& box, const cv::Mat& mask)
+TrtBuildOptions buildOptions(const NodeGraph::Node& node,int width,int height)
 {
-    if (box.width <= 0 || box.height <= 0 || mask.empty() || mask.type() != CV_8UC1)
-        return false;
-
-    const cv::Rect imageBounds(0, 0, mask.cols, mask.rows);
-    const cv::Rect clipped = box & imageBounds;
-    if (clipped.width <= 0 || clipped.height <= 0)
-        return false;
-
-    const int cx = clipped.x + clipped.width / 2;
-    const int cy = clipped.y + clipped.height / 2;
-    if (mask.at<uint8_t>(cy, cx) != 0)
-        return true;
-
-    const cv::Mat roi = mask(clipped);
-    return cv::countNonZero(roi) > 0;
+    TrtBuildOptions options;
+    options.fixedInputSize=NodeGraph::parameter(node,"fixed_input_size")!=0;
+    options.enableFp16=NodeGraph::parameter(node,"export_enable_fp16")!=0;
+    options.enableFp8=NodeGraph::parameter(node,"export_enable_fp8")!=0;
+    options.inputWidth=width;options.inputHeight=height;
+    options.minProfileSize=static_cast<int>(NodeGraph::parameter(node,"trt_profile_min_size"));
+    options.optProfileSize=static_cast<int>(NodeGraph::parameter(node,"trt_profile_opt_size"));
+    options.maxProfileSize=static_cast<int>(NodeGraph::parameter(node,"trt_profile_max_size"));
+    return options;
 }
 
-void filterDetectionsByDepthMask(std::vector<Detection>& detections)
-{
-    static cv::Mat holdTtl;
-
-    if (detections.empty())
-        return;
-
-    if (!config.depth_inference_enabled || !config.depth_mask_enabled)
-    {
-        holdTtl.release();
-        return;
-    }
-
-    const int holdFrames = std::clamp(config.depth_mask_hold_frames, 0, 120);
-    cv::Mat currentMask = getCurrentDetectionSuppressionMask();
-    cv::Mat suppressionMask;
-
-    if (holdFrames <= 0)
-    {
-        holdTtl.release();
-        suppressionMask = currentMask;
-    }
-    else
-    {
-        if (!currentMask.empty() && currentMask.type() == CV_8UC1)
-        {
-            if (holdTtl.empty() || holdTtl.size() != currentMask.size())
-                holdTtl = cv::Mat::zeros(currentMask.size(), CV_16UC1);
-            cv::subtract(holdTtl, cv::Scalar(1), holdTtl);
-            holdTtl.setTo(cv::Scalar(static_cast<uint16_t>(holdFrames)), currentMask);
-        }
-        else if (!holdTtl.empty())
-        {
-            cv::subtract(holdTtl, cv::Scalar(1), holdTtl);
-        }
-
-        if (!holdTtl.empty() && cv::countNonZero(holdTtl) > 0)
-        {
-            cv::compare(holdTtl, cv::Scalar(0), suppressionMask, cv::CMP_GT);
-        }
-        else
-        {
-            suppressionMask.release();
-        }
-    }
-
-    if (suppressionMask.empty() || suppressionMask.type() != CV_8UC1)
-        return;
-
-    detections.erase(
-        std::remove_if(detections.begin(), detections.end(),
-            [&suppressionMask](const Detection& det) { return intersectsDepthMask(det.box, suppressionMask); }),
-        detections.end());
-}
-
-void filterDetectionsByCircleFov(std::vector<Detection>& detections)
-{
-    if (detections.empty() || !config.circle_fov_enabled)
-        return;
-
-    const cv::Size detectionSize(config.detection_resolution, config.detection_resolution);
-    detections.erase(
-        std::remove_if(detections.begin(), detections.end(),
-            [&detectionSize](const Detection& det)
-            {
-                const cv::Point2f center(
-                    static_cast<float>(det.box.x) + static_cast<float>(det.box.width) * 0.5f,
-                    static_cast<float>(det.box.y) + static_cast<float>(det.box.height) * 0.5f);
-                return !pointInsideCircleFov(center, detectionSize, config.circle_fov_radius_percent);
-            }),
-        detections.end());
-}
 } // namespace
 
 TrtDetector::TrtDetector()
@@ -186,17 +108,22 @@ void TrtDetector::requestStop()
 
 bool TrtDetector::isInitialized() const
 {
-    return context != nullptr;
+    if(!context||inputNames.empty()||outputNames.empty())return false;
+    for(const auto& name:inputNames){const auto found=inputBindings.find(name);if(found==inputBindings.end()||!found->second)return false;}
+    for(const auto& name:outputNames){const auto found=outputBindings.find(name);const auto host=pinnedOutputBuffers.find(name);
+        if(found==outputBindings.end()||!found->second||host==pinnedOutputBuffers.end()||!host->second)return false;}
+    return true;
 }
 
 void TrtDetector::freePinnedOutputs()
 {
     for (auto& kv : pinnedOutputBuffers)
     {
-        if (kv.second)
+        if (kv.second&&pinnedOutputNames.count(kv.first))
             cudaFreeHost(kv.second);
     }
     pinnedOutputBuffers.clear();
+    pinnedOutputNames.clear();pageableOutputBuffers.clear();
 }
 
 void TrtDetector::allocatePinnedOutputs()
@@ -209,6 +136,11 @@ void TrtDetector::allocatePinnedOutputs()
         if (bytes == 0) continue;
 
         void* hostPtr = nullptr;
+        if(!pinnedOutputsEnabled)
+        {
+            auto& buffer=pageableOutputBuffers[name];buffer.resize(bytes);
+            pinnedOutputBuffers[name]=buffer.data();continue;
+        }
         cudaError_t err = cudaHostAlloc(&hostPtr, bytes, cudaHostAllocDefault);
         if (err != cudaSuccess)
         {
@@ -218,6 +150,7 @@ void TrtDetector::allocatePinnedOutputs()
         }
 
         pinnedOutputBuffers[name] = hostPtr;
+        pinnedOutputNames.insert(name);
 
         if (config.verbose)
         {
@@ -399,7 +332,31 @@ void TrtDetector::getBindings()
 
 void TrtDetector::initialize(const std::string& modelFile)
 {
+    NodeGraph::Node settings=NodeGraph::defaultNode(NodeGraph::NodeKind::Inference,1);
+    int resolution=320;
+    {
+        std::lock_guard<std::mutex> lock(configMutex);
+        settings.parameters["fixed_input_size"]=config.fixed_input_size?1:0;
+        settings.parameters["confidence_threshold"]=config.confidence_threshold;
+        settings.parameters["nms_threshold"]=config.nms_threshold;
+        settings.parameters["max_detections"]=config.max_detections;
+        settings.parameters["use_cuda_graph"]=config.use_cuda_graph?1:0;
+        settings.parameters["use_pinned_memory"]=config.use_pinned_memory?1:0;
+        settings.parameters["export_enable_fp16"]=config.export_enable_fp16?1:0;
+        settings.parameters["export_enable_fp8"]=config.export_enable_fp8?1:0;
+        resolution=config.detection_resolution;
+    }
+    initialize(modelFile,settings,resolution,resolution);
+}
+
+void TrtDetector::initialize(const std::string& modelFile,const NodeGraph::Node& settings,int width,int height)
+{
+    destroyCudaGraph();
+    context.reset();engine.reset();runtime.reset();inputNames.clear();outputNames.clear();
+    inferenceSettings=settings;inferenceWidth=width;inferenceHeight=height>0?height:width;
+    pinnedOutputsEnabled=NodeGraph::parameter(settings,"use_pinned_memory")!=0;
     runtime.reset(nvinfer1::createInferRuntime(gLogger));
+    if(!runtime)throw std::runtime_error("TensorRT runtime creation failed.");
     loadEngine(modelFile);
     if (!engine)
     {
@@ -424,27 +381,20 @@ void TrtDetector::initialize(const std::string& modelFile)
     inputName = inputNames[0];
 
     nvinfer1::Dims modelInputDims = engine->getTensorShape(inputName.c_str());
+    if(modelInputDims.nbDims!=4||(modelInputDims.d[0]>0&&modelInputDims.d[0]!=1)||
+        (modelInputDims.d[1]>0&&modelInputDims.d[1]!=3))
+        throw std::runtime_error("Inference requires a single NCHW RGB image input.");
     bool isStatic = true;
     for (int i = 0; i < modelInputDims.nbDims; ++i)
         if (modelInputDims.d[i] <= 0) isStatic = false;
 
-    if (isStatic != config.fixed_input_size)
-    {
-        config.fixed_input_size = isStatic;
-        detector_model_changed.store(true);
-        std::cout << "[Detector] Automatically set fixed_input_size = " << (isStatic ? "true" : "false") << std::endl;
-    }
-
-    const int target = config.detection_resolution;
     nvinfer1::Dims inputDims = modelInputDims;
     if (!isStatic)
     {
-        nvinfer1::Dims4 newShape{ 1, 3, target, target };
-        context->setInputShape(inputName.c_str(), newShape);
-        if (!context->allInputDimensionsSpecified())
+        nvinfer1::Dims4 newShape{ 1, 3, inferenceHeight, inferenceWidth };
+        if (!context->setInputShape(inputName.c_str(), newShape)||!context->allInputDimensionsSpecified())
         {
-            std::cerr << "[Detector] Failed to set input dimensions" << std::endl;
-            return;
+            throw std::runtime_error("The frame size is outside this TensorRT engine's input profile.");
         }
         inputDims = context->getTensorShape(inputName.c_str());
     }
@@ -508,7 +458,8 @@ void TrtDetector::initialize(const std::string& modelFile)
         return;
     }
 
-    img_scale = static_cast<float>(config.detection_resolution) / w;
+    img_scale = static_cast<float>(inferenceWidth) / w;
+    imageScaleY=static_cast<double>(inferenceHeight)/h;
 
     gpuResizedBuffer.create(h, w, CV_8UC3);
     gpuFloatBuffer.create(h, w, CV_32FC3);
@@ -538,7 +489,7 @@ void TrtDetector::initialize(const std::string& modelFile)
     cudaEventCreate(&inferenceCompleteEvent);
     cudaEventCreate(&copyCompleteEvent);
 
-    useCudaGraph = config.use_cuda_graph;
+    useCudaGraph = NodeGraph::parameter(settings,"use_cuda_graph")!=0&&pinnedOutputsEnabled;
     if (useCudaGraph)
     {
         captureCudaGraph();
@@ -576,441 +527,206 @@ size_t TrtDetector::getElementSize(nvinfer1::DataType dtype)
 
 void TrtDetector::loadEngine(const std::string& modelFile)
 {
-    std::string engineFilePath;
-    std::filesystem::path modelPath(modelFile);
-    std::string extension = modelPath.extension().string();
-
-    if (extension == ".engine")
+    const auto path=std::filesystem::u8path(modelFile);
+    auto extension=path.extension().string();
+    std::transform(extension.begin(),extension.end(),extension.begin(),[](unsigned char value){return static_cast<char>(std::tolower(value));});
+    if(extension==".engine")
     {
-        engineFilePath = modelFile;
-    }
-    else if (extension == ".onnx")
-    {
-        engineFilePath = modelPath.replace_extension(".engine").string();
-
-        if (!fileExists(engineFilePath))
-        {
-            std::cout << "[Detector] Building engine from ONNX model" << std::endl;
-
-            nvinfer1::ICudaEngine* builtEngine = buildEngineFromOnnx(modelFile, gLogger);
-            if (builtEngine)
-            {
-                nvinfer1::IHostMemory* serializedEngine = builtEngine->serialize();
-
-                if (serializedEngine)
-                {
-                    std::ofstream engineFile(engineFilePath, std::ios::binary);
-                    if (engineFile)
-                    {
-                        engineFile.write(reinterpret_cast<const char*>(serializedEngine->data()), serializedEngine->size());
-                        engineFile.close();
-
-                        config.ai_model = std::filesystem::path(engineFilePath).filename().string();
-                        config.saveConfig("config.ini");
-
-                        std::cout << "[Detector] Engine saved to: " << engineFilePath << std::endl;
-                    }
-                    delete serializedEngine;
-                }
-                delete builtEngine;
-            }
-        }
-    }
-    else
-    {
-        std::cerr << "[Detector] Unsupported model format: " << extension << std::endl;
+        engine.reset(loadEngineFromFile(modelFile,runtime.get()));
         return;
     }
-
-    std::cout << "[Detector] Loading engine: " << engineFilePath << std::endl;
-    engine.reset(loadEngineFromFile(engineFilePath, runtime.get()));
+    if(extension!=".onnx")throw std::runtime_error("TensorRT requires an ONNX model or a prebuilt engine.");
+    const auto options=buildOptions(inferenceSettings,inferenceWidth,inferenceHeight);
+    const auto cachedPath=trtEngineCachePath(modelFile,options);
+    if(fileExists(cachedPath))engine.reset(loadEngineFromFile(cachedPath,runtime.get()));
+    if(engine)return;
+    engine.reset(buildEngineFromOnnx(modelFile,gLogger,options,*runtime));
+    if(!engine)return;
+    std::unique_ptr<nvinfer1::IHostMemory> serialized(engine->serialize());
+    if(!serialized)return;
+    // A model can still run when its directory is read-only; cache writes are
+    // an optimization rather than a requirement for graph evaluation.
+    std::ofstream output(cachedPath,std::ios::binary|std::ios::trunc);
+    if(output)
+    {
+        output.write(static_cast<const char*>(serialized->data()),static_cast<std::streamsize>(serialized->size()));
+        if(output)std::cout << "[TensorRT] Node engine cached: " << cachedPath << std::endl;
+    }
 }
 
-void TrtDetector::processFrame(
-    const cv::Mat& detection_frame,
-    const cv::Mat& source_frame,
-    std::chrono::steady_clock::time_point frameTimestamp)
+void TrtDetector::processFrame(const cv::Mat& detection_frame,const cv::Mat& source_frame,
+    std::chrono::steady_clock::time_point timestamp)
 {
-    const auto generation = detectionBuffer.currentGeneration();
-    detectionBuffer.withCurrentGeneration(generation, [&] {
-        std::unique_lock<std::mutex> lock(inferenceMutex);
-        currentFrame = detection_frame;
-        currentSourceFrame = source_frame.empty() ? detection_frame : source_frame;
-        currentFrameGpu.release();
-        currentFrameTimestamp = (frameTimestamp.time_since_epoch().count() != 0)
-            ? frameTimestamp
-            : std::chrono::steady_clock::now();
-        currentFrameGeneration = generation;
-        pendingFrameType = PendingFrameType::Cpu;
-        frameReady = true;
-        inferenceCV.notify_one();
+    const auto generation=detectionBuffer.currentGeneration();
+    detectionBuffer.withCurrentGeneration(generation,[&] {
+        auto packet=NodeVision::makeFrame(detection_frame,source_frame,timestamp,generation);
+        std::lock_guard<std::mutex> lock(inferenceMutex);
+        currentGraphFrame=std::move(packet);frameReady=true;inferenceCV.notify_one();
     });
 }
 
-void TrtDetector::processFrameGpu(
-    const cv::cuda::GpuMat& frame,
-    std::chrono::steady_clock::time_point frameTimestamp)
+void TrtDetector::processFrameGpu(const cv::cuda::GpuMat& image,std::chrono::steady_clock::time_point timestamp)
 {
-    const auto generation = detectionBuffer.currentGeneration();
-    detectionBuffer.withCurrentGeneration(generation, [&] {
-        std::unique_lock<std::mutex> lock(inferenceMutex);
-        currentFrame.release();
-        currentSourceFrame.release();
-        currentFrameGpu = frame;
-        currentFrameTimestamp = (frameTimestamp.time_since_epoch().count() != 0)
-            ? frameTimestamp
-            : std::chrono::steady_clock::now();
-        currentFrameGeneration = generation;
-        pendingFrameType = PendingFrameType::Gpu;
-        frameReady = true;
-        inferenceCV.notify_one();
+    const auto generation=detectionBuffer.currentGeneration();
+    detectionBuffer.withCurrentGeneration(generation,[&] {
+        auto packet=NodeVision::makeFrameGpu(image,timestamp,generation);
+        std::lock_guard<std::mutex> lock(inferenceMutex);
+        currentGraphFrame=std::move(packet);frameReady=true;inferenceCV.notify_one();
     });
 }
 
 std::vector<Detection> TrtDetector::detect(const cv::Mat& frame)
 {
-    std::vector<Detection> latestDetections;
-    if (!context || frame.empty())
-        return latestDetections;
+    // Provider benchmark compatibility; production passes a node-owned snapshot.
+    NodeGraph::Node settings=inferenceSettings;
+    {std::lock_guard<std::mutex> lock(configMutex);
+        settings.parameters["confidence_threshold"]=config.confidence_threshold;
+        settings.parameters["nms_threshold"]=config.nms_threshold;
+        settings.parameters["max_detections"]=config.max_detections;}
+    return inferGraphFrame(frame,cv::cuda::GpuMat(),settings);
+}
 
-    cudaEventRecord(preprocessStartEvent, stream);
-    preProcess(frame);
-    cudaEventRecord(inferenceStartEvent, stream);
+std::vector<Detection> TrtDetector::detect(const NodeGraph::FrameStream& frame,const NodeGraph::Node& settings)
+{
+    const auto storage=NodeVision::storage(frame);
+    if(!storage)return {};
+    if(frame->gpu&&!storage->gpu.empty())return inferGraphFrame(cv::Mat(),storage->gpu,settings);
+    return inferGraphFrame(NodeVision::cpuImage(frame),cv::cuda::GpuMat(),settings);
+}
 
-    const bool usedGraph = useCudaGraph && cudaGraphCaptured;
-    if (usedGraph)
+std::vector<Detection> TrtDetector::inferGraphFrame(const cv::Mat& cpu,const cv::cuda::GpuMat& gpu,const NodeGraph::Node& settings)
+{
+    std::vector<Detection> detections;
+    if(!isInitialized()||(cpu.empty()&&gpu.empty()))return detections;
+    inferenceSettings=settings;
+    auto checked=[](cudaError_t result,const char* operation) {
+        if(result!=cudaSuccess)throw std::runtime_error(std::string(operation)+": "+cudaGetErrorString(result));
+    };
+    checked(cudaEventRecord(preprocessStartEvent,stream),"Preprocess timing");
+    if(!gpu.empty())preProcess(gpu);else preProcess(cpu);
+    checked(cudaEventRecord(inferenceStartEvent,stream),"Inference timing");
+    if(useCudaGraph&&cudaGraphCaptured)
     {
         launchCudaGraph();
-        cudaEventRecord(copyCompleteEvent, stream);
-        cudaEventSynchronize(copyCompleteEvent);
+        checked(cudaEventRecord(copyCompleteEvent,stream),"Copy timing");
     }
     else
     {
-        context->enqueueV3(stream);
-        cudaEventRecord(inferenceCompleteEvent, stream);
-
-        for (const auto& name : outputNames)
+        if(!context->enqueueV3(stream))throw std::runtime_error("TensorRT enqueue failed.");
+        checked(cudaEventRecord(inferenceCompleteEvent,stream),"Inference completion");
+        for(const auto& name:outputNames)
         {
-            const size_t size = outputSizes[name];
-
-            auto itPinned = pinnedOutputBuffers.find(name);
-            if (itPinned == pinnedOutputBuffers.end() || !itPinned->second)
-                continue;
-
-            cudaMemcpyAsync(
-                itPinned->second,
-                outputBindings[name],
-                size,
-                cudaMemcpyDeviceToHost,
-                stream);
+            const auto host=pinnedOutputBuffers.find(name);
+            if(host==pinnedOutputBuffers.end()||!host->second)throw std::runtime_error("Missing model output buffer.");
+            checked(cudaMemcpyAsync(host->second,outputBindings[name],outputSizes[name],cudaMemcpyDeviceToHost,stream),"Output copy");
         }
-
-        cudaEventRecord(copyCompleteEvent, stream);
-        cudaEventSynchronize(copyCompleteEvent);
+        checked(cudaEventRecord(copyCompleteEvent,stream),"Copy completion");
     }
-
-    auto tPostStart = std::chrono::steady_clock::now();
-
-    for (const auto& name : outputNames)
+    checked(cudaEventSynchronize(copyCompleteEvent),"Inference execution");
+    const auto postStarted=std::chrono::steady_clock::now();
+    for(const auto& name:outputNames)
     {
-        const auto itPinned = pinnedOutputBuffers.find(name);
-        if (itPinned == pinnedOutputBuffers.end() || !itPinned->second)
-            continue;
-
-        nvinfer1::DataType dtype = outputTypes[name];
-        if (dtype == nvinfer1::DataType::kHALF)
+        const auto host=pinnedOutputBuffers.find(name);
+        if(host==pinnedOutputBuffers.end()||!host->second)continue;
+        if(outputTypes[name]==nvinfer1::DataType::kHALF)
         {
-            const size_t numElements = outputSizes[name] / sizeof(__half);
-            const __half* halfPtr = reinterpret_cast<const __half*>(itPinned->second);
-
-            auto& outputDataFloat = fp16OutputScratch[name];
-            if (outputDataFloat.size() != numElements)
-                outputDataFloat.resize(numElements);
-
-            for (size_t i = 0; i < numElements; ++i)
-                outputDataFloat[i] = __half2float(halfPtr[i]);
-
-            latestDetections = postProcess(outputDataFloat.data(), name, &lastNmsTime);
+            const size_t count=outputSizes[name]/sizeof(__half);
+            const auto* half=reinterpret_cast<const __half*>(host->second);
+            auto& converted=fp16OutputScratch[name];converted.resize(count);
+            for(size_t i=0;i<count;++i)converted[i]=__half2float(half[i]);
+            detections=postProcess(converted.data(),name,&lastNmsTime);
         }
-        else if (dtype == nvinfer1::DataType::kFLOAT)
-        {
-            const float* floatPtr = reinterpret_cast<const float*>(itPinned->second);
-            latestDetections = postProcess(floatPtr, name, &lastNmsTime);
-        }
+        else if(outputTypes[name]==nvinfer1::DataType::kFLOAT)
+            detections=postProcess(reinterpret_cast<const float*>(host->second),name,&lastNmsTime);
     }
-
-    auto tPostEnd = std::chrono::steady_clock::now();
-
-    float preprocessMs = 0.0f;
-    float inferenceMs = 0.0f;
-    float copyMs = 0.0f;
-
-    cudaEventElapsedTime(&preprocessMs, preprocessStartEvent, inferenceStartEvent);
-    cudaEventElapsedTime(&inferenceMs, inferenceStartEvent, inferenceCompleteEvent);
-    cudaEventElapsedTime(&copyMs, inferenceCompleteEvent, copyCompleteEvent);
-
-    lastPreprocessTime = std::chrono::duration<double, std::milli>(preprocessMs);
-    lastInferenceTime = std::chrono::duration<double, std::milli>(inferenceMs);
-    lastCopyTime = std::chrono::duration<double, std::milli>(copyMs);
-    lastPostprocessTime = tPostEnd - tPostStart;
-
-    return latestDetections;
+    float preprocessMs=0,inferenceMs=0,copyMs=0;
+    cudaEventElapsedTime(&preprocessMs,preprocessStartEvent,inferenceStartEvent);
+    cudaEventElapsedTime(&inferenceMs,inferenceStartEvent,inferenceCompleteEvent);
+    cudaEventElapsedTime(&copyMs,inferenceCompleteEvent,copyCompleteEvent);
+    lastPreprocessTime=std::chrono::duration<double,std::milli>(preprocessMs);
+    lastInferenceTime=std::chrono::duration<double,std::milli>(inferenceMs);
+    lastCopyTime=std::chrono::duration<double,std::milli>(copyMs);
+    lastPostprocessTime=std::chrono::steady_clock::now()-postStarted;
+    return detections;
 }
 
 void TrtDetector::inferenceThread()
 {
-    while (!shouldExit)
+    struct ModelSlot
     {
-        if (config.backend != "TRT")
+        std::unique_ptr<TrtDetector> detector;
+        std::string fingerprint;
+        std::string error;
+        std::chrono::steady_clock::time_point attemptedAt{};
+    };
+    std::unordered_map<int,ModelSlot> models;
+    auto infer=[&](int nodeKey,const NodeGraph::FrameStream& packet,const NodeGraph::Node& settings)->NodeGraph::DetectionStream {
+        try
         {
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
-            continue;
+            if(NodeGraph::textParameter(settings,"backend")!="TRT")throw std::runtime_error("This build supports TensorRT inference only.");
+            const std::string path=NodeVision::resolveModelPath(settings);
+            if(path.empty())throw std::runtime_error("Select a model for this Inference node.");
+            const std::string fingerprint=path+"|"+std::to_string(packet->width)+"x"+std::to_string(packet->height)+"|"+
+                std::to_string(NodeGraph::parameter(settings,"fixed_input_size"))+"|"+
+                std::to_string(NodeGraph::parameter(settings,"use_cuda_graph"))+"|"+std::to_string(NodeGraph::parameter(settings,"use_pinned_memory"))+"|"+
+                std::to_string(NodeGraph::parameter(settings,"export_enable_fp16"))+"|"+std::to_string(NodeGraph::parameter(settings,"export_enable_fp8"))+"|"+
+                std::to_string(NodeGraph::parameter(settings,"trt_profile_min_size"))+"|"+std::to_string(NodeGraph::parameter(settings,"trt_profile_opt_size"))+"|"+
+                std::to_string(NodeGraph::parameter(settings,"trt_profile_max_size"));
+            auto& slot=models[nodeKey];const auto now=std::chrono::steady_clock::now();
+            if(slot.fingerprint!=fingerprint||!slot.detector||!slot.detector->isInitialized())
+            {
+                if(slot.fingerprint==fingerprint&&now-slot.attemptedAt<std::chrono::seconds(2))
+                {NodeVision::reportError(nodeKey,slot.error);return {};}
+                slot.fingerprint=fingerprint;slot.attemptedAt=now;slot.detector.reset();
+                slot.detector=std::make_unique<TrtDetector>();slot.detector->initialize(path,settings,packet->width,packet->height);
+                if(!slot.detector->isInitialized())throw std::runtime_error("The selected TensorRT model could not be initialized.");
+            }
+            const auto detected=slot.detector->detect(packet,settings);
+            auto result=std::make_shared<NodeGraph::DetectionFrame>();
+            result->version=packet->version;result->generation=packet->generation;result->timestampSeconds=packet->timestampSeconds;
+            result->width=packet->width;result->height=packet->height;result->fresh=true;
+            result->modelName=NodeGraph::textParameter(settings,"model_path");
+            result->objects.reserve(detected.size());
+            for(const auto& detection:detected)result->objects.push_back({static_cast<double>(detection.box.x),static_cast<double>(detection.box.y),
+                static_cast<double>(detection.box.width),static_cast<double>(detection.box.height),detection.classId,detection.confidence});
+            lastPreprocessTime=slot.detector->lastPreprocessTime;lastInferenceTime=slot.detector->lastInferenceTime;
+            lastCopyTime=slot.detector->lastCopyTime;lastPostprocessTime=slot.detector->lastPostprocessTime;lastNmsTime=slot.detector->lastNmsTime;
+            slot.error.clear();NodeVision::reportError(nodeKey,"");return result;
         }
-
-        if (detector_model_changed.load())
+        catch(const std::exception& error)
         {
-            {
-                std::unique_lock<std::mutex> lock(inferenceMutex);
-                destroyCudaGraph();
-                context.reset();
-                engine.reset();
-
-                freePinnedOutputs();
-
-                for (auto& binding : inputBindings)
-                    if (binding.second) cudaFree(binding.second);
-                inputBindings.clear();
-                for (auto& binding : outputBindings)
-                    if (binding.second) cudaFree(binding.second);
-                outputBindings.clear();
-
-                currentFrame.release();
-                currentSourceFrame.release();
-                currentFrameGpu.release();
-                frameReady = false;
-                pendingFrameType = PendingFrameType::None;
-            }
-            initialize("models/" + config.ai_model);
-            detection_resolution_changed.store(true);
-            detector_model_changed.store(false);
+            const auto slot=models.find(nodeKey);if(slot!=models.end())slot->second.error=error.what();
+            NodeVision::reportError(nodeKey,error.what());return {};
         }
-
-        if (useCudaGraph != config.use_cuda_graph)
+    };
+    std::uint64_t providerRevision=0;
+    while(!shouldExit)
+    {
+        const auto revision=NodeGraph::service().revision();
+        if(revision!=providerRevision)
         {
-            useCudaGraph = config.use_cuda_graph;
-            if (!useCudaGraph)
+            const auto active=NodeGraph::service().providerNodes(NodeGraph::NodeKind::Inference);
+            for(auto it=models.begin();it!=models.end();)
             {
-                destroyCudaGraph();
+                const bool keep=std::any_of(active.begin(),active.end(),[&](const NodeGraph::Node& node){return
+                    static_cast<int>(NodeGraph::GraphKind::Vision)*1000001+node.id==it->first&&NodeGraph::parameter(node,"enabled")!=0;});
+                if(!keep)it=models.erase(it);else ++it;
             }
-            else if (context)
-            {
-                captureCudaGraph();
-            }
+            providerRevision=revision;
         }
-
-        cv::Mat frame;
-        cv::Mat sourceFrame;
-        cv::cuda::GpuMat frameGpu;
-        std::chrono::steady_clock::time_point frameTimestamp{};
-        std::uint64_t frameGeneration = 0;
-        PendingFrameType frameType = PendingFrameType::None;
-        bool hasNewFrame = false;
-
+        NodeGraph::FrameStream frame;
         {
             std::unique_lock<std::mutex> lock(inferenceMutex);
-            if (!frameReady && !shouldExit)
-                inferenceCV.wait(lock, [this] { return frameReady || shouldExit; });
-
-            if (shouldExit) break;
-
-            if (frameReady)
-            {
-                frameType = pendingFrameType;
-                frameTimestamp = currentFrameTimestamp;
-                frameGeneration = currentFrameGeneration;
-                if (frameType == PendingFrameType::Gpu)
-                {
-                    frameGpu = currentFrameGpu;
-                    currentFrameGpu.release();
-                    currentFrame.release();
-                    currentSourceFrame.release();
-                }
-                else
-                {
-                    frame = std::move(currentFrame);
-                    sourceFrame = std::move(currentSourceFrame);
-                    currentFrameGpu.release();
-                }
-                pendingFrameType = PendingFrameType::None;
-                frameReady = false;
-                hasNewFrame = true;
-            }
+            inferenceCV.wait_for(lock,std::chrono::milliseconds(50),[&]{return frameReady||shouldExit;});
+            if(shouldExit)break;
+            if(!frameReady)continue;
+            frame=std::move(currentGraphFrame);frameReady=false;
         }
-
-        if (!context)
-        {
-            if (!error_logged)
-            {
-                std::cerr << "[Detector] Context not initialized" << std::endl;
-                error_logged = true;
-            }
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            continue;
-        }
-        else
-        {
-            error_logged = false;
-        }
-
-        if (hasNewFrame)
-        {
-            if (!detectionBuffer.withCurrentGeneration(frameGeneration, [] {}))
-                continue;
-            const bool hasCpuFrame = (frameType == PendingFrameType::Cpu && !frame.empty());
-            const bool hasGpuFrame = (frameType == PendingFrameType::Gpu && !frameGpu.empty());
-            if (!hasCpuFrame && !hasGpuFrame)
-                continue;
-
-            try
-            {
-                cudaEventRecord(preprocessStartEvent, stream);
-                if (hasGpuFrame)
-                    preProcess(frameGpu);
-                else
-                    preProcess(frame);
-                cudaEventRecord(inferenceStartEvent, stream);
-                bool usedGraph = useCudaGraph && cudaGraphCaptured;
-                if (usedGraph)
-                {
-                    launchCudaGraph();
-                    cudaEventRecord(copyCompleteEvent, stream);
-                    cudaEventSynchronize(copyCompleteEvent);
-                }
-                else
-                {
-                    context->enqueueV3(stream);
-                    cudaEventRecord(inferenceCompleteEvent, stream);
-
-                    for (const auto& name : outputNames)
-                    {
-                        const size_t size = outputSizes[name];
-
-                        auto itPinned = pinnedOutputBuffers.find(name);
-                        if (itPinned == pinnedOutputBuffers.end() || !itPinned->second)
-                            continue;
-
-                        cudaMemcpyAsync(
-                            itPinned->second,
-                            outputBindings[name],
-                            size,
-                            cudaMemcpyDeviceToHost,
-                            stream
-                        );
-                    }
-
-                    cudaEventRecord(copyCompleteEvent, stream);
-                    cudaEventSynchronize(copyCompleteEvent);
-                }
-
-                // Post-processing (CPU)
-                auto t_post_start = std::chrono::steady_clock::now();
-
-                std::vector<Detection> latestDetections;
-                for (const auto& name : outputNames)
-                {
-                    const auto itPinned = pinnedOutputBuffers.find(name);
-                    if (itPinned == pinnedOutputBuffers.end() || !itPinned->second)
-                        continue;
-
-                    nvinfer1::DataType dtype = outputTypes[name];
-
-                    if (dtype == nvinfer1::DataType::kHALF)
-                    {
-                        // Convert to float on CPU
-                        const size_t numElements = outputSizes[name] / sizeof(__half);
-                        const __half* halfPtr = reinterpret_cast<const __half*>(itPinned->second);
-
-                        auto& outputDataFloat = fp16OutputScratch[name];
-                        if (outputDataFloat.size() != numElements)
-                            outputDataFloat.resize(numElements);
-
-                        for (size_t i = 0; i < numElements; ++i)
-                            outputDataFloat[i] = __half2float(halfPtr[i]);
-
-                        latestDetections = postProcess(outputDataFloat.data(), name, &lastNmsTime);
-                    }
-                    else if (dtype == nvinfer1::DataType::kFLOAT)
-                    {
-                        const float* floatPtr = reinterpret_cast<const float*>(itPinned->second);
-                        latestDetections = postProcess(floatPtr, name, &lastNmsTime);
-                    }
-                }
-
-                std::vector<cv::Rect> boxes;
-                std::vector<int> classes;
-                std::vector<float> confidences;
-                boxes.reserve(latestDetections.size());
-                classes.reserve(latestDetections.size());
-                confidences.reserve(latestDetections.size());
-                for (const auto& det : latestDetections)
-                {
-                    boxes.push_back(det.box);
-                    classes.push_back(det.classId);
-                    confidences.push_back(det.confidence);
-                }
-
-                if (!detectionBuffer.setForGeneration(frameGeneration, boxes, classes, confidences, frameTimestamp))
-                    continue;
-
-                if (hasGpuFrame)
-                {
-                    cvm::MaybeCollectDataSample(
-                        "",
-                        config.ai_model.c_str(),
-                        frameGpu,
-                        boxes,
-                        classes,
-                        confidences,
-                        aiming.load(),
-                        config);
-                }
-                else
-                {
-                    const cv::Mat& frameForCollection = sourceFrame.empty() ? frame : sourceFrame;
-                    cvm::MaybeCollectDataSample(
-                        "",
-                        config.ai_model.c_str(),
-                        frameForCollection,
-                        boxes,
-                        classes,
-                        confidences,
-                        aiming.load(),
-                        config);
-                }
-
-                auto t_post_end = std::chrono::steady_clock::now();
-
-                float preprocessMs = 0.0f;
-                float inferenceMs = 0.0f;
-                float copyMs = 0.0f;
-
-                cudaEventElapsedTime(&preprocessMs, preprocessStartEvent, inferenceStartEvent);
-                cudaEventElapsedTime(&inferenceMs, inferenceStartEvent, inferenceCompleteEvent);
-                cudaEventElapsedTime(&copyMs, inferenceCompleteEvent, copyCompleteEvent);
-
-                lastPreprocessTime = std::chrono::duration<double, std::milli>(preprocessMs);
-                lastInferenceTime = std::chrono::duration<double, std::milli>(inferenceMs);
-                lastCopyTime = std::chrono::duration<double, std::milli>(copyMs);
-                lastPostprocessTime = t_post_end - t_post_start;
-            }
-            catch (const std::exception& e)
-            {
-                std::cerr << "[Detector] Error during inference: " << e.what() << std::endl;
-            }
-        }
+        if(!frame||detectionBuffer.isPaused()||!detectionBuffer.withCurrentGeneration(frame->generation,[]{}))continue;
+        try{NodeVision::processFrame(frame,infer);}
+        catch(const std::exception& error){std::cerr<<"[TRT] Vision evaluation failed: "<<error.what()<<std::endl;}
     }
 }
-
 void TrtDetector::preProcess(const cv::Mat& frame)
 {
     if (frame.empty())
@@ -1182,14 +898,17 @@ std::vector<Detection> TrtDetector::postProcess(const float* output, const std::
     detections = postProcessYolo(
         output,
         shapeIt->second,
-        numClasses,
-        config.confidence_threshold,
-        config.nms_threshold,
-        std::max(1, config.max_detections),
-        nmsTime
+        NodeGraph::parameter(inferenceSettings,"class_count")>0?static_cast<int>(NodeGraph::parameter(inferenceSettings,"class_count")):numClasses,
+        static_cast<float>(NodeGraph::parameter(inferenceSettings,"confidence_threshold")),
+        static_cast<float>(NodeGraph::parameter(inferenceSettings,"nms_threshold")),
+        std::max(1,static_cast<int>(NodeGraph::parameter(inferenceSettings,"max_detections"))),
+        nmsTime,img_scale
     );
-    filterDetectionsByDepthMask(detections);
-    filterDetectionsByCircleFov(detections);
+    if(img_scale>0&&std::abs(imageScaleY-img_scale)>1e-6)
+    {
+        const double ratio=imageScaleY/img_scale;
+        for(auto& detection:detections){detection.box.y=static_cast<int>(detection.box.y*ratio);detection.box.height=static_cast<int>(detection.box.height*ratio);}
+    }
     return detections;
 }
 #endif

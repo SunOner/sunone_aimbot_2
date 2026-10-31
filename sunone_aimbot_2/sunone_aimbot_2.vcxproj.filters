@@ -47,6 +47,11 @@
     <ClCompile Include="overlay\Game_overlay.cpp" />
     <ClCompile Include="overlay\draw_game_overlay.cpp" />
     <ClCompile Include="overlay\config_dirty.cpp" />
+    <ClCompile Include="nodes\node_graph.cpp" />
+    <ClCompile Include="nodes\node_config_bridge.cpp" />
+    <ClCompile Include="nodes\vision_runtime.cpp" />
+    <ClCompile Include="nodes\vision_outputs.cpp" />
+    <ClCompile Include="overlay\node_editor.cpp" />
     <ClCompile Include="mem\gpu_resource_manager.cpp" />
     <ClCompile Include="mem\cpu_affinity_manager.cpp" />
     <ClCompile Include="capture\udp_capture.cpp" />
@@ -78,6 +83,7 @@
     <ClInclude Include="include\memory_images.h" />
     <ClInclude Include="capture\capture.h" />
     <ClInclude Include="overlay\overlay.h" />
+    <ClInclude Include="overlay\window_geometry.h" />
     <ClInclude Include="mouse\ghub.h" />
     <ClInclude Include="mouse\hidapi.h" />
     <ClInclude Include="mouse\KmboxAConnection.h" />
@@ -117,6 +123,12 @@
     <ClInclude Include="mouse\kmboxNetConnection.h" />
     <ClInclude Include="overlay\Game_overlay.h" />
     <ClInclude Include="overlay\config_dirty.h" />
+    <ClInclude Include="nodes\node_graph.h" />
+    <ClInclude Include="nodes\node_layout.h" />
+    <ClInclude Include="nodes\node_config_bridge.h" />
+    <ClInclude Include="nodes\vision_runtime.h" />
+    <ClInclude Include="nodes\vision_outputs.h" />
+    <ClInclude Include="overlay\node_editor.h" />
     <ClInclude Include="mem\gpu_resource_manager.h" />
     <ClInclude Include="mem\cpu_affinity_manager.h" />
     <ClInclude Include="detector\cuda_preprocess.h" />

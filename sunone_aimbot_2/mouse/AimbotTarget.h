@@ -18,12 +18,26 @@ public:
     AimbotTarget(int x, int y, int w, int h, int classId, double pivotX = 0.0, double pivotY = 0.0);
 };
 
+struct TargetSelectionSettings
+{
+    int classPlayer = 0;
+    int classHead = 1;
+    bool filterClasses = true;
+    bool preferHead = true;
+    bool mergeHeadBody = true;
+    bool applyOffsets = true;
+    double bodyOffset = 0.15;
+    double headOffset = 0.05;
+    int maxMissedFrames = 6;
+};
+
 AimbotTarget* sortTargets(
     const std::vector<cv::Rect>& boxes,
     const std::vector<int>& classes,
     int screenWidth,
     int screenHeight,
-    bool disableHeadshot
+    bool disableHeadshot,
+    const TargetSelectionSettings& settings
 );
 
 struct LockedTargetInfo
@@ -31,6 +45,9 @@ struct LockedTargetInfo
     int trackId = -1;
     bool observedThisFrame = false;
     int missedFrames = 0;
+    double confidence = 0.0;
+    double velocityX = 0.0;
+    double velocityY = 0.0;
     AimbotTarget target;
 };
 
@@ -60,6 +77,8 @@ public:
         int screenHeight,
         bool disableHeadshot,
         bool keepCurrentLock,
+        const TargetSelectionSettings& settings,
+        const std::vector<float>& confidences = {},
         std::chrono::steady_clock::time_point observationTime = {}
     );
     bool getLockedTarget(LockedTargetInfo& out) const;
@@ -73,6 +92,7 @@ private:
         cv::Rect2f box;
         cv::Point2f velocity = { 0.0f, 0.0f };
         int classId = -1;
+        double confidence = 0.0;
         int hits = 0;
         int missed = 0;
         bool observedThisFrame = false;
@@ -85,6 +105,7 @@ private:
     {
         cv::Rect2f box;
         int classId = -1;
+        double confidence = 0.0;
         double pivotX = 0.0;
         double pivotY = 0.0;
     };

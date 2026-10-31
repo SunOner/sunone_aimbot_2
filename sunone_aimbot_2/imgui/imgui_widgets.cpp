@@ -113,13 +113,27 @@ static float Win11AnimFloat(ImGuiID id, const char* suffix, float target, float 
         return target;
 
     const ImGuiID anim_id = ImHashStr(suffix, 0, id);
-    float* value = window->DC.StateStorage->GetFloatRef(anim_id, initial);
+    const ImGuiID frame_id = ImHashStr("##Win11AnimFrame", 0, anim_id);
+    const ImGuiID base_id = ImHashStr("##Win11AnimBase", 0, anim_id);
+    ImGuiStorage* storage = window->DC.StateStorage;
+    const float value = storage->GetFloat(anim_id, initial);
+    const bool same_frame = storage->GetInt(frame_id, -1) == g.FrameCount;
+    const float base = same_frame ? storage->GetFloat(base_id, value) : value;
+    if (!same_frame)
+    {
+        storage->SetFloat(base_id, base);
+        storage->SetInt(frame_id, g.FrameCount);
+    }
     const float dt = ImMin(g.IO.DeltaTime, 1.0f / 15.0f);
     const float step = 1.0f - expf(-speed * dt);
-    *value = ImLerp(*value, target, step);
-    if (ImFabs(*value - target) < 0.001f)
-        *value = target;
-    return *value;
+    // The combo frame and popup share this animation. Reusing its ID in the
+    // same frame must not advance time twice; a changed target is resolved
+    // against the same starting value rather than another integration step.
+    float animated = ImLerp(base, target, step);
+    if (ImFabs(animated - target) < 0.001f)
+        animated = target;
+    storage->SetFloat(anim_id, animated);
+    return animated;
 }
 
 static ImU32 Win11LerpColor(ImU32 a, ImU32 b, float t)
@@ -2174,7 +2188,7 @@ bool ImGui::BeginComboPopup(ImGuiID popup_id, const ImRect& bb, ImGuiComboFlags 
     ImGuiWindowFlags window_flags = ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_Popup | ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoMove;
     PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(g.Style.FramePadding.x + 2.0f, 7.0f)); // Horizontally align ourselves with the framed text
     PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0.0f, 6.0f));
-    PushStyleVar(ImGuiStyleVar_Alpha, ImMax(0.35f, open_anim));
+    PushStyleVar(ImGuiStyleVar_Alpha, g.Style.Alpha * ImMax(0.35f, open_anim));
     bool ret = Begin(name, NULL, window_flags);
     if (!ret)
     {

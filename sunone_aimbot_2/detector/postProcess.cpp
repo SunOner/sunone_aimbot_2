@@ -5,10 +5,6 @@
 #include <cmath>
 
 #include "postProcess.h"
-#include "sunone_aimbot_2.h"
-#ifdef USE_CUDA
-#include "trt_detector.h"
-#endif
 
 namespace
 {
@@ -37,15 +33,6 @@ bool ExtractRowsCols(const std::vector<int64_t>& shape, int* rows, int* cols)
 
     return TryPositiveInt64ToInt(shape[shape.size() - 2], rows) &&
         TryPositiveInt64ToInt(shape[shape.size() - 1], cols);
-}
-
-int ConfiguredClassCountHint()
-{
-    const int maxClassId = std::max(config.class_player, config.class_head);
-    if (maxClassId < 0 || maxClassId > 9999)
-        return 0;
-
-    return maxClassId + 1;
 }
 
 bool TryResolveClassLayout(
@@ -81,9 +68,6 @@ bool TryResolveClassLayout(
     };
 
     if (tryHint(numClassesHint))
-        return true;
-
-    if (tryHint(ConfiguredClassCountHint()))
         return true;
 
     if (preferObjectness && extent > 5)
@@ -455,6 +439,15 @@ void NMS(std::vector<Detection>& detections, float nmsThreshold, std::chrono::du
 
     SortDetectionsByConfidence(detections);
 
+    // Raw Inference nodes expose candidates to a separate graph NMS stage.
+    // A threshold of one cannot suppress any box; avoid a quadratic scan of
+    // the full model output in this deliberately disabled mode.
+    if(nmsThreshold>=1.0f)
+    {
+        if(nmsTime)*nmsTime=std::chrono::steady_clock::now()-t0;
+        return;
+    }
+
     std::vector<bool> suppress(detections.size(), false);
     std::vector<Detection> result;
     result.reserve(detections.size());
@@ -505,7 +498,8 @@ std::vector<Detection> postProcessYolo(
     float confThreshold,
     float nmsThreshold,
     int maxDetections,
-    std::chrono::duration<double, std::milli>* nmsTime
+    std::chrono::duration<double, std::milli>* nmsTime,
+    float imageScale
 )
 {
     return DecodeYoloOutput(
@@ -515,7 +509,7 @@ std::vector<Detection> postProcessYolo(
         confThreshold,
         nmsThreshold,
         maxDetections,
-        trt_detector.img_scale,
+        imageScale,
         nmsTime);
 }
 #endif

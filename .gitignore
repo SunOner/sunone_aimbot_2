@@ -43,6 +43,8 @@ compile_commands.json
 CMakePresets.json.user
 /build/
 benchmark_results/
+node_graphs.ini
+node_graphs.ini.tmp
 **/benchmark_results/
 cmake-build-*/
 tools/.bin/

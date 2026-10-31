@@ -1,10 +1,8 @@
 # Configuration Guide
 
-The runtime config is `config.ini`. It is created automatically the first time the app starts if it does not already exist.
+`config.ini` is created on first launch. Settings use root-level `key = value` lines; `[Games]` stores sensitivity profiles.
 
-Most settings are saved as simple root-level `key = value` lines. The only true INI section currently written by the app is `[Games]`, which stores game sensitivity profiles.
-
-For most users, the GUI is the safest way to edit settings. This page exists so you can also understand and edit the file directly.
+Capture, detection, aiming and output settings seed `node_graphs.ini` on first launch. Edit existing graphs in the [node editor](guides/node-graphs.md); device connections, application hotkeys and window preferences remain in `config.ini`.
 
 ## Basic Rules
 
@@ -13,9 +11,8 @@ For most users, the GUI is the safest way to edit settings. This page exists so 
 - Button lists are comma-separated, for example `RightMouseButton,LeftShift`.
 - Paths may be relative to the executable folder.
 - If a value is outside its accepted range, the app clamps it or falls back to a valid default.
-- Razer and Teensy control methods do not fall back to another method when selected.
 
-The defaults below are the generated defaults for a fresh config. A few legacy missing-key fallbacks in source are different for backward compatibility; those are called out where they matter.
+Tables show generated defaults. Different fallbacks for missing keys in older configs are noted separately.
 
 ## Quick Backend Setup
 
@@ -40,8 +37,6 @@ ai_model = sunxds_0.5.6.engine
 capture_use_cuda = true
 ```
 
-Circle FOV can remain enabled for circular target filtering.
-
 ## Capture
 
 | Key | Default | Meaning |
@@ -65,8 +60,6 @@ Circle FOV can remain enabled for circular target filtering.
 
 ### UDP Capture
 
-Use UDP capture when another PC or process sends a screen/camera stream to this app over the network.
-
 ```ini
 capture_method = udp_capture
 udp_ip = 0.0.0.0
@@ -75,15 +68,9 @@ detection_resolution = 320
 capture_fps = 60
 ```
 
-The receiver expects an MJPEG byte stream over UDP. Each frame must be a normal JPEG image; the app finds frames by JPEG start/end markers and decodes them with OpenCV. This is not RTP, RTSP, or a custom packet-header protocol.
+The receiver expects JPEG frames over UDP, not RTP/RTSP. `udp_ip` filters senders; `0.0.0.0` accepts any sender. Allow `udp_port` through the receiver firewall.
 
-`udp_ip = 0.0.0.0` is the recommended diagnostic setting because it accepts any sender. Set `udp_ip` to a specific sender IPv4 address only when you want to ignore packets from other machines. The app listens on `udp_port`; make sure that UDP port is allowed through Windows Firewall on the receiver PC.
-
-For FFmpeg sender examples, see [UDP capture over LAN](guides/udp-capture.md).
-
-### Circle FOV
-
-Use `circle_fov_enabled` for normal circular aim limiting and overlay visualization.
+See [FFmpeg sender examples](guides/udp-capture.md) and [Circle FOV setup](guides/circle-fov.md).
 
 ## Targeting
 
@@ -127,12 +114,6 @@ Use `circle_fov_enabled` for normal circular aim limiting and overlay visualizat
 
 ## Input Method
 
-Valid values:
-
-```text
-WIN32, GHUB, RAZER, ARDUINO, RP2350, TEENSY41, TEENSY41_HID, KMBOX_NET, KMBOX_A, MAKCU
-```
-
 | Method | Plain meaning |
 |---|---|
 | `WIN32` | Standard Windows mouse events. |
@@ -146,9 +127,7 @@ WIN32, GHUB, RAZER, ARDUINO, RP2350, TEENSY41, TEENSY41_HID, KMBOX_NET, KMBOX_A,
 | `KMBOX_A` | kmbox A serial/HID style control. |
 | `MAKCU` | MAKCU serial control. |
 
-`WIN32` is the easiest first test, but it uses standard Windows synthetic mouse events. Some games ignore or block that input path. If detection boxes are visible but the game does not react to aim movement or auto-shoot, switch to a supported runtime or external input device such as G HUB, Razer, Arduino/RP2350/Teensy, KMBOX, or MAKCU, and confirm that method is connected.
-
-When a hardware method is selected, the app expects that method to work. Razer and Teensy are intentionally explicit and do not silently switch to Win32 or another fallback method.
+Some applications ignore Win32 synthetic input. Razer and Teensy do not fall back to another method when unavailable. See [input setup and checks](guides/input-methods.md).
 
 ## Wind Mouse
 
@@ -182,11 +161,7 @@ When a hardware method is selected, the app expects that method to work. Razer a
 
 ### Teensy 4.1 RawHID
 
-Use this section only with:
-
-```ini
-input_method = TEENSY41_HID
-```
+For `input_method = TEENSY41_HID`.
 
 | Key | Default | Meaning |
 |---|---:|---|
@@ -242,8 +217,6 @@ The Teensy path sends report-ID-prefixed 64-byte packets and expects matching fi
 | `export_enable_fp8` | `false` in generated CUDA config | TensorRT export option, CUDA builds only. Missing-key fallback is `true`. |
 | `export_enable_fp16` | `true` in CUDA | TensorRT export option, CUDA builds only. |
 
-`fixed_input_size` exists as an internal runtime config field but is not currently written to the generated config file.
-
 ## CUDA
 
 These keys are written only in CUDA builds.
@@ -286,11 +259,12 @@ Use `None` to disable a button where supported.
 |---|---:|---|
 | `overlay_opacity` | `225` | Overlay opacity, `0..255`. |
 | `overlay_ui_scale` | `1.0` | Overlay UI scale. |
+| `overlay_sidebar_collapsed` | `false` | Show only sidebar icons. The sidebar chevron toggles this preference; changes save automatically. |
 | `overlay_exclude_from_capture` | `true` | Attempts to keep overlay out of captured frames. |
 | `overlay_x` | `0` | Overlay editor window X position. Auto-saved after moving. |
 | `overlay_y` | `0` | Overlay editor window Y position. Auto-saved after moving. |
-| `overlay_width` | `860` | Overlay editor window width. Auto-saved after resizing. |
-| `overlay_height` | `526` | Overlay editor window height. Auto-saved after resizing. |
+| `overlay_width` | `1180` | Preferred editor window width. Limited to the monitor work area and auto-saved after resizing. |
+| `overlay_height` | `740` | Preferred editor window height. Limited to the monitor work area and auto-saved after resizing. |
 
 ## Depth
 
@@ -374,28 +348,11 @@ Data collection needs CPU-readable frames, so it can change capture performance 
 
 ## Game Profiles
 
-The active profile is selected by:
+`active_game` selects a `[Games]` profile. Entry format: `name = sensitivity,yaw,pitch[,fovScaled,baseFOV]`.
 
 ```ini
 active_game = UNIFIED
-```
 
-Profiles are stored under `[Games]`:
-
-```ini
-[Games]
-UNIFIED = 1,0.022,0.022
-```
-
-Format:
-
-```text
-name = sensitivity,yaw,pitch[,fovScaled,baseFOV]
-```
-
-Examples:
-
-```ini
 [Games]
 UNIFIED = 1,0.022,0.022
 MY_GAME = 2.5,0.02,0.02,true,90

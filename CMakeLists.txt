@@ -270,6 +270,11 @@ set(AIMBOT_SOURCES
     "${SRC_DIR}/mouse/Arduino.cpp"
     "${SRC_DIR}/mouse/RP2350.cpp"
     "${SRC_DIR}/mouse/AimbotTarget.cpp"
+    "${SRC_DIR}/nodes/node_graph.cpp"
+    "${SRC_DIR}/nodes/node_config_bridge.cpp"
+    "${SRC_DIR}/nodes/vision_runtime.cpp"
+    "${SRC_DIR}/nodes/vision_outputs.cpp"
+    "${SRC_DIR}/overlay/node_editor.cpp"
     "${SRC_DIR}/overlay/draw_ai.cpp"
     "${SRC_DIR}/overlay/draw_buttons.cpp"
     "${SRC_DIR}/overlay/draw_capture.cpp"
@@ -547,6 +552,13 @@ message(STATUS "C++/WinRT include: ${AIMBOT_CPPWINRT_INCLUDE_DIR}")
 
 include(CTest)
 if(BUILD_TESTING)
+    add_executable(overlay_window_geometry_tests "${CMAKE_SOURCE_DIR}/tests/overlay_window_geometry_tests.cpp")
+    target_include_directories(overlay_window_geometry_tests PRIVATE "${SRC_DIR}")
+    if(MSVC)
+        set_target_properties(overlay_window_geometry_tests PROPERTIES MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+        target_compile_options(overlay_window_geometry_tests PRIVATE /W3 /permissive- /EHsc)
+    endif()
+    add_test(NAME overlay_window_geometry_regressions COMMAND overlay_window_geometry_tests)
     # Exercise the real worker and control loop against fake input. This target
     # is backend independent and does not initialize CUDA, ORT or capture.
     add_executable(input_runtime_tests
@@ -556,6 +568,9 @@ if(BUILD_TESTING)
         "${SRC_DIR}/runtime/mouse_thread_loop.cpp"
         "${SRC_DIR}/config/config.cpp"
         "${SRC_DIR}/detector/detection_buffer.cpp"
+        "${SRC_DIR}/nodes/node_graph.cpp"
+        "${SRC_DIR}/nodes/node_config_bridge.cpp"
+        "${SRC_DIR}/keyboard/keycodes.cpp"
     )
     target_include_directories(input_runtime_tests PRIVATE
         "${SRC_DIR}"
@@ -578,4 +593,81 @@ if(BUILD_TESTING)
     add_dependencies(input_runtime_tests ai)
     add_test(NAME input_runtime_regressions COMMAND input_runtime_tests)
     set_tests_properties(input_runtime_regressions PROPERTIES TIMEOUT 30)
+    add_executable(node_graph_tests
+        "${CMAKE_SOURCE_DIR}/tests/node_graph_tests.cpp"
+        "${SRC_DIR}/nodes/node_graph.cpp")
+    target_include_directories(node_graph_tests PRIVATE "${SRC_DIR}")
+    if(MSVC)
+        set_target_properties(node_graph_tests PROPERTIES MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+        target_compile_options(node_graph_tests PRIVATE /W3 /permissive- /EHsc)
+    endif()
+    add_test(NAME node_graph_regressions COMMAND node_graph_tests)
+    add_executable(node_config_bridge_tests
+        "${CMAKE_SOURCE_DIR}/tests/node_config_bridge_tests.cpp"
+        "${SRC_DIR}/nodes/node_graph.cpp"
+        "${SRC_DIR}/nodes/node_config_bridge.cpp"
+        "${SRC_DIR}/keyboard/keycodes.cpp")
+    target_include_directories(node_config_bridge_tests PRIVATE "${SRC_DIR}" "${SRC_DIR}/config")
+    if(MSVC)
+        set_target_properties(node_config_bridge_tests PROPERTIES MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+        target_compile_options(node_config_bridge_tests PRIVATE /W3 /permissive- /EHsc)
+    endif()
+    add_test(NAME node_config_migration COMMAND node_config_bridge_tests)
+    add_executable(vision_outputs_tests
+        "${CMAKE_SOURCE_DIR}/tests/vision_outputs_tests.cpp"
+        "${SRC_DIR}/nodes/vision_outputs.cpp"
+        "${SRC_DIR}/nodes/node_graph.cpp"
+        "${SRC_DIR}/scr/data_collector.cpp")
+    target_include_directories(vision_outputs_tests PRIVATE
+        "${SRC_DIR}" "${SRC_DIR}/capture" "${SRC_DIR}/config"
+        "${SRC_DIR}/include" "${SRC_DIR}/detector" "${SRC_DIR}/mouse" "${AIMBOT_OPENCV_INCLUDE_DIR}")
+    target_link_libraries(vision_outputs_tests PRIVATE "${AIMBOT_OPENCV_LIBRARY}")
+    target_compile_definitions(vision_outputs_tests PRIVATE UNICODE _UNICODE _CONSOLE NOMINMAX)
+    if(MSVC)
+        set_target_properties(vision_outputs_tests PROPERTIES MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+        target_compile_options(vision_outputs_tests PRIVATE /W3 /permissive- /EHsc)
+    endif()
+    add_dependencies(vision_outputs_tests ai)
+    add_test(NAME vision_outputs_regressions COMMAND vision_outputs_tests)
+    # Exercise the actual canvas with queued ImGui input, without a native
+    # window, capture, providers or physical input devices. The optional
+    # --benchmark mode also measures the real D3D11 renderer offscreen.
+    add_executable(node_editor_input_tests
+        "${CMAKE_SOURCE_DIR}/tests/node_editor_input_tests.cpp"
+        "${SRC_DIR}/nodes/node_graph.cpp"
+        "${SRC_DIR}/nodes/node_config_bridge.cpp"
+        "${SRC_DIR}/keyboard/keycodes.cpp"
+        "${SRC_DIR}/imgui/imgui.cpp"
+        "${SRC_DIR}/imgui/imgui_draw.cpp"
+        "${SRC_DIR}/imgui/imgui_tables.cpp"
+        "${SRC_DIR}/imgui/imgui_impl_dx11.cpp"
+        "${SRC_DIR}/imgui/imgui_widgets.cpp")
+    target_link_libraries(node_editor_input_tests PRIVATE d3d11 dxgi)
+    set(_node_benchmark_commit "unknown")
+    set(_node_benchmark_dirty "unknown")
+    find_package(Git QUIET)
+    if(GIT_FOUND)
+        execute_process(COMMAND "${GIT_EXECUTABLE}" rev-parse --short HEAD WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+            OUTPUT_VARIABLE _node_benchmark_commit OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+        execute_process(COMMAND "${GIT_EXECUTABLE}" status --porcelain WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+            OUTPUT_VARIABLE _node_benchmark_status ERROR_QUIET)
+        if(_node_benchmark_status)
+            set(_node_benchmark_dirty "true")
+        else()
+            set(_node_benchmark_dirty "false")
+        endif()
+    endif()
+    target_compile_definitions(node_editor_input_tests PRIVATE
+        NODE_BENCHMARK_COMMIT="${_node_benchmark_commit}" NODE_BENCHMARK_DIRTY="${_node_benchmark_dirty}"
+        NODE_BENCHMARK_BACKEND="$<IF:$<BOOL:${AIMBOT_USE_CUDA}>,cuda,dml>")
+    target_include_directories(node_editor_input_tests PRIVATE
+        "${SRC_DIR}" "${SRC_DIR}/config" "${SRC_DIR}/keyboard"
+        "${SRC_DIR}/imgui" "${AIMBOT_OPENCV_INCLUDE_DIR}")
+    target_compile_definitions(node_editor_input_tests PRIVATE UNICODE _UNICODE _CONSOLE NOMINMAX)
+    if(MSVC)
+        set_target_properties(node_editor_input_tests PROPERTIES MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+        target_compile_options(node_editor_input_tests PRIVATE /W3 /permissive- /EHsc)
+    endif()
+    add_test(NAME node_editor_input_regressions COMMAND node_editor_input_tests)
+    set_tests_properties(node_editor_input_regressions PROPERTIES TIMEOUT 30)
 endif()

@@ -12,15 +12,17 @@
 #include <vector>
 
 #include "postProcess.h"
+#include "nodes/node_graph.h"
 
 class DirectMLDetector
 {
 public:
-    DirectMLDetector(const std::string& model_path);
+    DirectMLDetector(const std::string& model_path = "", int deviceId = -1, bool cpuOnly = false);
     ~DirectMLDetector();
 
     std::vector<Detection> detect(const cv::Mat& input_frame);
     std::vector<std::vector<Detection>> detectBatch(const std::vector<cv::Mat>& frames);
+    std::vector<std::vector<Detection>> detectBatch(const std::vector<cv::Mat>& frames, const NodeGraph::Node& settings);
 
     void dmlInferenceThread();
     void processFrame(
@@ -58,6 +60,10 @@ private:
     int offset_output_index = -1;
     int model_input_h = -1;
     int model_input_w = -1;
+    bool model_input_static = false;
+    int device_id = 0;
+    bool cpu_only = false;
+    std::string loaded_model_path;
 
     std::vector<float> input_tensor_values;
     cv::Mat preprocessBgrBuffer;
@@ -67,11 +73,8 @@ private:
     cv::Mat preprocessGrayFloatBuffer;
 
     std::mutex inferenceMutex;
-    cv::Mat currentFrame;
-    cv::Mat currentSourceFrame;
-    std::chrono::steady_clock::time_point currentFrameTimestamp{};
-    std::uint64_t currentFrameGeneration = 0;
     bool frameReady = false;
+    NodeGraph::FrameStream currentGraphFrame;
 
     bool initializeModel(const std::string& model_path);
     bool tryInitializeModel(

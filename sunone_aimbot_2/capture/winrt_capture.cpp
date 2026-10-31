@@ -100,6 +100,12 @@ WinRTScreenCapture::WinRTScreenCapture(int desiredWidth, int desiredHeight, cons
     else
     {
         HMONITOR hMonitor = GetMonitorHandleByIndex(options.monitorIndex);
+        if(!options.monitorDevice.empty())
+        {
+            struct Search{const std::string* device;HMONITOR found=nullptr;}search{&options.monitorDevice};
+            EnumDisplayMonitors(nullptr,nullptr,[](HMONITOR handle,HDC,LPRECT,LPARAM data)->BOOL{auto& search=*reinterpret_cast<Search*>(data);MONITORINFOEXW info{};info.cbSize=sizeof(info);if(GetMonitorInfoW(handle,&info)&&WideToUtf8(info.szDevice)==*search.device){search.found=handle;return FALSE;}return TRUE;},reinterpret_cast<LPARAM>(&search));
+            hMonitor=search.found;
+        }
         if (!hMonitor)
         {
             throw std::runtime_error("[WinRTCapture] Invalid monitor index in config.");

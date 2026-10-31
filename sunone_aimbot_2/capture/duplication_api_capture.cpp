@@ -66,7 +66,7 @@ public:
         int& outScreenWidth,
         int& outScreenHeight,
         ID3D11Device** outDevice,
-        ID3D11DeviceContext** outContext)
+        ID3D11DeviceContext** outContext,const std::string& monitorDevice)
     {
         HRESULT hr = S_OK;
 
@@ -81,6 +81,8 @@ public:
         IDXGIAdapter1* adapter = nullptr;
         IDXGIOutput* output = nullptr;
         const int targetMonitorIndex = std::max(0, monitorIndex);
+        std::wstring targetDevice;
+        if(!monitorDevice.empty()){const int count=MultiByteToWideChar(CP_UTF8,MB_ERR_INVALID_CHARS,monitorDevice.data(),static_cast<int>(monitorDevice.size()),nullptr,0);targetDevice.resize(std::max(0,count));if(count)MultiByteToWideChar(CP_UTF8,MB_ERR_INVALID_CHARS,monitorDevice.data(),static_cast<int>(monitorDevice.size()),targetDevice.data(),count);else{SafeRelease(&factory);return E_INVALIDARG;}}
 
         int currentMonitorIndex = 0;
         bool foundOutput = false;
@@ -111,7 +113,8 @@ public:
                     return hr;
                 }
 
-                if (currentMonitorIndex == targetMonitorIndex)
+                DXGI_OUTPUT_DESC candidate{};const bool matchingDevice=!targetDevice.empty()&&SUCCEEDED(candidateOutput->GetDesc(&candidate))&&targetDevice==candidate.DeviceName;
+                if (targetDevice.empty()?currentMonitorIndex==targetMonitorIndex:matchingDevice)
                 {
                     adapter = candidateAdapter;
                     output = candidateOutput;
@@ -274,7 +277,7 @@ public:
     bool m_frameAcquired;
 };
 
-DuplicationAPIScreenCapture::DuplicationAPIScreenCapture(int desiredWidth, int desiredHeight, int monitorIndex)
+DuplicationAPIScreenCapture::DuplicationAPIScreenCapture(int desiredWidth, int desiredHeight, int monitorIndex,const std::string& monitorDevice)
     : d3dDevice(nullptr)
     , d3dContext(nullptr)
     , deskDupl(nullptr)
@@ -295,7 +298,7 @@ DuplicationAPIScreenCapture::DuplicationAPIScreenCapture(int desiredWidth, int d
         screenWidth,
         screenHeight,
         &d3dDevice,
-        &d3dContext
+        &d3dContext,monitorDevice
     );
     if (FAILED(hr))
     {

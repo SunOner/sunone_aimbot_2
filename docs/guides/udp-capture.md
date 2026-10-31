@@ -1,6 +1,6 @@
 # UDP Capture Over LAN (FFmpeg)
 
-UDP capture receives an MJPEG byte stream from another PC or process. The sender streams JPEG frames over UDP; this app decodes those frames on the receiver PC.
+UDP capture receives an MJPEG byte stream from another PC or process.
 
 ## Receiver PC Setup
 
@@ -52,15 +52,13 @@ Match the FFmpeg `scale` size to `detection_resolution` when possible. Valid det
 
 ## UDP Capture Does Not Receive Frames
 
-Check these first:
-
 1. `capture_method = udp_capture`
 2. `udp_port` matches the sender command.
 3. The receiver firewall allows inbound UDP on that port.
 4. The sender streams MJPEG to the receiver PC IP, not to `0.0.0.0`.
 5. `udp_ip = 0.0.0.0` while diagnosing, so packets from any sender are accepted.
 
-Set `udp_ip` to a specific sender IPv4 address only after the stream is working. In the current implementation this value filters the sender address; it is not the local bind address.
+`udp_ip` filters the sender address; it is not the local bind address.
 
 Related docs:
 

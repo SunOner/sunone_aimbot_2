@@ -22,6 +22,8 @@ extern ID3D11RenderTargetView* g_mainRenderTargetView;
 extern HWND g_hwnd;
 
 void OverlayThread();
+void OverlayPreview();
+void Overlay_ExpandForNodes();
 
 extern std::atomic<bool> detection_resolution_changed;
 extern std::atomic<bool> capture_method_changed;

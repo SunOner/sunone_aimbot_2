@@ -13,9 +13,7 @@
 #include <mutex>
 #include <opencv2/opencv.hpp>
 
-#include "runtime/input_state.h"
 #include "AimbotTarget.h"
-#include "config.h"
 
 AimbotTarget::AimbotTarget()
     : x(0), y(0), w(0), h(0), classId(0), pivotX(0.0), pivotY(0.0)
@@ -32,7 +30,8 @@ AimbotTarget* sortTargets(
     const std::vector<int>& classes,
     int screenWidth,
     int screenHeight,
-    bool disableHeadshot)
+    bool disableHeadshot,
+    const TargetSelectionSettings& settings)
 {
     const size_t inputCount = std::min(boxes.size(), classes.size());
     if (inputCount == 0)
@@ -41,23 +40,16 @@ AimbotTarget* sortTargets(
     }
 
     cv::Point center(screenWidth / 2, screenHeight / 2);
-    int classHead = 1;
-    int classPlayer = 0;
-    float headOffset = 0.05f;
-    float bodyOffset = 0.15f;
-    {
-        std::lock_guard<std::mutex> lock(configMutex);
-        classHead = config.class_head;
-        classPlayer = config.class_player;
-        headOffset = config.head_y_offset;
-        bodyOffset = config.body_y_offset;
-    }
+    const int classHead = settings.classHead;
+    const int classPlayer = settings.classPlayer;
+    const double headOffset = settings.applyOffsets ? settings.headOffset : 0.5;
+    const double bodyOffset = settings.applyOffsets ? settings.bodyOffset : 0.5;
 
     double minDistance = std::numeric_limits<double>::max();
     int nearestIdx = -1;
     int targetY = 0;
 
-    if (!disableHeadshot)
+    if (!disableHeadshot && settings.preferHead)
     {
         for (size_t i = 0; i < inputCount; i++)
         {
@@ -79,7 +71,7 @@ AimbotTarget* sortTargets(
         }
     }
 
-    if (disableHeadshot || nearestIdx == -1)
+    if (disableHeadshot || !settings.preferHead || nearestIdx == -1)
     {
         minDistance = std::numeric_limits<double>::max();
         for (size_t i = 0; i < inputCount; i++)
@@ -90,7 +82,7 @@ AimbotTarget* sortTargets(
             if (disableHeadshot && classes[i] == classHead)
                 continue;
 
-            if (classes[i] == classPlayer)
+            if (!settings.filterClasses || classes[i] == classPlayer)
             {
                 int offsetY = static_cast<int>(boxes[i].height * bodyOffset);
                 cv::Point targetPoint(boxes[i].x + boxes[i].width / 2, boxes[i].y + offsetY);
@@ -304,8 +296,11 @@ void MultiTargetTracker::update(
     int screenHeight,
     bool disableHeadshot,
     bool keepCurrentLock,
+    const TargetSelectionSettings& settings,
+    const std::vector<float>& confidences,
     std::chrono::steady_clock::time_point observationTime)
 {
+    maxMissedFrames_ = std::clamp(settings.maxMissedFrames,0,120);
     auto now = (observationTime.time_since_epoch().count() != 0)
         ? observationTime
         : std::chrono::steady_clock::now();
@@ -325,17 +320,10 @@ void MultiTargetTracker::update(
     }
     lastTrackerFrameTime_ = now;
 
-    int classPlayer = 0;
-    int classHead = 1;
-    float bodyOffset = 0.15f;
-    float headOffset = 0.05f;
-    {
-        std::lock_guard<std::mutex> lock(configMutex);
-        classPlayer = config.class_player;
-        classHead = config.class_head;
-        bodyOffset = config.body_y_offset;
-        headOffset = config.head_y_offset;
-    }
+    const int classPlayer = settings.classPlayer;
+    const int classHead = settings.classHead;
+    const double bodyOffset = settings.applyOffsets ? settings.bodyOffset : 0.5;
+    const double headOffset = settings.applyOffsets ? settings.headOffset : 0.5;
 
     for (auto& t : tracks_)
         t.observedThisFrame = false;
@@ -349,12 +337,12 @@ void MultiTargetTracker::update(
         const int cls = classes[i];
         if (disableHeadshot)
         {
-            if (cls != classPlayer)
+            if (cls == classHead || (settings.filterClasses && cls != classPlayer))
                 continue;
         }
         else
         {
-            if (cls != classPlayer && cls != classHead)
+            if (settings.filterClasses && cls != classPlayer && cls != classHead)
             {
                 continue;
             }
@@ -368,12 +356,13 @@ void MultiTargetTracker::update(
         DetectionCandidate d;
         d.box = cv::Rect2f(static_cast<float>(b.x), static_cast<float>(b.y), static_cast<float>(b.width), static_cast<float>(b.height));
         d.classId = cls;
+        d.confidence = i < confidences.size() ? confidences[i] : 0.0;
         d.pivotX = b.x + b.width * 0.5;
         d.pivotY = b.y + b.height * yOffset;
         dets.push_back(d);
     }
 
-    if (!disableHeadshot && !dets.empty())
+    if (!disableHeadshot && settings.mergeHeadBody && !dets.empty())
     {
         // If head and player detections refer to the same entity, keep one track candidate
         // (player box for stable identity) but move its pivot to the head point.
@@ -473,7 +462,7 @@ void MultiTargetTracker::update(
             if (!sameClass)
             {
                 const bool allowHeadBodySwap =
-                    !disableHeadshot &&
+                    !disableHeadshot && settings.mergeHeadBody &&
                     ((t.classId == classPlayer && d.classId == classHead) ||
                      (t.classId == classHead && d.classId == classPlayer));
                 if (!allowHeadBodySwap)
@@ -597,6 +586,7 @@ void MultiTargetTracker::update(
             t.pivotX = d.pivotX;
             t.pivotY = d.pivotY;
             t.classId = d.classId;
+            t.confidence = d.confidence;
             t.hits += 1;
             t.missed = 0;
             t.observedThisFrame = true;
@@ -630,6 +620,7 @@ void MultiTargetTracker::update(
         t.id = nextId_++;
         t.box = d.box;
         t.classId = d.classId;
+        t.confidence = d.confidence;
         t.hits = 1;
         t.missed = 0;
         t.observedThisFrame = true;
@@ -671,6 +662,9 @@ bool MultiTargetTracker::getLockedTarget(LockedTargetInfo& out) const
     out.trackId = t.id;
     out.observedThisFrame = t.observedThisFrame;
     out.missedFrames = t.missed;
+    out.confidence = t.confidence;
+    out.velocityX = t.velocity.x;
+    out.velocityY = t.velocity.y;
     out.target = AimbotTarget(
         static_cast<int>(std::lround(t.box.x)),
         static_cast<int>(std::lround(t.box.y)),

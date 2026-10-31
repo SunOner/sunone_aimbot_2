@@ -10,6 +10,7 @@
 #include <condition_variable>
 #include <vector>
 #include <unordered_map>
+#include <unordered_set>
 #include <cuda_fp16.h>
 #include <memory>
 #include <thread>
@@ -19,6 +20,7 @@
 #include <cuda_runtime_api.h>
 
 #include "postProcess.h"
+#include "nodes/node_graph.h"
 
 class TrtDetector
 {
@@ -26,6 +28,7 @@ public:
     TrtDetector();
     ~TrtDetector();
     void initialize(const std::string& modelFile);
+    void initialize(const std::string& modelFile,const NodeGraph::Node& settings,int width,int height=0);
     void processFrame(
         const cv::Mat& detection_frame,
         const cv::Mat& source_frame = cv::Mat(),
@@ -37,6 +40,7 @@ public:
     void requestStop();
     bool isInitialized() const;
     std::vector<Detection> detect(const cv::Mat& frame);
+    std::vector<Detection> detect(const NodeGraph::FrameStream& frame,const NodeGraph::Node& settings);
 
     float img_scale;
 
@@ -66,26 +70,21 @@ private:
     void destroyCudaGraph();
 
     std::unordered_map<std::string, void*> pinnedOutputBuffers;
+    std::unordered_set<std::string> pinnedOutputNames;
+    std::unordered_map<std::string,std::vector<std::uint8_t>> pageableOutputBuffers;
     void allocatePinnedOutputs();
     void freePinnedOutputs();
 
     std::mutex inferenceMutex;
     std::condition_variable inferenceCV;
     std::atomic<bool> shouldExit;
-    cv::Mat currentFrame;
-    cv::Mat currentSourceFrame;
-    cv::cuda::GpuMat currentFrameGpu;
-    std::chrono::steady_clock::time_point currentFrameTimestamp{};
-    std::uint64_t currentFrameGeneration = 0;
     bool frameReady;
-
-    enum class PendingFrameType
-    {
-        None = 0,
-        Cpu = 1,
-        Gpu = 2
-    };
-    PendingFrameType pendingFrameType = PendingFrameType::None;
+    NodeGraph::FrameStream currentGraphFrame;
+    NodeGraph::Node inferenceSettings;
+    int inferenceWidth=320,inferenceHeight=320;
+    bool pinnedOutputsEnabled=true;
+    double imageScaleY=1;
+    std::vector<Detection> inferGraphFrame(const cv::Mat& cpu,const cv::cuda::GpuMat& gpu,const NodeGraph::Node& settings);
 
     void loadEngine(const std::string& engineFile);
 

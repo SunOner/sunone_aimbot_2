@@ -2,6 +2,8 @@
 
 ## Lowest Setup Burden
 
+Config examples seed new graphs; edit node inputs in an existing workspace.
+
 ```ini
 backend = DML
 ai_model = your_model.onnx
@@ -24,7 +26,7 @@ Then check `[CaptureDiag]` output.
 
 ## Provider Benchmark
 
-Use this when you want repeatable provider timings without starting capture, overlay, input devices, or file logging:
+Run from the backend's output folder; capture and input devices stay inactive:
 
 ```powershell
 .\ai.exe --benchmark-providers
@@ -33,9 +35,7 @@ Use this when you want repeatable provider timings without starting capture, ove
 .\ai.exe --benchmark-providers cuda --bench-cuda-model models\your_model.engine
 ```
 
-The benchmark prints one final CSV-style summary in seconds. DML builds support `cpu`, `dml-gpu`, and `dml-cpu`; CUDA builds support `cuda` through TensorRT.
-
-DML benchmark runs append rows to `benchmark_results\provider_benchmark.csv`; CUDA benchmark runs append rows to `benchmark_results\provider_benchmark_cuda.csv`. Use `--bench-no-save` for a disposable run.
+DML supports `cpu`, `dml-gpu` and `dml-cpu`; CUDA supports `cuda` through TensorRT. Timings are reported in seconds. Results append to `benchmark_results\provider_benchmark.csv` or `provider_benchmark_cuda.csv`. Use `--bench-no-save` for console output only, or `--bench-results <path>` for a custom CSV.
 
 ## Razer Control Test
 
@@ -43,11 +43,7 @@ DML benchmark runs append rows to `benchmark_results\provider_benchmark.csv`; CU
 input_method = RAZER
 ```
 
-Make sure `rzctl.dll` is beside `ai.exe` or in:
-
-```text
-sunone_aimbot_2
-```
+Place `rzctl.dll` beside `ai.exe` or in `sunone_aimbot_2`.
 
 ## Teensy Control Test
 

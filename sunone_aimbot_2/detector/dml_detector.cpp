@@ -13,20 +13,18 @@
 #include <cmath>
 #include <dxgi.h>
 #include <utility>
+#include <filesystem>
+#include <memory>
+#include <unordered_map>
+#include <stdexcept>
 
 #include "dml_detector.h"
 #include "sunone_aimbot_2.h"
-#include "scr/data_collector.h"
+#include "nodes/vision_runtime.h"
 #include "postProcess.h"
 #include "capture.h"
-#include "capture/circle_fov.h"
+#include "runtime/input_state.h"
 #include "other_tools.h"
-#ifdef USE_CUDA
-#include "depth/depth_mask.h"
-#endif
-
-extern std::atomic<bool> detector_model_changed;
-extern std::atomic<bool> detection_resolution_changed;
 
 namespace
 {
@@ -202,103 +200,6 @@ std::vector<Detection> decodeSunPointRaw(
     return detections;
 }
 
-#ifdef USE_CUDA
-bool intersectsDepthMask(const cv::Rect& box, const cv::Mat& mask)
-{
-    if (box.width <= 0 || box.height <= 0 || mask.empty() || mask.type() != CV_8UC1)
-        return false;
-
-    const cv::Rect imageBounds(0, 0, mask.cols, mask.rows);
-    const cv::Rect clipped = box & imageBounds;
-    if (clipped.width <= 0 || clipped.height <= 0)
-        return false;
-
-    const int cx = clipped.x + clipped.width / 2;
-    const int cy = clipped.y + clipped.height / 2;
-    if (mask.at<uint8_t>(cy, cx) != 0)
-        return true;
-
-    const cv::Mat roi = mask(clipped);
-    return cv::countNonZero(roi) > 0;
-}
-
-void filterDetectionsByDepthMask(std::vector<Detection>& detections)
-{
-    static cv::Mat holdTtl;
-
-    if (detections.empty())
-        return;
-
-    if (!config.depth_inference_enabled || !config.depth_mask_enabled)
-    {
-        holdTtl.release();
-        return;
-    }
-
-    const int holdFrames = std::clamp(config.depth_mask_hold_frames, 0, 120);
-    cv::Mat currentMask = getCurrentDetectionSuppressionMask();
-    cv::Mat suppressionMask;
-
-    if (holdFrames <= 0)
-    {
-        holdTtl.release();
-        suppressionMask = currentMask;
-    }
-    else
-    {
-        if (!currentMask.empty() && currentMask.type() == CV_8UC1)
-        {
-            if (holdTtl.empty() || holdTtl.size() != currentMask.size())
-                holdTtl = cv::Mat::zeros(currentMask.size(), CV_16UC1);
-            cv::subtract(holdTtl, cv::Scalar(1), holdTtl);
-            holdTtl.setTo(cv::Scalar(static_cast<uint16_t>(holdFrames)), currentMask);
-        }
-        else if (!holdTtl.empty())
-        {
-            cv::subtract(holdTtl, cv::Scalar(1), holdTtl);
-        }
-
-        if (!holdTtl.empty() && cv::countNonZero(holdTtl) > 0)
-        {
-            cv::compare(holdTtl, cv::Scalar(0), suppressionMask, cv::CMP_GT);
-        }
-        else
-        {
-            suppressionMask.release();
-        }
-    }
-
-    if (suppressionMask.empty() || suppressionMask.type() != CV_8UC1)
-        return;
-
-    detections.erase(
-        std::remove_if(detections.begin(), detections.end(),
-            [&suppressionMask](const Detection& det) { return intersectsDepthMask(det.box, suppressionMask); }),
-        detections.end());
-}
-#else
-void filterDetectionsByDepthMask(std::vector<Detection>&)
-{
-}
-#endif
-}
-
-void filterDetectionsByCircleFov(std::vector<Detection>& detections)
-{
-    if (detections.empty() || !config.circle_fov_enabled)
-        return;
-
-    const cv::Size detectionSize(config.detection_resolution, config.detection_resolution);
-    detections.erase(
-        std::remove_if(detections.begin(), detections.end(),
-            [&detectionSize](const Detection& det)
-            {
-                const cv::Point2f center(
-                    static_cast<float>(det.box.x) + static_cast<float>(det.box.width) * 0.5f,
-                    static_cast<float>(det.box.y) + static_cast<float>(det.box.height) * 0.5f);
-                return !pointInsideCircleFov(center, detectionSize, config.circle_fov_radius_percent);
-            }),
-        detections.end());
 }
 
 std::string GetDMLDeviceName(int deviceId)
@@ -319,12 +220,14 @@ std::string GetDMLDeviceName(int deviceId)
     return WideToUtf8(wname);
 }
 
-DirectMLDetector::DirectMLDetector(const std::string& model_path)
+DirectMLDetector::DirectMLDetector(const std::string& model_path, int deviceId, bool cpuOnly)
     :
     env(getDmlOrtLogLevel(), "DML_Detector"),
     memory_info(Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault))
 {
-    if (!initializeModel(model_path))
+    device_id=deviceId>=0?deviceId:config.dml_device_id;
+    cpu_only=cpuOnly;
+    if (!model_path.empty()&&!initializeModel(model_path))
     {
         std::cerr << "[DML] Detector started without an active model. "
                   << "Select another ONNX model or fix the model/provider compatibility." << std::endl;
@@ -357,7 +260,7 @@ Ort::SessionOptions DirectMLDetector::createSessionOptions(
 
     if (useDirectML)
     {
-        Ort::ThrowOnError(OrtSessionOptionsAppendExecutionProvider_DML(options, config.dml_device_id));
+        Ort::ThrowOnError(OrtSessionOptionsAppendExecutionProvider_DML(options, device_id));
     }
 
     return options;
@@ -373,7 +276,7 @@ bool DirectMLDetector::tryInitializeModel(
     try
     {
         Ort::SessionOptions options = createSessionOptions(useDirectML, graphOptimizationLevel);
-        std::wstring model_path_wide(model_path.begin(), model_path.end());
+        std::wstring model_path_wide=std::filesystem::u8path(model_path).wstring();
         Ort::Session newSession(env, model_path_wide.c_str(), options);
 
         std::string newInputName = newSession.GetInputNameAllocated(0, allocator).get();
@@ -428,6 +331,8 @@ bool DirectMLDetector::tryInitializeModel(
         input_shape = std::move(newInputShape);
         model_input_h = newModelInputH;
         model_input_w = newModelInputW;
+        model_input_static = isStatic;
+        loaded_model_path=model_path;
         heat_output_index = newHeatOutputIndex;
         box_output_index = newBoxOutputIndex;
         offset_output_index = newOffsetOutputIndex;
@@ -435,19 +340,11 @@ bool DirectMLDetector::tryInitializeModel(
         using_directml_provider = useDirectML;
         model_ready.store(true);
 
-        if (isStatic != config.fixed_input_size)
-        {
-            config.fixed_input_size = isStatic;
-            detector_model_changed.store(true);
-            std::cout << "[DML] Automatically set fixed_input_size = "
-                      << (isStatic ? "true" : "false") << std::endl;
-        }
-
         std::cout << "[DML] Model initialized with " << providerLabel
                   << " provider: " << model_path << std::endl;
 
         if (useDirectML && config.verbose)
-            std::cout << "[DirectML] Using adapter: " << GetDMLDeviceName(config.dml_device_id) << std::endl;
+            std::cout << "[DirectML] Using adapter: " << GetDMLDeviceName(device_id) << std::endl;
 
         if (config.verbose)
         {
@@ -479,6 +376,14 @@ bool DirectMLDetector::initializeModel(const std::string& model_path)
 {
     env.UpdateEnvWithCustomLogLevel(getDmlOrtLogLevel());
     const bool hadReadySession = model_ready.load();
+
+    if(cpu_only)
+    {
+        std::string error;
+        if(tryInitializeModel(model_path,false,GraphOptimizationLevel::ORT_ENABLE_ALL,"CPU",&error))return true;
+        std::cerr << "[DML] CPU initialization failed: " << error << std::endl;
+        return false;
+    }
 
     std::string directMlError;
     if (tryInitializeModel(
@@ -630,6 +535,21 @@ std::vector<Detection> DirectMLDetector::detect(const cv::Mat& input_frame)
 
 std::vector<std::vector<Detection>> DirectMLDetector::detectBatch(const std::vector<cv::Mat>& frames)
 {
+    // Compatibility entry point for provider benchmarks. Production supplies
+    // the connected Inference node's immutable parameters instead.
+    NodeGraph::Node settings=NodeGraph::defaultNode(NodeGraph::NodeKind::Inference,1);
+    {
+        std::lock_guard<std::mutex> lock(configMutex);
+        settings.parameters["fixed_input_size"]=config.fixed_input_size?1:0;
+        settings.parameters["confidence_threshold"]=config.confidence_threshold;
+        settings.parameters["nms_threshold"]=config.nms_threshold;
+        settings.parameters["max_detections"]=config.max_detections;
+    }
+    return detectBatch(frames,settings);
+}
+
+std::vector<std::vector<Detection>> DirectMLDetector::detectBatch(const std::vector<cv::Mat>& frames, const NodeGraph::Node& settings)
+{
     std::vector<std::vector<Detection>> empty;
     if (!isReady()) return empty;
     if (frames.empty()) return empty;
@@ -637,10 +557,11 @@ std::vector<std::vector<Detection>> DirectMLDetector::detectBatch(const std::vec
 
     const int model_h = model_input_h;
     const int model_w = model_input_w;
-    const bool useFixed = config.fixed_input_size && model_h > 0 && model_w > 0;
+    const bool useFixed = (model_input_static||NodeGraph::parameter(settings,"fixed_input_size")!=0) && model_h > 0 && model_w > 0;
 
-    const int target_h = useFixed ? model_h : config.detection_resolution;
-    const int target_w = useFixed ? model_w : config.detection_resolution;
+    const int target_h = useFixed ? model_h : frames.front().rows;
+    const int target_w = useFixed ? model_w : frames.front().cols;
+    if(target_h<=0||target_w<=0)return empty;
 
     auto t0 = std::chrono::steady_clock::now();
     const size_t frameTensorSize =
@@ -678,9 +599,9 @@ std::vector<std::vector<Detection>> DirectMLDetector::detectBatch(const std::vec
     auto t3 = std::chrono::steady_clock::now();
 
     std::vector<std::vector<Detection>> batchDetections(batch_size);
-    float conf_thr = config.confidence_threshold;
-    float nms_thr = config.nms_threshold;
-    int max_detections = std::max(1, config.max_detections);
+    const float conf_thr = static_cast<float>(NodeGraph::parameter(settings,"confidence_threshold"));
+    const float nms_thr = static_cast<float>(NodeGraph::parameter(settings,"nms_threshold"));
+    const int max_detections = std::max(1, static_cast<int>(NodeGraph::parameter(settings,"max_detections")));
 
     auto t4 = std::chrono::steady_clock::now();
     std::chrono::duration<double, std::milli> nmsTimeTmp{ 0 };
@@ -720,10 +641,10 @@ std::vector<std::vector<Detection>> DirectMLDetector::detectBatch(const std::vec
                 max_detections,
                 &nmsTimeTmp);
 
-            if (useFixed && (target_w != config.detection_resolution || target_h != config.detection_resolution))
+            if (target_w != frames[b].cols || target_h != frames[b].rows)
             {
-                float scaleX = static_cast<float>(config.detection_resolution) / target_w;
-                float scaleY = static_cast<float>(config.detection_resolution) / target_h;
+                float scaleX = static_cast<float>(frames[b].cols) / target_w;
+                float scaleY = static_cast<float>(frames[b].rows) / target_h;
                 for (auto& d : detections)
                 {
                     d.box.x = static_cast<int>(d.box.x * scaleX);
@@ -761,7 +682,8 @@ std::vector<std::vector<Detection>> DirectMLDetector::detectBatch(const std::vec
         std::cerr << "[DirectMLDetector] Output tensor dimensions are invalid." << std::endl;
         return empty;
     }
-    const int num_classes = rows - 4;
+    const int explicitClasses=static_cast<int>(NodeGraph::parameter(settings,"class_count"));
+    const int num_classes = explicitClasses>0?explicitClasses:rows-4;
 
     for (size_t b = 0; b < batch_size; ++b)
     {
@@ -771,10 +693,10 @@ std::vector<std::vector<Detection>> DirectMLDetector::detectBatch(const std::vec
         std::vector<int64_t> shp = { static_cast<int64_t>(rows), static_cast<int64_t>(cols) };
         detections = postProcessYoloDML(ptr, shp, num_classes, conf_thr, nms_thr, max_detections, &nmsTimeTmp);
 
-        if (useFixed && (target_w != config.detection_resolution || target_h != config.detection_resolution))
+        if (target_w != frames[b].cols || target_h != frames[b].rows)
         {
-            float scaleX = static_cast<float>(config.detection_resolution) / target_w;
-            float scaleY = static_cast<float>(config.detection_resolution) / target_h;
+            float scaleX = static_cast<float>(frames[b].cols) / target_w;
+            float scaleY = static_cast<float>(frames[b].rows) / target_h;
             for (auto& d : detections)
             {
                 d.box.x = static_cast<int>(d.box.x * scaleX);
@@ -832,137 +754,100 @@ void DirectMLDetector::processFrame(
     const cv::Mat& source_frame,
     std::chrono::steady_clock::time_point frameTimestamp)
 {
-    const auto generation = detectionBuffer.currentGeneration();
-    detectionBuffer.withCurrentGeneration(generation, [&] {
-        std::unique_lock<std::mutex> lock(inferenceMutex);
-        currentFrame = detection_frame;
-        currentSourceFrame = source_frame.empty() ? detection_frame : source_frame;
-        currentFrameTimestamp = (frameTimestamp.time_since_epoch().count() != 0)
-            ? frameTimestamp
-            : std::chrono::steady_clock::now();
-        currentFrameGeneration = generation;
-        frameReady = true;
+    const auto generation=detectionBuffer.currentGeneration();
+    detectionBuffer.withCurrentGeneration(generation,[&] {
+        auto packet=NodeVision::makeFrame(detection_frame,source_frame,frameTimestamp,generation);
+        std::lock_guard<std::mutex> lock(inferenceMutex);
+        currentGraphFrame=std::move(packet);
+        frameReady=true;
         inferenceCV.notify_one();
     });
 }
 
 void DirectMLDetector::dmlInferenceThread()
 {
+    struct ModelSlot
+    {
+        std::unique_ptr<DirectMLDetector> detector;
+        std::string fingerprint;
+        std::string error;
+        std::chrono::steady_clock::time_point attemptedAt{};
+    };
+    std::unordered_map<int,ModelSlot> models;
+    auto infer=[&](int nodeKey,const NodeGraph::FrameStream& packet,const NodeGraph::Node& settings)->NodeGraph::DetectionStream {
+        try
+        {
+            const std::string backend=NodeGraph::textParameter(settings,"backend");
+            if(backend!="DML"&&backend!="CPU")throw std::runtime_error("This build supports DML/CPU inference, not "+backend);
+            const std::string path=NodeVision::resolveModelPath(settings);
+            if(path.empty())throw std::runtime_error("Select a model for this Inference node.");
+            const int device=static_cast<int>(NodeGraph::parameter(settings,"dml_device_id"));
+            const std::string fingerprint=path+"|"+std::to_string(device)+"|"+backend;
+            auto& slot=models[nodeKey];
+            const auto now=std::chrono::steady_clock::now();
+            if(slot.fingerprint!=fingerprint||!slot.detector||!slot.detector->isReady())
+            {
+                if(slot.fingerprint==fingerprint&&now-slot.attemptedAt<std::chrono::seconds(2))
+                {NodeVision::reportError(nodeKey,slot.error);return {};}
+                slot.fingerprint=fingerprint;slot.attemptedAt=now;
+                slot.detector.reset();
+                slot.detector=std::make_unique<DirectMLDetector>(path,device,backend=="CPU");
+                if(!slot.detector->isReady())throw std::runtime_error("The selected model/provider could not be initialized.");
+            }
+            const cv::Mat image=NodeVision::cpuImage(packet);
+            if(image.empty())throw std::runtime_error("Inference received an empty image.");
+            const auto detected=slot.detector->detectBatch({image},settings);
+            if(detected.empty())throw std::runtime_error("Model inference produced no output batch.");
+            auto result=std::make_shared<NodeGraph::DetectionFrame>();
+            result->version=packet->version;result->generation=packet->generation;
+            result->timestampSeconds=packet->timestampSeconds;result->width=packet->width;result->height=packet->height;result->fresh=true;
+            result->modelName=NodeGraph::textParameter(settings,"model_path");
+            result->objects.reserve(detected.back().size());
+            for(const auto& detection:detected.back())result->objects.push_back({static_cast<double>(detection.box.x),static_cast<double>(detection.box.y),
+                static_cast<double>(detection.box.width),static_cast<double>(detection.box.height),detection.classId,detection.confidence});
+            lastPreprocessTimeDML=slot.detector->lastPreprocessTimeDML;lastInferenceTimeDML=slot.detector->lastInferenceTimeDML;
+            lastCopyTimeDML=slot.detector->lastCopyTimeDML;lastPostprocessTimeDML=slot.detector->lastPostprocessTimeDML;lastNmsTimeDML=slot.detector->lastNmsTimeDML;
+            slot.error.clear();NodeVision::reportError(nodeKey,"");
+            return result;
+        }
+        catch(const std::exception& error)
+        {
+            const auto slot=models.find(nodeKey);if(slot!=models.end())slot->second.error=error.what();
+            NodeVision::reportError(nodeKey,error.what());return {};
+        }
+    };
     try
     {
-        while (!shouldExit)
+        std::uint64_t providerRevision=0;
+        while(!shouldExit)
         {
-            if (config.backend != "DML")
+            const auto revision=NodeGraph::service().revision();
+            if(revision!=providerRevision)
             {
-                std::this_thread::sleep_for(std::chrono::milliseconds(50));
-                continue;
-            }
-
-            if (detector_model_changed.load())
-            {
-                const bool reloaded = initializeModel("models/" + config.ai_model);
-                if (reloaded)
+                const auto active=NodeGraph::service().providerNodes(NodeGraph::NodeKind::Inference);
+                for(auto it=models.begin();it!=models.end();)
                 {
-                    detection_resolution_changed.store(true);
-                    std::cout << "[DML] Detector reloaded: " << config.ai_model << std::endl;
+                    const bool keep=std::any_of(active.begin(),active.end(),[&](const NodeGraph::Node& node){
+                        return static_cast<int>(NodeGraph::GraphKind::Vision)*1000001+node.id==it->first&&NodeGraph::parameter(node,"enabled")!=0;});
+                    if(!keep)it=models.erase(it);else ++it;
                 }
-                detector_model_changed.store(false);
-                if (!reloaded && !isReady())
-                    detectionBuffer.clear();
+                providerRevision=revision;
             }
-
-            if (!isReady())
-            {
-                detectionBuffer.clear();
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
-                continue;
-            }
-
-            if (detectionBuffer.isPaused())
-            {
-                std::this_thread::sleep_for(std::chrono::milliseconds(10));
-                continue;
-            }
-
-            cv::Mat frame;
-            cv::Mat sourceFrame;
-            std::chrono::steady_clock::time_point frameTimestamp{};
-            std::uint64_t frameGeneration = 0;
-            bool hasNewFrame = false;
+            NodeGraph::FrameStream frame;
             {
                 std::unique_lock<std::mutex> lock(inferenceMutex);
-                if (!frameReady && !shouldExit)
-                    inferenceCV.wait(lock, [this] { return frameReady || shouldExit; });
-
-                if (shouldExit) break;
-
-                if (frameReady)
-                {
-                    frame = std::move(currentFrame);
-                    sourceFrame = std::move(currentSourceFrame);
-                    frameTimestamp = currentFrameTimestamp;
-                    frameGeneration = currentFrameGeneration;
-                    frameReady = false;
-                    hasNewFrame = true;
-                }
+                inferenceCV.wait_for(lock,std::chrono::milliseconds(50),[&]{return frameReady||shouldExit;});
+                if(shouldExit)break;
+                if(!frameReady)continue;
+                frame=std::move(currentGraphFrame);frameReady=false;
             }
-
-            if (hasNewFrame && !frame.empty())
-            {
-                if (!detectionBuffer.withCurrentGeneration(frameGeneration, [] {}))
-                    continue;
-                std::vector<cv::Mat> batchFrames = { frame };
-                auto detectionsBatch = detectBatch(batchFrames);
-                if (detectionsBatch.empty())
-                {
-                    continue;
-                }
-                const std::vector<Detection>& detections = detectionsBatch.back();
-                std::vector<Detection> filteredDetections = detections;
-                filterDetectionsByDepthMask(filteredDetections);
-                filterDetectionsByCircleFov(filteredDetections);
-
-                std::vector<cv::Rect> boxes;
-                std::vector<int> classes;
-                std::vector<float> confidences;
-                boxes.reserve(filteredDetections.size());
-                classes.reserve(filteredDetections.size());
-                confidences.reserve(filteredDetections.size());
-                for (const auto& d : filteredDetections)
-                {
-                    boxes.push_back(d.box);
-                    classes.push_back(d.classId);
-                    confidences.push_back(d.confidence);
-                }
-
-                if (!detectionBuffer.setForGeneration(frameGeneration, boxes, classes, confidences, frameTimestamp))
-                    continue;
-
-                const cv::Mat& frameForCollection = sourceFrame.empty() ? frame : sourceFrame;
-                cvm::MaybeCollectDataSample(
-                    "",
-                    config.ai_model.c_str(),
-                    frameForCollection,
-                    boxes,
-                    classes,
-                    confidences,
-                    aiming.load(),
-                    config);
-            }
+            if(!frame||detectionBuffer.isPaused()||!detectionBuffer.withCurrentGeneration(frame->generation,[]{}))continue;
+            NodeVision::processFrame(frame,infer);
         }
     }
-    catch (const std::exception& e)
+    catch(const std::exception& error)
     {
-        std::cerr << "[DML] Inference thread crashed: " << e.what() << std::endl;
-        shouldExit = true;
-        inferenceCV.notify_all();
-        detectionBuffer.cv.notify_all();
-    }
-    catch (...)
-    {
-        std::cerr << "[DML] Inference thread crashed: unknown exception." << std::endl;
-        shouldExit = true;
-        inferenceCV.notify_all();
-        detectionBuffer.cv.notify_all();
+        std::cerr<<"[DML] Vision thread failed: "<<error.what()<<std::endl;
+        shouldExit=true;inferenceCV.notify_all();detectionBuffer.cv.notify_all();
     }
 }
