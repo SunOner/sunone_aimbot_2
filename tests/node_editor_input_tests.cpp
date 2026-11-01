@@ -1528,6 +1528,12 @@ void testCatalogSubmenusOpenOnHoverAndCreateANode()
     h.move(add(group->DC.CursorStartPos,ImVec2(55,ImGui::GetTextLineHeight()*0.5f)));for(int frame=0;frame<20;++frame)h.frame();
     require(context.OpenPopupStack.Size>=4&&context.OpenPopupStack[3].Window,"Hovering Control buttons did not open its node submenu");
     const auto* submenu=context.OpenPopupStack[3].Window;const auto before=h.graph().nodes.size();
+    h.move(add(submenu->DC.CursorStartPos,ImVec2(35,ImGui::GetTextLineHeight()*0.5f)));h.frame();
+    require(editor.catalogPreview.kind==NodeKind::AimHeld&&editor.catalogPreview.drawnFrame==ImGui::GetFrameCount()&&h.graph().nodes.size()==before,"Hovering a nested catalog leaf did not preview it without creating a node");
+    h.move(editor.catalogPreview.bounds.GetCenter());for(int frame=0;frame<30;++frame)h.frame();
+    require(context.OpenPopupStack.Size>=4&&editor.catalogPreview.drawnFrame==ImGui::GetFrameCount(),"Moving to a nested leaf's preview dismissed the preview or its parent menus");
+    h.click(editor.catalogPreview.bounds.GetCenter());h.frame();
+    require(context.OpenPopupStack.Size>=4&&h.graph().nodes.size()==before,"Clicking a read-only preview dismissed its menus or created a node");
     h.click(add(submenu->DC.CursorStartPos,ImVec2(35,ImGui::GetTextLineHeight()*0.5f)));
     require(h.graph().nodes.size()==before+1&&findNode(h.graph(),editor.selected[0])->kind==NodeKind::AimHeld,"Choosing a nested node did not create it");
     require(context.OpenPopupStack.empty(),"Choosing a nested node left a context menu open");
@@ -1768,6 +1774,7 @@ void testCatalogCanBeTraversedWithKeyboard()
     for(int depth=0;depth<3;++depth){h.key(ImGuiKey_RightArrow,true);h.key(ImGuiKey_RightArrow,false);h.frame();}
     auto& context=*ImGui::GetCurrentContext();
     require(context.OpenPopupStack.Size>=4,"Arrow keys did not open the catalog's category and subcategory");
+    require(editor.catalogPreview.drawnFrame==ImGui::GetFrameCount(),"Keyboard navigation to a nested catalog leaf has no preview");
     const auto before=h.graph().nodes.size();h.key(ImGuiKey_Enter,true);h.key(ImGuiKey_Enter,false);h.frame();
     require(h.graph().nodes.size()==before+1&&context.OpenPopupStack.empty(),"Enter did not create a node from the focused submenu");
     require((ImGui::GetIO().ConfigFlags&ImGuiConfigFlags_NavEnableKeyboard)==0,"Popup navigation continued to capture canvas arrow keys after closing");
@@ -1904,6 +1911,9 @@ void testDisplayCacheRefreshesAfterRevisionAndReopen()
 #include "node_preview_tests.h"
 #include "node_wire_bend_tests.h"
 #include "node_editor_placement_tests.h"
+#include "node_editor_menu_tests.h"
+#include "node_catalog_search_tests.h"
+#include "node_catalog_preview_tests.h"
 int main(int argc,char** argv)
 {
     try
@@ -1912,6 +1922,15 @@ int main(int argc,char** argv)
         testPreviewVisibilityFollowsTheImagePanel();testPreviewTexturesUploadAndReuseActualPixels();
         testOptionEditorBindings();testOutputToInputAndPreview(); testShortPreviewDoesNotLoop(); testInputToOutputAndReplacement();
         testEveryCardSizeFollowsTheGrid();testFreeDragShowsItsGridDestinationAcrossZoom();testFreeMoveCancelsWithoutSavingOrNoopHistory();testGroupsAndReroutesHaveFreePlacementPreviews();
+        testEmptyDoubleClickCreatesOneRerouteAcrossZoomAndTabs();testEmptyDoubleClickRespectsGroupsToolsAndLimits();testLooseReroutesAdaptToTheFirstConnection();testMouseMenuHoverDoesNotHighlightAnUnrelatedFirstItem();
+        testCatalogSearchAddsWithTabAndEnter();testCatalogArrowsKeepSearchFocusAndScroll();testCatalogNoResultsAndEscapeAreSafe();testCatalogSearchQuickAddPreservesExistingConnections();testEmptyCatalogCanBrowseWithArrows();
+        testCatalogSearchMouseSelectionAndCreationErrors();
+        testCatalogOpeningFrameInputIsPreserved();
+        testCatalogSearchPopupFitsTheViewport();
+        testCatalogPreviewTracksSelectionWithoutExecuting();testCatalogPreviewShowsDefaultsAndBoundsLargeNodes();testCatalogPreviewPlacementAvoidsMenusAtViewportEdges();
+        testCatalogPreviewScrollDoesNotDismissMenusOrMoveTheGraph();
+        testCatalogCardWrapsFullValuesAndReusesLayout();
+        testCatalogPreviewFollowsEveryHoveredSubmenuRow();testCatalogSearchPreviewFollowsMouseRows();
         testNearestCompactPin(); testPortWinsOverLaterBody();
         testCancelInvalidAndOutside(); testRightClickCancelsAndWheelDoesNotMoveGesture();
         testAltDisconnect(); testShiftSelectionAndSnappedDrag(); testMiddlePanAndWheelAnchor(); testPopupBlocksGraphShortcuts();

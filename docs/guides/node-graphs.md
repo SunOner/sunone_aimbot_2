@@ -16,12 +16,12 @@ Logic runs through these graphs. A branch executes when an active output needs i
 - **Move and select:** left-drag nodes or group headers. Items follow the cursor freely; a background outline shows their grid placement on release. RMB/Esc cancels. Drag empty canvas with LMB/MMB to pan. Right-drag selects a box; Shift adds to the selection. Shift/Ctrl+click toggles individual nodes. The wheel zooms around the cursor.
 - **Connect:** drag between compatible ports in either direction. A new wire replaces the existing input connection. Drop on empty canvas to add a compatible node, or use RMB/Esc to cancel. Alt+click a port disconnects it; double-click a wire cuts it.
 - **Bend wires:** hover a wire to reveal its center handle. Drag horizontally for roundness and vertically for twist; Shift+drag gives finer control. Alt+click the handle or choose Reset bend from the wire menu to reset. RMB/Esc cancels a drag. Wires do not automatically detour around nodes; bends persist with the graph, clipboard and Undo.
-- **Add nodes:** short right-click opens the context menu. Hover categories and subcategories, or search by name. Toolbar icons show tooltips with their actions and shortcuts.
+- **Add nodes:** RMB, Shift+A or Ctrl+Space opens the library with search focused. Type a name, use Up/Down to select, and Tab/Enter to add at the requested position. Hovering or selecting a node shows a read-only node card with all its ports, fields and defaults beside the menu. Long text wraps; large previews scroll with the wheel or scrollbar. Esc closes search; Down on an empty search browses all nodes. Exact names and abbreviations rank first. A menu opened from a wire shows compatible nodes and connects the chosen result automatically. Categories remain available when search is empty.
 - **Edit values:** all runtime settings have visible typed inputs. Click Bool to toggle, drag Int/Float or Ctrl+click for exact entry, and click String to edit. Choices, keys and file pickers are available at the input. A wire overrides the stored local value until disconnected. Source literals and Get/Set names use local fields.
 - **Read defaults:** a dash means required data is missing; Center, Local and None identify contextual or optional inputs. Hover for details. Changed values and consumed connections briefly highlight; stable data does not create pulses.
 - **Resize and arrange:** select a card and drag its edges/corners. Card positions and dimensions align to the 32-pixel grid, including automatic sizes and collapsed cards. The Size menu offers automatic, compact, wide and fit-height presets. Arrange graph wraps long chains and fits their stage groups. RMB/Esc cancels a resize.
 - **Groups:** group selected nodes into a named, colored frame. Drag its header to move the contents; resize or remove the frame without deleting its nodes.
-- **Reroute:** right-click a wire → Insert reroute, then drag the dot to guide the wire. Its side handles appear near the pointer.
+- **Reroute:** double-click empty canvas to add a point, or right-click a wire → Insert reroute. A loose point adopts its first connection's type; connected points keep their type. Drag the dot to move it; side handles appear near the pointer. Points created inside a group join that group.
 - **Wire ties:** hold Z and drag across wires to gather their routes under a strap. Shift+drag rotates it in 15-degree steps. Double-click/Delete removes the strap while keeping its connections.
 - **Bypass and disable:** bypass passes through a compatible input; bypassing an output stops its action. Disable makes the output unavailable. Unused upstream branches stop executing.
 - **Collapse and zoom:** the header chevron folds a card. Zooming out shows large node names while preserving card dimensions and port positions. View options include Automatic, Detailed and Compact.
@@ -60,6 +60,8 @@ Canvas shortcuts pause while editing a field or using a popup.
 | Shortcut | Action |
 | --- | --- |
 | Shift+A / Ctrl+Space | Open node library |
+| Up/Down in node search | Select result; Down with no query browses all nodes |
+| Tab / Enter in node search; Esc | Add selected result; close search |
 | G; Shift+D | Move selection; duplicate and move |
 | Enter/LMB; Esc/RMB | Confirm; cancel move or connection |
 | A / Ctrl+A; Alt+A; Ctrl+I | Select all; deselect all; invert selection |

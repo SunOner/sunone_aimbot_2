@@ -153,6 +153,27 @@ struct NodeDisplay
     NodeKind defaultKind=NodeKind::Count;
     std::vector<InputDefaultDisplay> defaults;
 };
+struct CatalogPreviewState
+{
+    struct Row
+    {
+        float y=0,height=0,labelWidth=0,valueX=0,valueY=0,valueWidth=0,valueHeight=0,outputWidth=0;
+    };
+    NodeKind requested=NodeKind::Count,kind=NodeKind::Count;
+    Node node;
+    NodeDisplay display;
+    ImRect anchor,bounds;
+    ImGuiID owner=0;
+    ImFont* measuredFont=nullptr;
+    float measuredSize=0,desiredWidth=380,contentHeight=0;
+    std::vector<Row> rows;
+    float layoutWidth=-1,headerHeight=0,cardHeight=0,settingsY=0;
+    std::uint64_t layouts=0;
+    double hoveredAt=-1;
+    bool interacting=false;
+    int requestFrame=-1,drawnFrame=-1,inputRows=0,outputRows=0;
+    std::uint64_t builds=0;
+};
 struct CanvasRoutes
 {
     std::vector<std::uint64_t> key,scratch;
@@ -168,6 +189,15 @@ struct CutPiece {std::vector<ImVec2> points;float length=0;ImVec2 recoil;};
 struct CutAnimation {int graph=0;double born=0;ImU32 color=0;ImVec2 minimum,maximum;std::array<CutPiece,2> pieces;};
 constexpr std::size_t MaxCutAnimations=24;
 constexpr float CutDuration=0.36f;
+struct CatalogSearchState
+{
+    std::string query,error,pendingText;
+    ImVec2 popupAnchor{},popupSize{};
+    std::vector<NodeKind> nodes,available;
+    int selected=0,step=0,graph=-1,anchor=-1,port=-1;
+    bool output=true,browse=false,navigate=false,accept=false,reveal=false,refocus=false,candidatesReady=false,filteredReady=false;
+    std::uint64_t revision=0,builds=0,candidateBuilds=0;
+};
 struct Editor
 {
     Workspace draft;
@@ -225,6 +255,7 @@ struct Editor
     ImVec2 dragStartSize;
     int panButton = -1;
     bool panned = false;
+    bool emptyClickCandidate = false;
     ImVec2 panStartMouse;
     ImVec2 panStart;
     int contextNode = 0;
@@ -247,6 +278,8 @@ struct Editor
     bool boxSelectMode = false;
     bool showShortcuts = false;
     bool popupNavigation = false;
+    bool popupUsesKeyboard = false;
+    int popupInputFrame = -1;
     bool restoreKeyboardNavigation = false;
     int marqueeButton = ImGuiMouseButton_Right;
     bool cutStroke = false;
@@ -262,6 +295,8 @@ struct Editor
     char groupTitle[129] = {};
     ImVec2 catalogPosition;
     char search[96] = {};
+    CatalogSearchState catalogSearch;
+    CatalogPreviewState catalogPreview;
     std::string message;
     std::string shownMessage;
     double messageAt = 0;
@@ -530,6 +565,34 @@ WireTie* findTie(Graph& graph,int id)
 const WireTie* findTie(const Graph& graph,int id)
 {for(const auto& tie:graph.ties)if(tie.id==id)return &tie;return nullptr;}
 std::array<int,4> linkKey(const Link& link){return {link.fromNode,link.fromPort,link.toNode,link.toPort};}
+bool looseReroute(const Graph& graph,const Node& node)
+{
+    return reroute(node.kind)&&node.inputValues.empty()&&node.inputTexts.empty()&&
+        std::none_of(graph.links.begin(),graph.links.end(),[&](const Link& link){return link.fromNode==node.id||link.toNode==node.id;});
+}
+ValueType connectionType(const Graph& graph,const Link& link)
+{
+    const auto* source=findNode(graph,link.fromNode);const auto* target=findNode(graph,link.toNode);
+    if(source&&target&&looseReroute(graph,*source)&&!looseReroute(graph,*target))return definition(target->kind).inputs[link.toPort].type;
+    return source?definition(source->kind).outputs[link.fromPort].type:ValueType::Float;
+}
+void adaptLooseReroutes(Graph& graph,const Link& link)
+{
+    auto* source=findNode(graph,link.fromNode);auto* target=findNode(graph,link.toNode);
+    if(!source||!target||source==target||link.fromPort<0||link.toPort<0||
+        static_cast<std::size_t>(link.fromPort)>=definition(source->kind).outputs.size()||
+        static_cast<std::size_t>(link.toPort)>=definition(target->kind).inputs.size())return;
+    const auto type=connectionType(graph,link);
+    if(looseReroute(graph,*source))source->kind=rerouteKind(type);
+    if(looseReroute(graph,*target))target->kind=rerouteKind(type);
+}
+bool canConnectReroutes(const Graph& graph,const Link& link,std::string& error)
+{
+    const auto* source=findNode(graph,link.fromNode);const auto* target=findNode(graph,link.toNode);
+    if((source&&looseReroute(graph,*source))||(target&&looseReroute(graph,*target)))
+    {auto candidate=graph;adaptLooseReroutes(candidate,link);return canConnect(candidate,link,error);}
+    return canConnect(graph,link,error);
+}
 bool usesTie(const Link& link,int id){return std::find(link.ties.begin(),link.ties.end(),id)!=link.ties.end();}
 bool isTieSelected(int tab,int id)
 {const auto& selected=editor.tieSelection[tab];return std::find(selected.begin(),selected.end(),id)!=selected.end();}
@@ -594,6 +657,7 @@ void cancelLeftGesture()
 void cancelGestures()
 {
     cancelLeftGesture();editor.panButton=-1;editor.panned=false;editor.rightGesture=editor.marquee=false;editor.tieMode=editor.boxSelectMode=editor.cutStroke=false;
+    editor.emptyClickCandidate=false;
     editor.portFocus.fill({});
 }
 void beginPan(const Graph& graph,int button)
@@ -1128,8 +1192,8 @@ void activatePort(Graph& graph,int tab)
     {editor.wireNode=0;editor.keyboardWire=false;return;}
     if(focus.output==editor.wireOutput){editor.message="Choose a compatible port on the opposite side.";editor.error=true;return;}
     const Link link=editor.wireOutput?Link{editor.wireNode,editor.wirePort,focus.node,focus.port}:Link{focus.node,focus.port,editor.wireNode,editor.wirePort};
-    std::string error;if(!canConnect(graph,link,error)){editor.message=error;editor.error=true;return;}
-    remember();graph.links.erase(std::remove_if(graph.links.begin(),graph.links.end(),[&](const Link& existing){return existing.toNode==link.toNode&&existing.toPort==link.toPort;}),graph.links.end());
+    std::string error;if(!canConnectReroutes(graph,link,error)){editor.message=error;editor.error=true;return;}
+    remember();adaptLooseReroutes(graph,link);graph.links.erase(std::remove_if(graph.links.begin(),graph.links.end(),[&](const Link& existing){return existing.toNode==link.toNode&&existing.toPort==link.toPort;}),graph.links.end());
     graph.links.push_back(link);editor.wireNode=0;editor.keyboardWire=false;edited();
 }
 void disconnectPort(Graph& graph,int tab)
@@ -1740,6 +1804,18 @@ void insertReroute(Graph& graph,int index,ImVec2 position,int tab,std::size_t ti
     selectOne(tab,id);
     edited();
 }
+void addLooseReroute(Graph& graph,int tab,ImVec2 position)
+{
+    if(graph.nodes.size()>=MaxNodes){editor.error=true;editor.message="Node limit reached (128).";return;}
+    const auto node=defaultNode(NodeKind::RerouteFloat,nextNodeId(graph),snap(position.x-32),snap(position.y-16));
+    int owner=0;float area=std::numeric_limits<float>::max();
+    for(const auto& group:graph.groups)
+        if(contains(position,ImVec2(group.x,group.y+32),ImVec2(group.x+group.width,group.y+group.height))&&group.width*group.height<area)
+        {owner=group.id;area=group.width*group.height;}
+    remember();graph.nodes.push_back(node);
+    if(auto* group=findGroup(graph,owner)){group->nodes.push_back(node.id);fitContainingGroups(graph,node.id);}
+    cancelGestures();selectOne(tab,node.id);editor.autoFit[tab]=false;edited();
+}
 bool modelPathInput(NodeKind kind,const char* key)
 {
     return (kind==NodeKind::Inference||kind==NodeKind::DepthInference)&&key&&std::strcmp(key,"model_path")==0;
@@ -2080,11 +2156,12 @@ bool catalogConnection(const Graph& graph,const Node& node,Link& connection)
     const auto type=anchorPins[editor.catalogWirePort].type;
     const auto& candidates=editor.catalogWireOutput?definition(node.kind).inputs:definition(node.kind).outputs;
     Graph draft=graph;draft.nodes.push_back(node);
-    for(size_t port=0;port<candidates.size();++port)if(editor.catalogWireOutput?canConnectTypes(type,candidates[port].type):canConnectTypes(candidates[port].type,type))
+    for(size_t port=0;port<candidates.size();++port)if(looseReroute(graph,*anchor)||looseReroute(draft,node)||
+        (editor.catalogWireOutput?canConnectTypes(type,candidates[port].type):canConnectTypes(candidates[port].type,type)))
     {
         const Link link=editor.catalogWireOutput?Link{anchor->id,editor.catalogWirePort,node.id,static_cast<int>(port)}:
             Link{node.id,static_cast<int>(port),anchor->id,editor.catalogWirePort};
-        std::string error;if(canConnect(draft,link,error)){connection=link;return true;}
+        std::string error;if(canConnectReroutes(draft,link,error)){connection=link;return true;}
     }
     return false;
 }
@@ -2100,6 +2177,7 @@ bool addCatalogNode(Graph& graph,int index,NodeKind kind,std::string& error)
     Graph candidate=graph;candidate.nodes.push_back(node);
     if(editor.catalogWireNode)
     {
+        adaptLooseReroutes(candidate,connection);
         candidate.links.erase(std::remove_if(candidate.links.begin(),candidate.links.end(),[&](const Link& link){
             return link.toNode==connection.toNode&&link.toPort==connection.toPort;}),candidate.links.end());
         candidate.links.push_back(connection);
@@ -2168,18 +2246,218 @@ struct CatalogMenu
         children.push_back({name});return children.back();
     }
 };
-CatalogMenu catalogTree(const Graph& graph)
+void requestCatalogPreview(NodeKind kind,bool retain=false)
 {
-    CatalogMenu root;
-    for(const auto& def:definitions())
+    auto& preview=editor.catalogPreview;preview.requested=kind;preview.requestFrame=ImGui::GetFrameCount();
+    preview.anchor=ImGui::GetCurrentWindow()->Rect();preview.owner=ImGui::GetCurrentWindow()->ID;
+    if(!retain)preview.hoveredAt=ImGui::GetTime();
+}
+bool retainCatalogPreview(NodeKind kind)
+{
+    const auto& preview=editor.catalogPreview;const auto& context=*ImGui::GetCurrentContext();
+    if(preview.kind!=kind||preview.owner!=ImGui::GetCurrentWindow()->ID||preview.drawnFrame<ImGui::GetFrameCount()-1)return false;
+    auto bounds=preview.bounds;bounds.Expand(12);
+    const auto* window=ImGui::FindWindowByName("Node preview###catalog_node_preview");
+    return bounds.Contains(ImGui::GetIO().MousePos)||(window&&context.ActiveIdWindow==window&&context.ActiveId!=0)||ImGui::GetTime()-preview.hoveredAt<0.25;
+}
+const std::string& catalogDefaultValue(const InputDefaultDisplay& value)
+{
+    return value.kind==InputDefaultKind::Number||value.kind==InputDefaultKind::Text?value.fullText:value.text;
+}
+void drawNodeShell(ImDrawList* draw,ImVec2 p,ImVec2 q,float header,float zoom,ImU32 accent,bool bypassed,bool selected,float hoverFade,bool active,float signal)
+{
+    draw->AddRectFilled(add(p,ImVec2(3,4)),add(q,ImVec2(3,4)),IM_COL32(0,0,0,50),6*zoom);
+    draw->AddRectFilled(p,q,bypassed?IM_COL32(33,34,38,255):IM_COL32(37,39,44,255),6*zoom);
+    draw->AddRectFilled(p,ImVec2(q.x,p.y+header),IM_COL32(46,49,55,255),6*zoom);
+    draw->AddRect(p,q,selected?Cyan:IM_COL32(74+static_cast<int>(26*hoverFade),79+static_cast<int>(35*hoverFade),88+static_cast<int>(43*hoverFade),255),6*zoom,0,selected?2.0f:1.0f);
+    draw->AddRectFilled(add(p,ImVec2(0,8*zoom)),add(p,ImVec2(3*zoom,24*zoom)),(accent&0x00ffffff)|IM_COL32(0,0,0,active?230:85),2);
+    if(signal>0.01f)draw->AddRect(p,q,(accent&0x00ffffff)|IM_COL32(0,0,0,static_cast<int>(210*signal)),6*zoom,0,1.0f+signal);
+}
+void layoutCatalogCard(CatalogPreviewState& preview,float width)
+{
+    if(preview.layoutWidth==width)return;
+    preview.layoutWidth=width;preview.rows.clear();++preview.layouts;
+    const auto& def=definition(preview.kind);const float font=ImGui::GetFontSize();
+    const auto measure=[&](const char* text,float wrap){return ImGui::GetFont()->CalcTextSizeA(font,FLT_MAX,std::max(1.0f,wrap),text);};
+    preview.headerHeight=std::max(HeaderHeight,measure(def.title,width-30).y+12);
+    float y=preview.headerHeight+8;
+    for(std::size_t pin=0;pin<std::max(def.inputs.size(),def.outputs.size());++pin)
     {
-        if(def.kind==NodeKind::RenderOverlay||def.kind==NodeKind::CollectDataset||!matches(def)||!kindAllowed(graph,def.kind))continue;
-        Link connection;
-        if(editor.catalogWireNode&&!catalogConnection(graph,defaultNode(def.kind,nextNodeId(graph)),connection))continue;
-        const auto path=catalogPath(def);auto& group=root.branch(path.group);
-        (path.subgroup?group.branch(path.subgroup):group).nodes.push_back(def.kind);
+        CatalogPreviewState::Row row;row.y=y;float height=font;
+        if(pin<def.outputs.size())
+        {
+            row.outputWidth=std::min(measure(def.outputs[pin].name,FLT_MAX).x,pin<def.inputs.size()?width*0.36f:width-24);
+            height=std::max(height,measure(def.outputs[pin].name,row.outputWidth).y);
+        }
+        if(pin<def.inputs.size())
+        {
+            const float available=std::max(24.0f,width-24-(pin<def.outputs.size()?row.outputWidth+16:0));
+            const float padding=modelPathInput(preview.kind,def.inputs[pin].defaultParameter)?26.0f:8.0f;
+            const auto& value=catalogDefaultValue(preview.display.defaults[pin]);
+            const auto labelSize=measure(def.inputs[pin].name,FLT_MAX),valueSize=measure(value.c_str(),FLT_MAX);
+            row.labelWidth=std::min(labelSize.x,available);row.valueWidth=std::min(valueSize.x+padding,available);
+            const float labelHeight=measure(def.inputs[pin].name,row.labelWidth).y;
+            row.valueX=12;row.valueY=labelHeight+4;
+            if(labelSize.x+6+row.valueWidth<=available){row.valueX+=labelSize.x+6;row.valueY=0;}
+            row.valueHeight=measure(value.c_str(),row.valueWidth-padding).y+2;
+            height=std::max(height,row.valueY+row.valueHeight);
+        }
+        row.height=std::max(PinSpacing,height+8);y+=row.height;preview.rows.push_back(row);
     }
-    return root;
+    preview.settingsY=y+4;
+    if(hasNodeSettings(preview.node))y+=preview.node.kind==NodeKind::Boolean?56:font*2+36;
+    if(preview.kind==NodeKind::ImagePreview)y+=std::clamp((width-20)*9/16,64.0f,240.0f)+8;
+    preview.cardHeight=reroute(preview.kind)?60:y+16;
+}
+void drawCatalogCard(CatalogPreviewState& preview)
+{
+    auto* draw=ImGui::GetWindowDrawList();const auto& def=definition(preview.kind);const float font=ImGui::GetFontSize();
+    const auto p=add(ImGui::GetCursorScreenPos(),ImVec2(5,4));const float width=std::max(32.0f,ImGui::GetContentRegionAvail().x-10);
+    layoutCatalogCard(preview,width);const auto q=add(p,ImVec2(width,preview.cardHeight));
+    const auto accent=def.outputs.empty()?Cyan:pinColor(def.outputs[0].type);
+    preview.inputRows=static_cast<int>(def.inputs.size());preview.outputRows=static_cast<int>(def.outputs.size());
+    if(reroute(preview.kind))
+    {
+        const ImVec2 center(p.x+width*0.5f,p.y+30);drawReroutePoint(draw,center,5,accent,false,0);
+        draw->AddLine(add(center,ImVec2(-38,0)),add(center,ImVec2(-6,0)),accent,1.4f);
+        draw->AddLine(add(center,ImVec2(6,0)),add(center,ImVec2(38,0)),accent,1.4f);
+    }
+    else
+    {
+        drawNodeShell(draw,p,q,preview.headerHeight,1,accent,false,false,0,false,0);
+        const ImVec2 c(p.x+12,p.y+14);draw->AddTriangleFilled(add(c,ImVec2(-4,-2)),add(c,ImVec2(4,-2)),add(c,ImVec2(0,4)),IM_COL32(175,186,200,255));
+        draw->AddText(ImGui::GetFont(),font,add(p,ImVec2(24,6)),IM_COL32(238,241,245,255),def.title,nullptr,width-30);
+        for(std::size_t pin=0;pin<preview.rows.size();++pin)
+        {
+            const auto& row=preview.rows[pin];const float y=p.y+row.y;
+            if(y+row.height<ImGui::GetCurrentWindow()->ClipRect.Min.y||y>ImGui::GetCurrentWindow()->ClipRect.Max.y)continue;
+            if(pin<def.inputs.size())
+            {
+                const auto color=pinColor(def.inputs[pin].type);const ImVec2 port(p.x,y+font*0.5f);
+                draw->AddCircleFilled(port,5,IM_COL32(27,29,33,255));draw->AddCircle(port,4,color,0,1.3f);
+                draw->AddText(ImGui::GetFont(),font,ImVec2(p.x+12,y),IM_COL32(184,192,204,255),def.inputs[pin].name,nullptr,row.labelWidth);
+                const ImVec2 value(p.x+row.valueX,y+row.valueY);
+                const bool model=modelPathInput(preview.kind,def.inputs[pin].defaultParameter);
+                draw->AddRectFilled(add(value,ImVec2(0,-1)),add(value,ImVec2(row.valueWidth,row.valueHeight)),(color&0x00ffffff)|IM_COL32(0,0,0,22),3);
+                draw->AddText(ImGui::GetFont(),font,add(value,ImVec2(4,0)),(color&0x00ffffff)|IM_COL32(0,0,0,220),catalogDefaultValue(preview.display.defaults[pin]).c_str(),nullptr,std::max(1.0f,row.valueWidth-(model?26:8)));
+                if(model&&row.valueWidth>=26)
+                {
+                    const ImVec2 c(value.x+row.valueWidth-9,value.y+font*0.5f);
+                    draw->AddLine(add(c,ImVec2(-3,-1.5f)),add(c,ImVec2(0,1.5f)),color,1);draw->AddLine(add(c,ImVec2(0,1.5f)),add(c,ImVec2(3,-1.5f)),color,1);
+                }
+            }
+            if(pin<def.outputs.size())
+            {
+                const auto color=pinColor(def.outputs[pin].type);const ImVec2 port(q.x,y+font*0.5f);
+                draw->AddCircleFilled(port,5,IM_COL32(27,29,33,255));draw->AddCircle(port,4,color,0,1.3f);
+                draw->AddText(ImGui::GetFont(),font,ImVec2(q.x-12-row.outputWidth,y),IM_COL32(184,192,204,255),def.outputs[pin].name,nullptr,std::max(1.0f,row.outputWidth));
+            }
+        }
+        if(hasNodeSettings(preview.node))
+        {
+            const ImVec2 a(p.x+6,p.y+preview.settingsY),b(q.x-6,q.y-12);
+            draw->AddRectFilled(a,b,IM_COL32(23,25,29,105),4);
+            const auto cursor=ImGui::GetCursorScreenPos();ImGui::PushStyleVar(ImGuiStyleVar_DisabledAlpha,1);
+            ImGui::PushStyleVar(ImGuiStyleVar_FramePadding,ImVec2(5,4));ImGui::BeginDisabled();
+            draw->AddText(add(a,ImVec2(5,6)),ImGui::GetColorU32(ImGuiCol_Text),variableGet(preview.kind)||variableSet(preview.kind)?"Variable name":"Value");
+            if(preview.kind==NodeKind::Boolean)
+            {
+                const float toggleWidth=std::max(18.0f,ImGui::GetFrameHeight()*0.72f)*1.85f;
+                ImGui::SetCursorScreenPos(ImVec2(b.x-toggleWidth-10,a.y+2));ImGui::SetNextItemWidth(toggleWidth);
+                bool value=preview.node.value!=0;ImGui::Checkbox("##literal",&value);
+            }
+            else
+            {
+                ImGui::SetCursorScreenPos(add(a,ImVec2(5,font+12)));ImGui::SetNextItemWidth(std::max(16.0f,b.x-a.x-20));
+                if(preview.kind==NodeKind::Number){double value=preview.node.value;ImGui::InputDouble("##literal",&value,0,0,"%.5f");}
+                else if(preview.kind==NodeKind::Integer){int value=static_cast<int>(preview.node.value);ImGui::InputInt("##literal",&value,0,0);}
+                else{char value[129]{};const auto name=textParameter(preview.node,"name");std::memcpy(value,name.data(),std::min(name.size(),sizeof(value)-1));ImGui::InputText("##literal",value,sizeof(value));}
+            }
+            ImGui::EndDisabled();ImGui::PopStyleVar(2);ImGui::SetCursorScreenPos(cursor);
+        }
+        if(preview.kind==NodeKind::ImagePreview)
+        {
+            const ImVec2 a(p.x+10,p.y+preview.settingsY),b(q.x-10,q.y-12);
+            draw->AddRectFilled(a,b,IM_COL32(17,19,23,255),4);draw->AddRect(a,b,IM_COL32(66,73,83,150),4);
+            const char* label="Connect Frame, Depth or Mask";const float wrap=std::max(1.0f,b.x-a.x-16);
+            const auto size=ImGui::GetFont()->CalcTextSizeA(font,FLT_MAX,wrap,label);
+            draw->AddText(ImGui::GetFont(),font,add(ImVec2((a.x+b.x)*0.5f,(a.y+b.y)*0.5f),multiply(size,-0.5f)),IM_COL32(137,146,159,255),label,nullptr,wrap);
+        }
+    }
+    ImGui::Dummy(ImVec2(0,preview.cardHeight+12));
+}
+ImRect catalogPreviewPlacement(ImRect menus,ImRect viewport,ImVec2 desired)
+{
+    constexpr float gap=8,minWidth=180;
+    const float right=viewport.Max.x-menus.Max.x-gap,left=menus.Min.x-viewport.Min.x-gap;
+    bool useRight=right>=desired.x||(right>=left&&left<desired.x);
+    const float side=useRight?right:left;
+    if(side>=minWidth)
+    {
+        const ImVec2 size(std::min(desired.x,side),std::min(desired.y,viewport.GetHeight()));
+        const ImVec2 p(useRight?menus.Max.x+gap:menus.Min.x-gap-size.x,
+            std::clamp(menus.Min.y,viewport.Min.y,viewport.Max.y-size.y));
+        return ImRect(p,add(p,size));
+    }
+    const float above=menus.Min.y-viewport.Min.y-gap,below=viewport.Max.y-menus.Max.y-gap;
+    if(std::max(above,below)<140)return {};
+    const ImVec2 size(std::min(desired.x,viewport.GetWidth()),std::min(desired.y,std::max(above,below)));
+    const ImVec2 p(std::clamp(menus.Min.x,viewport.Min.x,viewport.Max.x-size.x),below>=above?menus.Max.y+gap:menus.Min.y-gap-size.y);
+    return ImRect(p,add(p,size));
+}
+void drawCatalogPreview()
+{
+    auto& preview=editor.catalogPreview;
+    if(preview.requestFrame!=ImGui::GetFrameCount()||preview.drawnFrame==ImGui::GetFrameCount()||ImGui::GetCurrentContext()->BeginPopupStack.empty()||ImGui::GetCurrentContext()->OpenPopupStack.empty())return;
+    const bool changed=preview.kind!=preview.requested;
+    if(changed)
+    {
+        preview.kind=preview.requested;preview.node=defaultNode(preview.kind,1);preview.display=NodeDisplay{};
+        if(preview.kind==NodeKind::Boolean)preview.node.value=1;
+        for(std::size_t pin=0;pin<definition(preview.kind).inputs.size();++pin)inputDefault(preview.display,preview.node,pin);
+        preview.measuredFont=nullptr;preview.contentHeight=0;preview.layoutWidth=-1;++preview.builds;
+    }
+    const auto& def=definition(preview.kind);const float font=ImGui::GetFontSize();
+    if(preview.measuredFont!=ImGui::GetFont()||preview.measuredSize!=font)
+    {
+        float width=ImGui::CalcTextSize(def.title).x+48;
+        for(std::size_t pin=0;pin<def.inputs.size();++pin)
+            width=std::max(width,ImGui::CalcTextSize(def.inputs[pin].name).x+ImGui::CalcTextSize(catalogDefaultValue(preview.display.defaults[pin]).c_str()).x+80);
+        for(const auto& pin:def.outputs)width=std::max(width,ImGui::CalcTextSize(pin.name).x+48);
+        preview.desiredWidth=std::clamp(width,240.0f,560.0f);preview.measuredFont=ImGui::GetFont();preview.measuredSize=font;preview.contentHeight=0;preview.layoutWidth=-1;
+    }
+    const auto* viewport=ImGui::GetWindowViewport();ImRect menus=preview.anchor;
+    for(const auto& popup:ImGui::GetCurrentContext()->OpenPopupStack)if(popup.Window&&popup.Window->Active)menus.Add(popup.Window->Rect());
+    const ImRect work(add(viewport->WorkPos,ImVec2(8,8)),add(viewport->WorkPos,ImVec2(viewport->WorkSize.x-8,viewport->WorkSize.y-8)));
+    const float desiredHeight=preview.contentHeight>0?preview.contentHeight+20:font*10+(def.inputs.size()+def.outputs.size())*(font+12);
+    const auto bounds=catalogPreviewPlacement(menus,work,ImVec2(preview.desiredWidth,std::clamp(desiredHeight,160.0f,600.0f)));
+    if(bounds.GetWidth()<1||bounds.GetHeight()<140)return;
+    preview.bounds=bounds;preview.drawnFrame=ImGui::GetFrameCount();
+    ImGui::SetNextWindowPos(bounds.Min);ImGui::SetNextWindowSize(bounds.GetSize());
+    if(changed)ImGui::SetNextWindowScroll(ImVec2(0,0));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,ImVec2(12,10));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding,7);
+    ImGui::PushStyleColor(ImGuiCol_PopupBg,ImVec4(0.11f,0.12f,0.14f,0.98f));
+    const auto flags=ImGuiWindowFlags_NoTitleBar|ImGuiWindowFlags_NoResize|ImGuiWindowFlags_NoMove|ImGuiWindowFlags_NoCollapse|
+        ImGuiWindowFlags_NoNav|ImGuiWindowFlags_NoFocusOnAppearing|ImGuiWindowFlags_NoSavedSettings|ImGuiWindowFlags_Tooltip;
+    if(ImGui::Begin("Node preview###catalog_node_preview",nullptr,flags))
+    {
+        auto* window=ImGui::GetCurrentWindow();
+        // A read-only surface consumes background clicks without focusing the
+        // tooltip or dismissing its parent menus. The native scrollbar remains interactive.
+        const auto bodyId=window->GetID("##read_only_surface");bool hovered=false,held=false;
+        ImGui::ItemAdd(window->InnerRect,bodyId,nullptr,ImGuiItemFlags_NoNav);
+        ImGui::ButtonBehavior(window->InnerRect,bodyId,&hovered,&held,ImGuiButtonFlags_NoNavFocus);
+        ImGui::TextDisabled("Node preview");
+        ImGui::PushTextWrapPos(0);ImGui::TextUnformatted(def.description);ImGui::PopTextWrapPos();
+        ImGui::Separator();
+        drawCatalogCard(preview);
+        preview.contentHeight=ImGui::GetCursorPosY()+ImGui::GetScrollY()-window->WindowPadding.y-ImGui::GetStyle().ItemSpacing.y;
+        if(ImGui::GetCurrentContext()->ActiveIdWindow==window&&ImGui::GetActiveID())preview.interacting=true;
+        if(ImGui::IsMouseReleased(ImGuiMouseButton_Left)&&preview.interacting)
+        {if(editor.search[0]||editor.catalogSearch.browse)editor.catalogSearch.refocus=true;preview.interacting=false;}
+    }
+    ImGui::End();ImGui::PopStyleColor();ImGui::PopStyleVar(2);
 }
 void catalogItem(Graph& graph,int index,NodeKind kind,bool showCategory=false)
 {
@@ -2190,35 +2468,235 @@ void catalogItem(Graph& graph,int index,NodeKind kind,bool showCategory=false)
         if(!addCatalogNode(graph,index,kind,error)){editor.message=error;editor.error=true;}
         ImGui::CloseCurrentPopup();
     }
-    if(ImGui::IsItemHovered())ImGui::SetTooltip("%s%s%s\n%s",path.group,path.subgroup?" / ":"",path.subgroup?path.subgroup:"",def.description);
+    const bool hovered=ImGui::IsItemHovered()||(editor.popupUsesKeyboard&&ImGui::GetCurrentContext()->NavId==ImGui::GetItemID());
+    if(hovered)requestCatalogPreview(kind);
+}
+void syncPopupNavigation()
+{
+    auto& context=*ImGui::GetCurrentContext();const auto& io=ImGui::GetIO();
+    if(editor.popupInputFrame!=ImGui::GetFrameCount())
+    {
+        editor.popupInputFrame=ImGui::GetFrameCount();
+        if(io.MouseDelta.x!=0||io.MouseDelta.y!=0||io.MouseWheel!=0||io.MouseWheelH!=0||
+            ImGui::IsMouseClicked(ImGuiMouseButton_Left)||ImGui::IsMouseClicked(ImGuiMouseButton_Right)||ImGui::IsMouseClicked(ImGuiMouseButton_Middle))editor.popupUsesKeyboard=false;
+        for(const auto key:{ImGuiKey_Tab,ImGuiKey_LeftArrow,ImGuiKey_RightArrow,ImGuiKey_UpArrow,ImGuiKey_DownArrow,
+            ImGuiKey_Home,ImGuiKey_End,ImGuiKey_PageUp,ImGuiKey_PageDown,ImGuiKey_Enter,ImGuiKey_KeypadEnter,ImGuiKey_Space,
+            ImGuiKey_GamepadDpadLeft,ImGuiKey_GamepadDpadRight,ImGuiKey_GamepadDpadUp,ImGuiKey_GamepadDpadDown,ImGuiKey_GamepadFaceDown})
+            if(ImGui::IsKeyPressed(key))editor.popupUsesKeyboard=true;
+    }
+    if(!editor.popupUsesKeyboard)
+    {
+        // Opening/recycling a submenu initializes its first navigation item.
+        // Keep that cursor for keyboard navigation, but don't paint it as a
+        // second hover target while the user is moving through mouse menus.
+        ImGui::SetNavCursorVisible(false);context.NavHighlightItemUnderNav=false;
+    }
+}
+bool beginEditorMenu(const char* label,bool enabled=true)
+{
+    if(!ImGui::BeginMenu(label,enabled))return false;
+    syncPopupNavigation();return true;
+}
+bool beginEditorPopup(const char* label)
+{
+    if(!ImGui::BeginPopup(label))return false;
+    syncPopupNavigation();return true;
 }
 void catalogBranches(Graph& graph,int index,const CatalogMenu& menu)
 {
-    for(const auto& branch:menu.children)if(ImGui::BeginMenu(branch.label.c_str()))
+    for(const auto& branch:menu.children)if(beginEditorMenu(branch.label.c_str()))
     {catalogBranches(graph,index,branch);ImGui::EndMenu();}
     for(const auto kind:menu.nodes)catalogItem(graph,index,kind);
+    if(!menu.nodes.empty())
+    {
+        auto& preview=editor.catalogPreview;
+        // Resolve every row before retaining or drawing a preview. Otherwise
+        // an earlier row's retained card can consume the frame before the hovered row.
+        if(preview.requestFrame!=ImGui::GetFrameCount()&&
+            std::find(menu.nodes.begin(),menu.nodes.end(),preview.kind)!=menu.nodes.end()&&retainCatalogPreview(preview.kind))
+            requestCatalogPreview(preview.kind,true);
+        if(preview.owner==ImGui::GetCurrentWindow()->ID)drawCatalogPreview();
+    }
 }
-void catalogResults(Graph& graph,int index,const CatalogMenu& menu)
+void refreshCatalogCandidates(const Graph& graph,int index)
 {
-    for(const auto& branch:menu.children)catalogResults(graph,index,branch);
-    for(const auto kind:menu.nodes)catalogItem(graph,index,kind,true);
+    auto& state=editor.catalogSearch;
+    if(state.candidatesReady&&state.graph==index&&state.revision==editor.observedRevision&&
+        state.anchor==editor.catalogWireNode&&state.port==editor.catalogWirePort&&state.output==editor.catalogWireOutput)return;
+    state.graph=index;state.revision=editor.observedRevision;state.anchor=editor.catalogWireNode;state.port=editor.catalogWirePort;state.output=editor.catalogWireOutput;
+    state.available.clear();
+    for(const auto& def:definitions())
+    {
+        if(def.kind==NodeKind::RenderOverlay||def.kind==NodeKind::CollectDataset||!kindAllowed(graph,def.kind))continue;
+        Link connection;
+        if(editor.catalogWireNode&&!catalogConnection(graph,defaultNode(def.kind,nextNodeId(graph)),connection))continue;
+        state.available.push_back(def.kind);
+    }
+    state.candidatesReady=true;state.filteredReady=false;++state.candidateBuilds;
+}
+CatalogMenu catalogTree(const std::vector<NodeKind>& kinds)
+{
+    CatalogMenu tree;
+    for(auto kind:kinds)
+    {const auto path=catalogPath(definition(kind));auto& group=tree.branch(path.group);(path.subgroup?group.branch(path.subgroup):group).nodes.push_back(kind);}
+    return tree;
+}
+int catalogSearchInput(ImGuiInputTextCallbackData* data)
+{
+    auto& state=*static_cast<CatalogSearchState*>(data->UserData);
+    if(data->EventFlag==ImGuiInputTextFlags_CallbackCompletion)state.accept=true;
+    else if(data->EventFlag==ImGuiInputTextFlags_CallbackHistory)
+    {
+        const int direction=data->EventKey==ImGuiKey_UpArrow?-1:1;
+        // The first Down on an empty field opens the list at its first result.
+        state.step+=data->BufTextLen==0&&!state.browse&&direction>0?0:direction;
+        state.browse=true;state.navigate=true;state.reveal=true;
+    }
+    if(!state.pendingText.empty())
+    {
+        if(data->SelectionStart!=data->SelectionEnd)data->DeleteChars(data->SelectionStart,data->SelectionEnd-data->SelectionStart);
+        const char* begin=state.pendingText.c_str();const auto length=std::min<std::size_t>(state.pendingText.size(),data->BufSize-data->BufTextLen-1);
+        const char* end=begin+length;
+        while(end>begin&&end<begin+state.pendingText.size()&&(static_cast<unsigned char>(*end)&0xc0)==0x80)--end;
+        data->InsertChars(data->CursorPos,begin,end);state.pendingText.clear();
+    }
+    return 0;
+}
+int catalogSearchRank(NodeKind kind,const std::string& query)
+{
+    const auto lower=[](std::string text){for(auto& c:text)if(c>='A'&&c<='Z')c+='a'-'A';return text;};
+    const auto title=lower(definition(kind).title),shortTitle=lower(compactTitle(kind));
+    if(title==query||shortTitle==query)return 0;
+    if(title.rfind(query,0)==0||shortTitle.rfind(query,0)==0)return 1;
+    if(title.find(query)!=std::string::npos||shortTitle.find(query)!=std::string::npos)return 2;
+    return 3;
+}
+void refreshCatalogSearch(const Graph& graph,int index)
+{
+    auto& state=editor.catalogSearch;
+    refreshCatalogCandidates(graph,index);
+    if(state.filteredReady&&state.query==editor.search)return;
+    state.query=editor.search;state.nodes.clear();
+    for(auto kind:state.available)if(matches(definition(kind)))state.nodes.push_back(kind);
+    std::string query=state.query;for(auto& c:query)if(c>='A'&&c<='Z')c+='a'-'A';
+    std::stable_sort(state.nodes.begin(),state.nodes.end(),[&](NodeKind a,NodeKind b){return catalogSearchRank(a,query)<catalogSearchRank(b,query);});
+    state.selected=0;state.reveal=true;state.filteredReady=true;++state.builds;
+}
+bool catalogSearchResults()
+{
+    auto& state=editor.catalogSearch;const int count=static_cast<int>(state.nodes.size());
+    if(!count){ImGui::TextDisabled("No matching nodes.");state.step=0;return false;}
+    state.selected=((state.selected+state.step)%count+count)%count;state.step=0;
+    const float font=ImGui::GetFontSize(),rowHeight=std::ceil(font*1.8f+10);
+    const auto* viewport=ImGui::GetWindowViewport();
+    const float chrome=ImGui::GetFrameHeightWithSpacing()+ImGui::GetTextLineHeightWithSpacing()*(editor.catalogWireNode?5:9)+2*ImGui::GetStyle().WindowPadding.y;
+    const float height=std::min(std::min(count,7)*rowHeight+4,std::max(rowHeight+4,viewport->WorkSize.y-chrome-16));
+    const float width=std::min(360.0f,std::max(180.0f,viewport->WorkSize.x-4*ImGui::GetStyle().WindowPadding.x));
+    ImGui::BeginChild("catalog_results",ImVec2(width,height),ImGuiChildFlags_None,ImGuiWindowFlags_NoNavInputs);
+    bool chosen=false;ImGuiListClipper clipper;clipper.Begin(count,rowHeight);
+    if(state.reveal)clipper.IncludeItemByIndex(state.selected);
+    while(clipper.Step())for(int row=clipper.DisplayStart;row<clipper.DisplayEnd;++row)
+    {
+        const auto kind=state.nodes[row];const auto& def=definition(kind);const auto path=catalogPath(def);
+        const auto p=ImGui::GetCursorScreenPos();ImGui::PushID(static_cast<int>(kind));
+        ImGui::PushItemFlag(ImGuiItemFlags_NoNav,true);
+        const bool pressed=ImGui::Selectable("##result",row==state.selected,ImGuiSelectableFlags_NoAutoClosePopups,ImVec2(0,rowHeight-ImGui::GetStyle().ItemSpacing.y));
+        ImGui::PopItemFlag();
+        const bool over=ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenBlockedByActiveItem);
+        if(over&&!editor.popupUsesKeyboard&&(ImGui::GetIO().MouseDelta.x!=0||ImGui::GetIO().MouseDelta.y!=0)){state.selected=row;state.reveal=false;}
+        if(pressed){state.selected=row;chosen=true;}
+        if(state.reveal&&row==state.selected)ImGui::SetScrollHereY(0.5f);
+        const auto q=ImGui::GetItemRectMax();const ImVec4 clip(p.x+8,p.y,q.x-6,q.y);
+        auto* draw=ImGui::GetWindowDrawList();
+        if(row==state.selected)draw->AddRectFilled(add(p,ImVec2(1,4)),ImVec2(p.x+3,q.y-4),Cyan,1);
+        draw->AddText(ImGui::GetFont(),font,add(p,ImVec2(10,2)),IM_COL32(223,230,238,255),def.title,nullptr,0,&clip);
+        std::string breadcrumb=path.group;if(path.subgroup){breadcrumb+=" / ";breadcrumb+=path.subgroup;}
+        draw->AddText(ImGui::GetFont(),font*0.8f,add(p,ImVec2(10,font+5)),IM_COL32(142,157,175,255),breadcrumb.c_str(),nullptr,0,&clip);
+        ImGui::PopID();
+    }
+    state.reveal=false;ImGui::EndChild();return chosen;
 }
 void catalog(Graph& graph, int index)
 {
-    if (!ImGui::BeginPopup("node_catalog"))
+    if(!ImGui::IsPopupOpen("node_catalog")){editor.catalogWireNode=0;return;}
+    auto& state=editor.catalogSearch;const auto* viewport=ImGui::GetWindowViewport();
+    const ImVec2 minimum=add(viewport->WorkPos,ImVec2(8,8)),available(std::max(1.0f,viewport->WorkSize.x-16),std::max(1.0f,viewport->WorkSize.y-16));
+    ImGui::SetNextWindowSizeConstraints(ImVec2(0,0),available);
+    if(!editor.catalogFocus&&state.popupSize.x>0)
+    {
+        const ImVec2 maximum(minimum.x+available.x-std::min(available.x,state.popupSize.x),minimum.y+available.y-std::min(available.y,state.popupSize.y));
+        ImGui::SetNextWindowPos(ImVec2(std::clamp(state.popupAnchor.x,minimum.x,maximum.x),std::clamp(state.popupAnchor.y,minimum.y,maximum.y)),ImGuiCond_Always);
+    }
+    if (!beginEditorPopup("node_catalog"))
     {if(!ImGui::IsPopupOpen("node_catalog"))editor.catalogWireNode=0;return;}
+    if(editor.catalogFocus)
+    {
+        editor.catalogPreview=CatalogPreviewState{};
+        state=CatalogSearchState{};const auto anchor=ImGui::GetMousePosOnOpeningCurrentPopup();
+        state.popupAnchor=ImGui::IsMousePosValid(&anchor)?anchor:ImGui::GetWindowPos();
+    }
+    if((editor.search[0]||state.browse)&&ImGui::IsKeyPressed(ImGuiKey_Escape))
+    {
+        ImGui::ClearActiveID();editor.catalogWireNode=0;ImGui::CloseCurrentPopup();ImGui::EndPopup();return;
+    }
     ImGui::TextUnformatted(editor.catalogWireNode?"Add and connect":"Graph");
     if(editor.catalogWireNode)ImGui::TextDisabled("Only compatible nodes are shown");
     ImGui::SetNextItemWidth(272);
-    if(editor.catalogFocus){ImGui::SetKeyboardFocusHere();editor.catalogFocus=false;}
-    ImGui::InputTextWithHint("##search", "Search nodes...", editor.search, sizeof(editor.search));
+    const bool focusSearch=editor.catalogFocus||state.refocus;
+    bool openingShortcut=false;
+    if(focusSearch)
+    {
+        // Activate in the opening frame. A deferred focus request makes
+        // InputText discard characters arriving in its activation frame.
+        ImGui::FocusWindow(ImGui::GetCurrentWindow());
+        auto& context=*ImGui::GetCurrentContext();const auto id=ImGui::GetID("##search");
+        const auto& io=ImGui::GetIO();
+        openingShortcut=!state.refocus&&((io.KeyShift&&ImGui::IsKeyPressed(ImGuiKey_A))||(io.KeyCtrl&&ImGui::IsKeyPressed(ImGuiKey_Space)));
+        if(state.refocus)context.InputTextReactivateId=id;
+        else
+        {
+            // Navigation activation suppresses its incoming character queue.
+            // Replay real search text via InputText's callback, while keeping
+            // the shortcut that opened the library out of the query.
+            if(!openingShortcut&&context.ActiveId!=id&&!io.KeyCtrl)
+                for(auto c:io.InputQueueCharacters)if(c>=32&&c!=127)
+                {char utf8[5];const int bytes=ImTextCharToUtf8(utf8,c);if(state.pendingText.size()+bytes>=sizeof(editor.search))break;state.pendingText.append(utf8,bytes);}
+            context.NavActivateId=id;context.NavActivateFlags=ImGuiActivateFlags_PreferInput;
+        }
+        editor.catalogFocus=false;state.refocus=false;
+    }
+    auto flags=ImGuiInputTextFlags_EnterReturnsTrue|ImGuiInputTextFlags_CallbackHistory;
+    if(!state.pendingText.empty())flags|=ImGuiInputTextFlags_CallbackAlways;
+    if(editor.search[0]||state.browse||(!openingShortcut&&!ImGui::GetIO().InputQueueCharacters.empty()))flags|=ImGuiInputTextFlags_CallbackCompletion;
+    const bool enter=ImGui::InputTextWithHint("##search", "Search nodes...", editor.search, sizeof(editor.search),flags,catalogSearchInput,&state);
+    if(ImGui::IsItemEdited())
+    {state.selected=0;state.reveal=true;state.error.clear();if(!state.navigate)state.browse=false;editor.popupUsesKeyboard=true;}
     ImGui::Separator();
-    const auto tree=catalogTree(graph);
-    if(tree.children.empty())ImGui::TextDisabled("No matching nodes.");
-    else if(editor.search[0])
-    {ImGui::BeginChild("catalog_results",ImVec2(300,300));catalogResults(graph,index,tree);ImGui::EndChild();}
-    else if(ImGui::BeginMenu("Add node"))
-    {catalogBranches(graph,index,tree);ImGui::EndMenu();}
+    bool choose=false;
+    if(editor.search[0]||state.browse)
+    {
+        refreshCatalogSearch(graph,index);choose=catalogSearchResults();
+        choose|=(enter||state.accept)&&!state.nodes.empty();
+        ImGui::PushTextWrapPos(ImGui::GetCursorPosX()+std::max(180.0f,std::min(360.0f,available.x-16)));
+        ImGui::TextDisabled("Up/Down: select   Tab/Enter: add   Esc: close");ImGui::PopTextWrapPos();
+    }
+    else
+    {
+        refreshCatalogCandidates(graph,index);const auto tree=catalogTree(state.available);
+        if(tree.children.empty())ImGui::TextDisabled("No matching nodes.");
+        else if(beginEditorMenu("Add node")){catalogBranches(graph,index,tree);ImGui::EndMenu();}
+    }
+    if(choose)
+    {
+        std::string error;
+        if(addCatalogNode(graph,index,state.nodes[state.selected],error))
+        {ImGui::ClearActiveID();ImGui::CloseCurrentPopup();ImGui::EndPopup();return;}
+        state.error=error;editor.message=error;editor.error=true;state.refocus=true;
+    }
+    else if(enter)state.refocus=true;
+    if((editor.search[0]||state.browse)&&!state.nodes.empty())requestCatalogPreview(state.nodes[state.selected]);
+    state.accept=false;state.navigate=false;state.step=0;
+    if(!state.error.empty())ImGui::TextColored(ImVec4(1,0.45f,0.45f,1),"%s",state.error.c_str());
     if(!editor.catalogWireNode)
     {
         ImGui::Separator();
@@ -2227,6 +2705,10 @@ void catalog(Graph& graph, int index)
         if(ImGui::MenuItem("Arrange graph","Alt+L",false,!graph.nodes.empty()))arrangeGraph(graph,index);
         if(ImGui::MenuItem("Paste","Ctrl+V"))pasteSelection(graph,index);
     }
+    const auto* popup=ImGui::GetCurrentWindow();
+    state.popupSize=ImVec2(popup->DC.CursorMaxPos.x-popup->Pos.x+popup->WindowPadding.x+popup->Scroll.x+2*popup->WindowBorderSize,
+        popup->DC.CursorMaxPos.y-popup->Pos.y+popup->WindowPadding.y+popup->Scroll.y+2*popup->WindowBorderSize);
+    if(editor.search[0]||state.browse)drawCatalogPreview();
     ImGui::EndPopup();
 }
 void rememberParameterChange()
@@ -2660,7 +3142,7 @@ bool inlineInputDefault(Graph& graph,int index,int id,std::size_t pin,NodeDispla
 }
 void inspector(Graph& graph,int index)
 {
-    if(!ImGui::BeginPopup("node_inspector"))return;
+    if(!beginEditorPopup("node_inspector"))return;
     const auto* node=findNode(graph,editor.selected[index]);
     if(!node){ImGui::EndPopup();return;}
     const Node snapshot=*node;const int id=node->id;
@@ -2671,7 +3153,7 @@ void inspector(Graph& graph,int index)
     if(ImGui::MenuItem("Bypass","Ctrl+B",snapshot.bypassed,canBypass(snapshot.kind)))bypassSelection(graph,index);
     if(ImGui::MenuItem("Disable","Ctrl+M",snapshot.disabled))disableSelection(graph,index);
     if(ImGui::MenuItem("Collapse / expand","Space",snapshot.collapsed,!reroute(snapshot.kind)))collapseSelection(graph,index);
-    if(ImGui::BeginMenu("Size",!reroute(snapshot.kind)))
+    if(beginEditorMenu("Size",!reroute(snapshot.kind)))
     {
         if(ImGui::MenuItem("Automatic / reset"))resizeSelection(graph,index,NodeSizePreset::Automatic);
         if(ImGui::MenuItem("Fit height to visible settings"))resizeSelection(graph,index,NodeSizePreset::FitContent);
@@ -2728,7 +3210,7 @@ int drawWireBendHandle(ImDrawList* draw,const Graph& graph,int index,const std::
 }
 void wireInspector(Graph& graph,int index,ImVec2 origin)
 {
-    if(!ImGui::BeginPopup("wire_inspector"))return;
+    if(!beginEditorPopup("wire_inspector"))return;
     const auto found=std::find_if(graph.links.begin(),graph.links.end(),[&](const Link& link){return linkKey(link)==editor.contextLink;});
     if(found==graph.links.end()){ImGui::CloseCurrentPopup();ImGui::EndPopup();return;}
     const int position=static_cast<int>(found-graph.links.begin());
@@ -2785,7 +3267,7 @@ void propertiesPanel(Graph& graph,int index,ImVec2 position,ImVec2 size)
 }
 void groupInspector(Graph& graph,int tab)
 {
-    if (!ImGui::BeginPopup("group_inspector")) return;
+    if (!beginEditorPopup("group_inspector")) return;
     Group* group=findGroup(graph,editor.selectedGroup[tab]);
     if (!group) {ImGui::EndPopup();return;}
     ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(group->color),"Group");
@@ -2816,7 +3298,7 @@ void groupInspector(Graph& graph,int tab)
 }
 void tieInspector(Graph& graph,int tab)
 {
-    if(!ImGui::BeginPopup("wire_tie_inspector"))return;
+    if(!beginEditorPopup("wire_tie_inspector"))return;
     auto* tie=findTie(graph,editor.selectedTie[tab]);
     if(tie)
     {
@@ -2935,7 +3417,7 @@ void nudgeSelection(Graph& graph,int index,float x,float y)
 void shortcutsPopup()
 {
     ImGui::SetNextWindowSize(ImVec2(570,560),ImGuiCond_Appearing);
-    if(!ImGui::BeginPopup("graph_shortcuts"))return;
+    if(!beginEditorPopup("graph_shortcuts"))return;
     ImGui::TextUnformatted("Keyboard and mouse");ImGui::Separator();
     ImGui::BeginChild("shortcut_rows",ImVec2(0,-40));
     ImGui::TextUnformatted("Signal colors");
@@ -2952,7 +3434,7 @@ void shortcutsPopup()
     ImGui::TextWrapped("Int connects to Float without precision loss. Use Float to Int to choose rounding.");ImGui::Separator();
     const std::pair<const char*,const char*> rows[]={
         {"LMB drag","Move freely; outline previews grid placement on release"},{"Empty canvas + LMB / MMB","Pan the graph"},{"Wire center + LMB drag","Horizontal: roundness; vertical: twist; Shift: fine"},{"Alt + click wire center","Reset bend; RMB / Esc cancels a bend drag"},{"Selected card edge / corner","Resize on the grid; RMB / Esc cancels"},{"RMB click / drag","Context menu / box selection"},{"Shift + RMB drag","Add to selection"},{"MMB drag / Wheel","Pan / zoom around cursor"},
-        {"Shift+A / Ctrl+Space","Open node library"},{"?","Show this reference"},{"G","Move selected items with the cursor"},{"Shift+D","Duplicate and move selected nodes"},
+        {"Shift+A / Ctrl+Space","Open node library; type to search"},{"Up / Down in search","Select a result; Down with no query browses all"},{"Tab / Enter in search","Add selected node; Esc closes the search"},{"?","Show this reference"},{"G","Move selected items with the cursor"},{"Shift+D","Duplicate and move selected nodes"},
         {"Enter / LMB","Confirm keyboard move"},{"Esc / RMB","Cancel move or unfinished connection"},{"A / Ctrl+A","Select all nodes and ties"},{"Alt+A","Deselect all"},{"Ctrl+I","Invert selection"},
         {"B","Box select with the next LMB drag"},{"Alt+L","Arrange graph by connections"},{"Home","Frame the whole graph"},{"F / Numpad .","Frame selection"},{"Arrow keys","Move selection by one grid cell"},
         {"Tab / Shift+Tab","Focus ports; move to the next / previous node"},{"Up / Down; Home / End","Choose a focused node's port"},{"Left / Right","Follow upstream / downstream from a focused port"},
@@ -2960,7 +3442,7 @@ void shortcutsPopup()
         {"Ctrl+C / X / V","Copy / cut / paste selection"},{"Ctrl+D","Duplicate selection one grid cell away"},{"Ctrl+Z / Ctrl+Y","Undo / redo (Ctrl+Shift+Z also redoes)"},
         {"Ctrl+B","Bypass selected processing nodes"},{"Ctrl+M","Disable / enable selected nodes"},{"Ctrl+G","Group selected nodes"},{"Space","Collapse / expand selection"},
         {"Enter / Double-click node","Open node information"},{"X / Delete","Delete selection"},{"Z + LMB drag","Tie crossed wires"},{"Ctrl+RMB drag","Cut crossed connections"},
-        {"Shift + tie drag","Rotate tie in 15-degree steps"},{"Double-click wire","Cut connection"},{"Alt+click port","Disconnect port"},{"Ctrl+S","Flush automatic saving now"}};
+        {"Shift + tie drag","Rotate tie in 15-degree steps"},{"Double-click empty canvas","Add a reroute; first wire chooses its type"},{"Double-click wire","Cut connection"},{"Alt+click port","Disconnect port"},{"Ctrl+S","Flush automatic saving now"}};
     if(ImGui::BeginTable("shortcuts",2,ImGuiTableFlags_RowBg))
     {
         ImGui::TableSetupColumn("Shortcut",ImGuiTableColumnFlags_WidthFixed,178);
@@ -3024,6 +3506,8 @@ void canvas(Graph& graph, int index)
     const ImVec2 end = add(origin,size);
     ImDrawList* draw = ImGui::GetWindowDrawList();
     auto& io = ImGui::GetIO();
+    const bool emptyDoubleClick=editor.emptyClickCandidate&&ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left);
+    if(ImGui::IsMouseClicked(ImGuiMouseButton_Left)||ImGui::IsMouseClicked(ImGuiMouseButton_Right)||ImGui::IsMouseClicked(ImGuiMouseButton_Middle))editor.emptyClickCandidate=false;
     const bool editCancelled=(editor.resizeNode||editor.bendGraph>=0||editor.pointerMove||editor.keyboardMove)&&
         (ImGui::IsKeyPressed(ImGuiKey_Escape)||ImGui::IsMouseClicked(ImGuiMouseButton_Right));
     if(editCancelled)
@@ -3114,7 +3598,7 @@ void canvas(Graph& graph, int index)
         const int button=editor.panButton;
         const bool released=ImGui::IsMouseReleased(button);
         const ImVec2 delta(io.MousePos.x-editor.panStartMouse.x,io.MousePos.y-editor.panStartMouse.y);
-        if(distanceSquared(io.MousePos,editor.panStartMouse)>=io.MouseDragThreshold*io.MouseDragThreshold)editor.panned=true;
+        if(distanceSquared(io.MousePos,editor.panStartMouse)>=io.MouseDragThreshold*io.MouseDragThreshold){editor.panned=true;editor.emptyClickCandidate=false;}
         if(editor.panned&&(ImGui::IsMouseDown(button)||released))
         {
             const float x=editor.panStart.x+delta.x,y=editor.panStart.y+delta.y;
@@ -3253,13 +3737,8 @@ void canvas(Graph& graph, int index)
         const ImU32 accent = node.disabled?IM_COL32(133,141,154,255):node.bypassed?IM_COL32(211,176,114,255):def.outputs.empty() ? Cyan : pinColor(def.outputs.front().type);
         if(!isReroute)
         {
-            draw->AddRectFilled(add(p,ImVec2(3,4)),add(q,ImVec2(3,4)),IM_COL32(0,0,0,50),6*graph.zoom);
-            draw->AddRectFilled(p,q,node.bypassed?IM_COL32(33,34,38,255):IM_COL32(37,39,44,255),6*graph.zoom);
-            draw->AddRectFilled(p,add(p,ImVec2(cardWidth(node)*graph.zoom,HeaderHeight*graph.zoom)),IM_COL32(46,49,55,255),6*graph.zoom);
-            draw->AddRect(p,q,selected?Cyan:IM_COL32(74+static_cast<int>(26*hoverFade),79+static_cast<int>(35*hoverFade),88+static_cast<int>(43*hoverFade),255),6*graph.zoom,0,selected?2.0f:1.0f);
             const bool active=sample&&(sample->active||(value->valid&&ImGui::GetTime()<display.rapidUntil));
-            draw->AddRectFilled(add(p,ImVec2(0,8*graph.zoom)),add(p,ImVec2(3*graph.zoom,24*graph.zoom)),(accent&0x00ffffff)|IM_COL32(0,0,0,active?230:85),2);
-            if(signal>0.01f)draw->AddRect(p,q,(accent&0x00ffffff)|IM_COL32(0,0,0,static_cast<int>(210*signal)),6*graph.zoom,0,1.0f+signal);
+            drawNodeShell(draw,p,q,HeaderHeight*graph.zoom,graph.zoom,accent,node.bypassed,selected,hoverFade,active,signal);
         }
         const float font = std::max(graph.zoom<0.4f?8.0f:0.0f,ImGui::GetFontSize()*graph.zoom);
         if (!reroute(node.kind))
@@ -3400,7 +3879,7 @@ void canvas(Graph& graph, int index)
         }
         else if (overBody)
         {
-            if(isReroute)ImGui::SetTooltip("%s%s%s\nDrag the point to move. Drag a side handle to connect.\nDrop a wire on the point to connect.",def.title,text.empty()?"":"  |  ",text.c_str());
+            if(isReroute)ImGui::SetTooltip("%s%s%s\nDrag the point to move. Drag a side handle to connect.\nDrop a wire on the point to connect.",looseReroute(graph,node)?"Reroute | First wire chooses the type":def.title,text.empty()?"":"  |  ",text.c_str());
             else ImGui::SetTooltip("%s%s%s%s",def.title,node.disabled?"  [DISABLED]":node.bypassed?"  [BYPASS]":"",text.empty()?"":"\n",text.c_str());
         }
         if(hovered&&settingsHovered!=node.id&&hoverNode==node.id&&hoverPort<0&&contains(io.MousePos,p,q)&&value&&
@@ -3640,7 +4119,9 @@ void canvas(Graph& graph, int index)
         }
         else
         {
-            beginPan(graph,ImGuiMouseButton_Left);
+            if(emptyDoubleClick&&!io.KeyCtrl&&!io.KeyShift&&!io.KeyAlt&&!editor.panned&&!editor.wireNode&&!editor.popupNavigation)
+                addLooseReroute(graph,index,ImVec2((io.MousePos.x-origin.x-graph.panX)/graph.zoom,(io.MousePos.y-origin.y-graph.panY)/graph.zoom));
+            else{beginPan(graph,ImGuiMouseButton_Left);editor.emptyClickCandidate=!editor.popupNavigation;}
         }
     }
     if(editor.bendGraph==index)
@@ -3725,7 +4206,7 @@ void canvas(Graph& graph, int index)
         if(targetNode&&targetPort>=0&&targetOutput!=editor.wireOutput)
         {
             candidate=editor.wireOutput?Link{editor.wireNode,editor.wirePort,targetNode,targetPort}:Link{targetNode,targetPort,editor.wireNode,editor.wirePort};
-            compatible=canConnect(graph,candidate,connectionError);
+            compatible=canConnectReroutes(graph,candidate,connectionError);
         }
         if (const Node* node=findNode(graph,editor.wireNode))
         {
@@ -3738,7 +4219,7 @@ void canvas(Graph& graph, int index)
             }
             const auto& anchorPins=editor.wireOutput?definition(node->kind).outputs:definition(node->kind).inputs;
             auto type=anchorPins[editor.wirePort].type;
-            if(compatible&&!editor.wireOutput)type=definition(findNode(graph,targetNode)->kind).outputs[targetPort].type;
+            if(compatible)type=connectionType(graph,candidate);
             const ImU32 color=compatible||connectionError.empty()?pinColor(type):IM_COL32(241,111,119,255);
             previewWire(draw,editor.wireOutput?pos:endpoint,editor.wireOutput?endpoint:pos,color);
             if(compatible)ImGui::SetTooltip("Release to connect. RMB or Esc to cancel.");
@@ -3749,7 +4230,7 @@ void canvas(Graph& graph, int index)
         {
             if (compatible)
             {
-                remember();
+                remember();adaptLooseReroutes(graph,candidate);
                 graph.links.erase(std::remove_if(graph.links.begin(),graph.links.end(),[&](const Link& old) { return old.toNode==candidate.toNode && old.toPort==candidate.toPort; }),graph.links.end());
                 graph.links.push_back(candidate); edited();
             }
@@ -3875,7 +4356,7 @@ void drawEditor(int index)
     if(toolButton("help","Keyboard and mouse reference (?)\nAll edits apply immediately and save automatically.",ToolIcon::Help))ImGui::OpenPopup("graph_shortcuts");
     ImGui::PopStyleVar();
     ImGui::EndDisabled();
-    if(ImGui::BeginPopup("graph_tools"))
+    if(beginEditorPopup("graph_tools"))
     {
         if(ImGui::MenuItem("Select all","Ctrl+A"))selectAll(graph,index);
         if(ImGui::MenuItem("Copy selected","Ctrl+C",false,canCopySelection))copySelection(graph,index);
@@ -3898,14 +4379,14 @@ void drawEditor(int index)
         if(ImGui::MenuItem("Delete selection","Delete",false,hasSelection||!editor.tieSelection[index].empty()||editor.selectedGroup[index]!=0))deleteSelection(graph,index);
         ImGui::EndPopup();
     }
-    if (ImGui::BeginPopup("graph_files"))
+    if (beginEditorPopup("graph_files"))
     {
         ImGui::TextDisabled("All graphs, layout and values");
         if (ImGui::MenuItem("Import graphs...")) editor.fileAction=1;
         if (ImGui::MenuItem("Export graphs...")) editor.fileAction=2;
         ImGui::EndPopup();
     }
-    if (ImGui::BeginPopup("restore_graph"))
+    if (beginEditorPopup("restore_graph"))
     {
         ImGui::TextUnformatted("Restore the starter graph for this tab?");
         if (ImGui::Button("Restore"))
@@ -4047,7 +4528,7 @@ void NodeEditor_PrepareFrame()
     else if(!popup&&editor.popupNavigation)
     {
         if(!editor.restoreKeyboardNavigation)flags&=~ImGuiConfigFlags_NavEnableKeyboard;
-        editor.popupNavigation=false;
+        editor.popupNavigation=false;editor.popupUsesKeyboard=false;
     }
 }
 void NodeEditor_PreserveViewport()
