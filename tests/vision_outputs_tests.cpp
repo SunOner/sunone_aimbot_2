@@ -3,6 +3,7 @@
 #endif
 #include "nodes/vision_outputs.h"
 #include "nodes/vision_runtime.h"
+#include "nodes/preview_image.h"
 #include "scr/data_collector.h"
 #include "runtime/input_state.h"
 #include "detection_buffer.h"
@@ -15,6 +16,7 @@
 #include <iostream>
 #include <map>
 #include <stdexcept>
+#include <limits>
 
 // The real output helpers operate on CPU frames here without starting capture,
 // devices, an overlay window, CUDA, or the inference provider.
@@ -74,6 +76,27 @@ DetectionStream detections(std::int64_t version=1,std::uint64_t generation=1)
 const cv::Mat& pixels(const MaskStream& value)
 {return std::static_pointer_cast<const NodeVision::MaskStorage>(value->storage)->mask;}
 
+void previewsConvertPixelsWithoutChangingSources()
+{
+    auto settings=defaultNode(NodeKind::ImagePreview,1);Value value;value.type=ValueType::Frame;
+    value.frame=frame(cv::Mat(900,1600,CV_8UC3,cv::Scalar(10,20,230)));
+    const auto image=NodeVision::makePreview(value,{},settings);
+    require(image&&image->width==320&&image->height==180&&image->sourceWidth==1600&&image->sourceHeight==900,"Preview did not preserve aspect ratio or bound its pixel count");
+    require(image->rgba[0]==230&&image->rgba[1]==20&&image->rgba[2]==10&&image->rgba[3]==255,"Frame preview uses the wrong channel order");
+    require(NodeVision::cpuImage(value.frame).at<cv::Vec3b>(0,0)==cv::Vec3b(10,20,230),"Preview mutated capture pixels");
+    value.frame=frame(cv::Mat(2,2,CV_8UC4,cv::Scalar(10,20,230,0)));
+    require(NodeVision::makePreview(value,{},settings)->rgba[3]==255,"A capture frame with zero BGRA alpha became invisible");
+    value.type=ValueType::Depth;value.frame=frame((cv::Mat_<float>(2,2)<<1,2,3,std::numeric_limits<float>::quiet_NaN()));settings.parameters["colormap"]=1;
+    const auto depth=NodeVision::makePreview(value,{},settings);
+    require(depth&&depth->rgba[0]==0&&depth->rgba[8]==255&&depth->rgba[12]==0,"Depth normalization mishandled its finite range or NaN pixels");
+    settings.parameters["colormap"]=0;const auto color=NodeVision::makePreview(value,{},settings);
+    require(color&&color->rgba!=depth->rgba,"Depth color choices do not change the preview");
+    value.type=ValueType::Mask;value.frame.reset();value.mask=mask((cv::Mat_<std::uint8_t>(2,2)<<0,255,255,0));
+    const auto selected=NodeVision::makePreview(value,{},settings);require(selected&&selected->rgba[0]==0&&selected->rgba[4]==255,"Mask preview is not rendered as grayscale");
+    value.type=ValueType::Frame;value.mask.reset();value.frame=frame(cv::Mat(32,32,CV_8UC3,cv::Scalar(10,20,30)));
+    const auto plain=NodeVision::makePreview(value,{},settings),boxes=NodeVision::makePreview(value,detections(),settings),stale=NodeVision::makePreview(value,detections(9),settings);
+    require(boxes->rgba!=plain->rgba&&stale->rgba==plain->rgba,"Preview boxes were omitted or mixed detections from a different frame");
+}
 void masksOperateOnRealPixels()
 {
     auto depth=frame((cv::Mat_<std::uint8_t>(2,2)<<0,10,200,255));
@@ -241,8 +264,8 @@ void overlaySafetyRejectsOldFramesAndGraphs()
     const auto oldRevision=service().revision();const auto saved=service().workspace();auto updated=saved;
     auto& graph=updated.graphs[static_cast<std::size_t>(GraphKind::Vision)];
     std::vector<int> removed;
-    for(const auto& item:graph.nodes)if(item.kind==NodeKind::RenderOverlay)removed.push_back(item.id);
-    graph.nodes.erase(std::remove_if(graph.nodes.begin(),graph.nodes.end(),[](const Node& item){return item.kind==NodeKind::RenderOverlay;}),graph.nodes.end());
+    for(const auto& item:graph.nodes)if(item.kind==NodeKind::RenderOverlay||item.kind==NodeKind::OverlayOutput)removed.push_back(item.id);
+    graph.nodes.erase(std::remove_if(graph.nodes.begin(),graph.nodes.end(),[](const Node& item){return item.kind==NodeKind::RenderOverlay||item.kind==NodeKind::OverlayOutput;}),graph.nodes.end());
     graph.links.erase(std::remove_if(graph.links.begin(),graph.links.end(),[&](const Link& link){return std::find(removed.begin(),removed.end(),link.fromNode)!=removed.end()||std::find(removed.begin(),removed.end(),link.toNode)!=removed.end();}),graph.links.end());
     for(auto& group:graph.groups)group.nodes.erase(std::remove_if(group.nodes.begin(),group.nodes.end(),[&](int id){return std::find(removed.begin(),removed.end(),id)!=removed.end();}),group.nodes.end());
     std::string error;require(service().publish(updated,error),"Could not publish a graph after removing Render Overlay");
@@ -257,6 +280,7 @@ int main()
     try
     {
         detectionBuffer.generation=1;
+        previewsConvertPixelsWithoutChangingSources();
         masksOperateOnRealPixels();depthMaskCadenceIsPerNodeAndEditsAreImmediate();maskStateIsIndependentAndPruned();collectorUsesIndependentCadenceAndConnectedModel();
         packetsKeepIndependentImmutableStyles();screenshotsUseConnectedPixelsAndIndependentCadence();unsupportedDepthHasVisibleError();overlaySafetyRejectsOldFramesAndGraphs();NodeVision::retainVisionOutputs(NodeGraph::Actions{});
         std::cout<<"Vision output regressions passed\n";return 0;

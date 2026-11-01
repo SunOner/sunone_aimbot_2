@@ -48,6 +48,8 @@
     <ClCompile Include="overlay\draw_game_overlay.cpp" />
     <ClCompile Include="overlay\config_dirty.cpp" />
     <ClCompile Include="nodes\node_graph.cpp" />
+    <ClCompile Include="nodes\preview_image.cpp" />
+    <ClCompile Include="overlay\node_preview.cpp" />
     <ClCompile Include="nodes\node_config_bridge.cpp" />
     <ClCompile Include="nodes\vision_runtime.cpp" />
     <ClCompile Include="nodes\vision_outputs.cpp" />
@@ -124,6 +126,8 @@
     <ClInclude Include="overlay\Game_overlay.h" />
     <ClInclude Include="overlay\config_dirty.h" />
     <ClInclude Include="nodes\node_graph.h" />
+    <ClInclude Include="nodes\preview_image.h" />
+    <ClInclude Include="overlay\node_preview.h" />
     <ClInclude Include="nodes\node_layout.h" />
     <ClInclude Include="nodes\node_config_bridge.h" />
     <ClInclude Include="nodes\vision_runtime.h" />
@@ -138,6 +142,7 @@
     <ClInclude Include="modules\makcu\include\serialport.h" />
     <ClInclude Include="mouse\Makcu.h" />
     <ClInclude Include="depth\depth_anything_trt.h" />
+    <ClInclude Include="depth\model_path.h" />
     <ClInclude Include="depth\depth_mask.h" />
     <ClInclude Include="depth\depth_utils.h" />
   </ItemGroup>

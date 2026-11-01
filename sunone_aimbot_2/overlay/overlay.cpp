@@ -33,6 +33,8 @@
 #include "overlay/window_geometry.h"
 #include "nodes/node_graph.h"
 #include "nodes/vision_runtime.h"
+#include "nodes/preview_image.h"
+#include <opencv2/imgproc.hpp>
 #include "runtime/input_state.h"
 #include "include/other_tools.h"
 #include "config.h"
@@ -1496,20 +1498,26 @@ static HRESULT RenderOverlayFrame(bool allowAutoResize, bool allowConfigSave)
             visionPreview.elapsedSeconds=t;visionPreview.center=preview.center;
             visionPreview.captureFps=preview.captureFps;visionPreview.controlActive=true;
             const auto clockTime=std::chrono::steady_clock::now();
-            const auto image=NodeVision::makeFrame(cv::Mat(320,320,CV_8UC3,cv::Scalar(35,45,60)),{},clockTime,0);
+            cv::Mat demo(320,320,CV_8UC3,cv::Scalar(35,45,60));
+            for(int at=0;at<320;at+=32){cv::line(demo,{at,0},{at,319},{54,64,78});cv::line(demo,{0,at},{319,at},{54,64,78});}
+            cv::rectangle(demo,cv::Rect(static_cast<int>(x-25),static_cast<int>(y-40),50,80),cv::Scalar(95,170,220),cv::FILLED);
+            const auto image=NodeVision::makeFrame(demo,{},clockTime,0);
             visionPreview.frame=image;
             visionPreview.captureFrame=[image](int,const NodeGraph::Node&){return image;};
+            visionPreview.preview=NodeVision::makePreview;
             visionPreview.infer=[frame](int,const NodeGraph::FrameStream& input,const NodeGraph::Node& node){
                 auto result=std::make_shared<NodeGraph::DetectionFrame>(*frame);
                 result->timestampSeconds=input->timestampSeconds;result->version=input->version;result->generation=input->generation;
                 result->modelName=NodeGraph::textParameter(node,"model_path");return result;
             };
             visionPreview.depth=[](int,const NodeGraph::FrameStream& input,const NodeGraph::Node&){
-                auto native=std::make_shared<NodeVision::FrameStorage>();native->image=cv::Mat(320,320,CV_32FC1,cv::Scalar(0.5));
+                auto native=std::make_shared<NodeVision::FrameStorage>();native->image=cv::Mat(input->height,input->width,CV_32FC1);
+                for(int y=0;y<input->height;++y)for(int x=0;x<input->width;++x)native->image.at<float>(y,x)=static_cast<float>(std::hypot(x-input->width*0.5,y-input->height*0.5));
                 auto depth=std::make_shared<NodeGraph::FrameData>(*input);depth->gpu=false;depth->storage=native;return depth;
             };
             visionPreview.depthToMask=[](const NodeGraph::FrameStream& input,const NodeGraph::Node&){
                 auto native=std::make_shared<NodeVision::MaskStorage>();native->mask=cv::Mat::zeros(input->height,input->width,CV_8UC1);
+                cv::circle(native->mask,{input->width/2,input->height/2},std::min(input->width,input->height)/3,cv::Scalar(255),cv::FILLED);
                 auto mask=std::make_shared<NodeGraph::MaskData>();mask->width=input->width;mask->height=input->height;
                 mask->version=input->version;mask->generation=input->generation;mask->timestampSeconds=input->timestampSeconds;mask->storage=native;return mask;
             };

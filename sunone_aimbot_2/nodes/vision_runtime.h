@@ -39,6 +39,5 @@ void reportError(int nodeKey,const std::string& error);
 // Called without configMutex. Applies node settings to the physical capture
 // service and returns false when the graph has no active capture source.
 bool syncCaptureConfiguration(bool force = false);
-void seedMissingModelPaths();
 NodeGraph::Actions processFrame(const NodeGraph::FrameStream& frame,const Infer& infer);
 }

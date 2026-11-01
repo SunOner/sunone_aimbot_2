@@ -275,6 +275,8 @@ set(AIMBOT_SOURCES
     "${SRC_DIR}/nodes/vision_runtime.cpp"
     "${SRC_DIR}/nodes/vision_outputs.cpp"
     "${SRC_DIR}/overlay/node_editor.cpp"
+    "${SRC_DIR}/overlay/node_preview.cpp"
+    "${SRC_DIR}/nodes/preview_image.cpp"
     "${SRC_DIR}/overlay/draw_ai.cpp"
     "${SRC_DIR}/overlay/draw_buttons.cpp"
     "${SRC_DIR}/overlay/draw_capture.cpp"
@@ -615,6 +617,7 @@ if(BUILD_TESTING)
     add_test(NAME node_config_migration COMMAND node_config_bridge_tests)
     add_executable(vision_outputs_tests
         "${CMAKE_SOURCE_DIR}/tests/vision_outputs_tests.cpp"
+        "${SRC_DIR}/nodes/preview_image.cpp"
         "${SRC_DIR}/nodes/vision_outputs.cpp"
         "${SRC_DIR}/nodes/node_graph.cpp"
         "${SRC_DIR}/scr/data_collector.cpp")
@@ -634,6 +637,7 @@ if(BUILD_TESTING)
     # --benchmark mode also measures the real D3D11 renderer offscreen.
     add_executable(node_editor_input_tests
         "${CMAKE_SOURCE_DIR}/tests/node_editor_input_tests.cpp"
+        "${SRC_DIR}/overlay/node_preview.cpp"
         "${SRC_DIR}/nodes/node_graph.cpp"
         "${SRC_DIR}/nodes/node_config_bridge.cpp"
         "${SRC_DIR}/keyboard/keycodes.cpp"

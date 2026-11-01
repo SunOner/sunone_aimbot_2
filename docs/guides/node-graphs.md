@@ -13,12 +13,13 @@ Logic runs through these graphs. A branch executes when an active output needs i
 
 ## Editing
 
-- **Move and select:** left-drag nodes or group headers; drag empty canvas with LMB/MMB to pan. Right-drag selects a box; Shift adds to the selection. Shift/Ctrl+click toggles individual nodes. The wheel zooms around the cursor.
+- **Move and select:** left-drag nodes or group headers. Items follow the cursor freely; a background outline shows their grid placement on release. RMB/Esc cancels. Drag empty canvas with LMB/MMB to pan. Right-drag selects a box; Shift adds to the selection. Shift/Ctrl+click toggles individual nodes. The wheel zooms around the cursor.
 - **Connect:** drag between compatible ports in either direction. A new wire replaces the existing input connection. Drop on empty canvas to add a compatible node, or use RMB/Esc to cancel. Alt+click a port disconnects it; double-click a wire cuts it.
+- **Bend wires:** hover a wire to reveal its center handle. Drag horizontally for roundness and vertically for twist; Shift+drag gives finer control. Alt+click the handle or choose Reset bend from the wire menu to reset. RMB/Esc cancels a drag. Wires do not automatically detour around nodes; bends persist with the graph, clipboard and Undo.
 - **Add nodes:** short right-click opens the context menu. Hover categories and subcategories, or search by name. Toolbar icons show tooltips with their actions and shortcuts.
 - **Edit values:** all runtime settings have visible typed inputs. Click Bool to toggle, drag Int/Float or Ctrl+click for exact entry, and click String to edit. Choices, keys and file pickers are available at the input. A wire overrides the stored local value until disconnected. Source literals and Get/Set names use local fields.
 - **Read defaults:** a dash means required data is missing; Center, Local and None identify contextual or optional inputs. Hover for details. Changed values and consumed connections briefly highlight; stable data does not create pulses.
-- **Resize and arrange:** select a card and drag its edges/corners. Nodes snap to the 32-pixel grid. The Size menu offers automatic, compact, wide and fit-height presets. Arrange graph orders nodes by connections and fits their groups. RMB/Esc cancels a move or resize.
+- **Resize and arrange:** select a card and drag its edges/corners. Card positions and dimensions align to the 32-pixel grid, including automatic sizes and collapsed cards. The Size menu offers automatic, compact, wide and fit-height presets. Arrange graph wraps long chains and fits their stage groups. RMB/Esc cancels a resize.
 - **Groups:** group selected nodes into a named, colored frame. Drag its header to move the contents; resize or remove the frame without deleting its nodes.
 - **Reroute:** right-click a wire → Insert reroute, then drag the dot to guide the wire. Its side handles appear near the pointer.
 - **Wire ties:** hold Z and drag across wires to gather their routes under a strap. Shift+drag rotates it in 15-degree steps. Double-click/Delete removes the strap while keeping its connections.
@@ -30,7 +31,13 @@ Double-click a node or press Enter for its description, live data and status. Cl
 
 ## Data and settings nodes
 
+**Render overlay** takes a Style chain: Overlay boxes → Frame / FOV → Trails → Icon → Depth / mask → Correction. Use only the layers you need; each has editable inputs. Dataset labels connects separately to Collect dataset. Existing outputs split automatically on load, preserving settings and wires; graphs at the node/link limit retain compatible legacy cards.
+
+**Preview** is under Outputs → Rendering. Connect Frame, Depth or Mask; Detections adds matching boxes. View selects Auto/Frame/Depth/Mask, with depth colors, image size and FPS controls. Up to four visible previews update at once (15 FPS by default); collapsed, offscreen and hidden previews stop requesting images.
+
 Ports have distinct types and colors. Int uses signed 32-bit values and connects directly to Float; use Float to Int for the reverse conversion and choose its rounding mode. Invalid types, cycles, overflow and division by zero stop the affected branch.
+
+Object inference and Depth inference offer a model dropdown from `models`. Depth also lists `depth_models`. Reopening refreshes the list; Choose file and Custom path allow other locations. Selection applies immediately, and a connected input overrides the local choice.
 
 Select a monitor with `Get Monitors → Monitor At → Capture Source`. Monitor At takes a zero-based list position; Primary Monitor selects the primary screen. Connect Capture Source's Frame output to Inference, Collect Dataset or Screenshot. A connected Monitor controls the capture target, device and index. Source settings can change before the first frame arrives.
 

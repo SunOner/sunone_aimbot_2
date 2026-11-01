@@ -7,6 +7,7 @@
 #include <Windows.h>
 #include "nodes/vision_runtime.h"
 #include "nodes/vision_outputs.h"
+#include "nodes/preview_image.h"
 #include "runtime/input_state.h"
 #include "detection_buffer.h"
 #include "config.h"
@@ -182,45 +183,6 @@ bool syncCaptureConfiguration(bool force)
     return true;
 }
 
-void seedMissingModelPaths()
-{
-    const auto nodes=NodeGraph::service().providerNodes(NodeGraph::NodeKind::Inference);
-    if(std::none_of(nodes.begin(),nodes.end(),[](const NodeGraph::Node& node){return text(node,"model_path").empty();}))return;
-    std::string candidate;
-    {
-        std::lock_guard<std::mutex> lock(configMutex);
-        if(!config.ai_model.empty())
-        {
-            NodeGraph::Node probe=NodeGraph::defaultNode(NodeGraph::NodeKind::Inference,1);
-            probe.textParameters["model_path"]=config.ai_model;
-            if(std::filesystem::exists(std::filesystem::u8path(resolveModelPath(probe))))candidate=config.ai_model;
-        }
-    }
-    if(candidate.empty())
-    {
-        std::error_code error;
-        if(std::filesystem::is_directory("models",error))
-            for(const auto& entry:std::filesystem::directory_iterator("models",error))
-            {
-                if(!entry.is_regular_file())continue;
-                auto extension=entry.path().extension().string();
-                std::transform(extension.begin(),extension.end(),extension.begin(),[](unsigned char value){return static_cast<char>(std::tolower(value));});
-#ifdef USE_CUDA
-                if(extension!=".onnx"&&extension!=".engine")continue;
-#else
-                if(extension!=".onnx")continue;
-#endif
-                candidate=entry.path().filename().u8string();break;
-            }
-    }
-    if(candidate.empty())return;
-    auto workspace=NodeGraph::service().workspace();
-    for(auto& node:workspace.graphs[static_cast<int>(NodeGraph::GraphKind::Vision)].nodes)
-        if(node.kind==NodeGraph::NodeKind::Inference&&text(node,"model_path").empty())node.textParameters["model_path"]=candidate;
-    std::string error;
-    if(NodeGraph::service().publish(workspace,error))NodeGraph::service().save("node_graphs.ini",error);
-}
-
 NodeGraph::Actions processFrame(const NodeGraph::FrameStream& frame,const Infer& infer)
 {
     NodeGraph::Actions inactive;
@@ -246,6 +208,9 @@ NodeGraph::Actions processFrame(const NodeGraph::FrameStream& frame,const Infer&
         catch(const std::exception& error){reportError(key,error.what());return NodeGraph::DetectionStream{};}
     };
     context.depth=inferDepth;context.depthToMask=depthToMask;context.applyMask=applyMask;
+    context.preview=[&](const NodeGraph::Value& image,const NodeGraph::DetectionStream& detections,const NodeGraph::Node& node){
+        return current()?makePreview(image,detections,node):NodeGraph::Preview{};
+    };
     context.filterMask=filterMask;
     context.collect=[&](int key,const NodeGraph::FrameStream& input,const NodeGraph::DetectionStream& detections,const NodeGraph::Node& node){
         return current()&&collectDataset(key,input,detections,node);

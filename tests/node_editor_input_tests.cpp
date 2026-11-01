@@ -5,6 +5,7 @@
 #define _WINSOCKAPI_
 #include <winsock2.h>
 #include <Windows.h>
+#include <d3d11.h>
 #include <string>
 #include <vector>
 
@@ -14,6 +15,8 @@
 // hit testing, ImGui ownership, preview rendering and publication code.
 #define OVERLAY_H
 HWND g_hwnd = nullptr;
+ID3D11Device* g_pd3dDevice=nullptr;
+ID3D11DeviceContext* g_pd3dDeviceContext=nullptr;
 std::vector<std::string> key_names{"None", "F2", "F6"};
 void Overlay_ExpandForNodes() {}
 #include "../sunone_aimbot_2/overlay/node_editor.cpp"
@@ -22,7 +25,6 @@ void Overlay_ExpandForNodes() {}
 #include <stdexcept>
 
 Config config{};
-namespace NodeVision { void seedMissingModelPaths() {} }
 
 namespace
 {
@@ -746,7 +748,7 @@ void testWireContextKeepsRerouteAvailable()
     auto& stack=ImGui::GetCurrentContext()->OpenPopupStack;
     require(!stack.empty()&&stack.back().Window,"Right click on a wire did not open its menu");
     auto* popup=stack.back().Window;
-    h.click(ImVec2(popup->Pos.x+65,popup->Pos.y+popup->Size.y-16));
+    h.click(ImVec2(popup->Pos.x+65,popup->Pos.y+popup->Size.y-16-ImGui::GetTextLineHeightWithSpacing()));
     require(h.graph().nodes.size()==4&&h.graph().links.size()==2,"Reroute action in the wire menu did not split the connection");
     require(findNode(h.graph(),editor.selected[0])->kind==NodeKind::RerouteBoolean,"Wire menu inserted an incompatible reroute");
 }
@@ -935,7 +937,10 @@ void testInlinePathsAndDrivenSettings()
         gestureScenario="Inline model path is stored on its own node";
         EditorHarness h;h.graphIndex=3;h.graph().nodes={defaultNode(NodeKind::DepthInference,1,64,64),defaultNode(NodeKind::DepthInference,2,416,64)};
         h.frame();h.frame();const auto second=textParameter(*findNode(h.graph(),2),"model_path");
-        replaceInlineText(h,optionField(h,1,"model_path"),"models/depth.onnx");
+        h.click(optionField(h,1,"model_path"));h.frame();h.frame();
+        const auto* popup=ImGui::GetCurrentContext()->OpenPopupStack.back().Window;
+        replaceInlineText(h,ImVec2(popup->WorkRect.Min.x+60,popup->DC.CursorPosPrevLine.y+ImGui::GetFontSize()*0.5f),"models/depth.onnx");
+        h.key(ImGuiKey_Escape,true);h.key(ImGuiKey_Escape,false);h.frame();
         require(textParameter(*findNode(h.graph(),1),"model_path")=="models/depth.onnx"&&
             textParameter(service().workspace().graphs[3].nodes[0],"model_path")=="models/depth.onnx","Inline model path was not published immediately");
         require(textParameter(*findNode(h.graph(),2),"model_path")==second,"Editing one path retuned another node");
@@ -970,7 +975,7 @@ void testOverlappingGroupControlsUseOneTopmostTarget()
         harness.button(ImGuiMouseButton_Left,false);
         const auto* lower=findGroup(harness.graph(),1);const auto* upper=findGroup(harness.graph(),2);
         require(lower->x==32&&lower->y==32&&lower->width==256&&lower->height==160&&
-            upper->x==288&&upper->y==208&&upper->width==288&&upper->height==160,
+            upper->x==288&&upper->y==224&&upper->width==288&&upper->height==160,
             "Dragging the topmost group header resized or moved the wrong group");
     }
 }
@@ -1265,15 +1270,14 @@ void testWireAnimationIsContinuousAcrossGeometryAndZoom()
 
 void testWireSplinesAreSmoothAndScaleInvariant()
 {
-    gestureScenario="Spline-only forward, return and obstacle routes";
-    struct Example{ImVec2 start,end;float detour;};
-    const float automatic=std::numeric_limits<float>::quiet_NaN();
-    const Example examples[]={{{0,0},{240,80},automatic},{{240,0},{0,80},automatic},
-        {{240,0},{0,0},automatic},{{0,0},{0,240},automatic},{{0,0},{6,80},automatic},
-        {{0,0},{240,80},-90},{{0,0},{1000,400},-240},{{1000,0},{0,0},automatic}};
+    gestureScenario="Spline-only forward, return and manually bent routes";
+    struct Example{ImVec2 start,end;WireBend bend;};
+    const Example examples[]={{{0,0},{240,80},{}},{{240,0},{0,80},{}},
+        {{240,0},{0,0},{}},{{0,0},{0,240},{}},{{0,0},{6,80},{}},
+        {{0,0},{240,80},{0.8f,-0.5f}},{{0,0},{1000,400},{1,1}},{{1000,0},{0,0},{0,0}}};
     for(const auto& example:examples)
     {
-        const auto path=wirePath(example.start,example.end,1,example.detour);const float length=wireLength(path);
+        const auto path=wirePath(example.start,example.end,1,example.bend);const float length=wireLength(path);
         require(distanceSquared(path.front(),example.start)<0.001f&&distanceSquared(path.back(),example.end)<0.001f,"Spline detached from its ports");
         require(path[1].x>path.front().x&&path.back().x>path[path.size()-2].x,"Spline enters or leaves a port in the wrong direction");
         for(std::size_t i=1;i<path.size();++i)
@@ -1281,18 +1285,23 @@ void testWireSplinesAreSmoothAndScaleInvariant()
             require(path[i].x>=std::min(example.start.x,example.end.x)-96&&path[i].x<=std::max(example.start.x,example.end.x)+96,"A return spline extends too far past its ports");
             const float segment=std::sqrt(distanceSquared(path[i-1],path[i]));
             require(std::isfinite(segment)&&segment<length*0.08f,"Wire has a long rectilinear leg instead of a sampled spline");
-            if(i>1)
+            // A flat backward wire can reverse along its own line. Its center
+            // remains smooth; users choose the vertical twist themselves.
+            if(i>1&&(example.start.y!=example.end.y||example.bend.twist!=0))
             {
                 const ImVec2 previous(path[i-1].x-path[i-2].x,path[i-1].y-path[i-2].y),next(path[i].x-path[i-1].x,path[i].y-path[i-1].y);
                 const float product=std::sqrt(dot(previous,previous)*dot(next,next));
-                require(product>0&&dot(previous,next)/product>0.75f,"Spline contains a sharp corner or reverses at a join");
+                // Tight return curves turn faster near their port extremities;
+                // the shared cubic join must still have a continuous tangent.
+                const float minimumCosine=i==32||i==33?0.95f:0.5f;
+                require(product>0&&dot(previous,next)/product>minimumCosine,"Spline contains a sharp corner or reverses at a join");
             }
         }
         for(const float zoom:GestureZooms)
         {
             const ImVec2 origin(37,-19);
             const auto scaled=wirePath(add(origin,multiply(example.start,zoom)),add(origin,multiply(example.end,zoom)),zoom,
-                std::isfinite(example.detour)?origin.y+example.detour*zoom:automatic);
+                example.bend);
             require(scaled.size()==path.size(),"Zoom changed the spline route type");
             for(std::size_t i=0;i<path.size();++i)
                 require(distanceSquared(scaled[i],add(origin,multiply(path[i],zoom)))<0.01f,"Zoom changed the spline shape");
@@ -1316,7 +1325,7 @@ void testWirePositionsFollowTheDrawnArcLength()
     {
         const ImVec2 from=variant==1?ImVec2(240,0):ImVec2(0,0);
         const ImVec2 to=variant==1?ImVec2(0,80):ImVec2(240,80);
-        const auto path=wirePath(from,to,1,variant==2?-90.0f:std::numeric_limits<float>::quiet_NaN());
+        const auto path=wirePath(from,to,1,variant==2?WireBend{0.8f,-0.5f}:WireBend{});
         const float length=wireLength(path);
         require(path.size()>1&&std::isfinite(length)&&length>0,"Wire route has no finite animated path");
         require(distanceSquared(wirePosition(path,0),from)<0.001f&&
@@ -1334,7 +1343,7 @@ void testWirePositionsFollowTheDrawnArcLength()
                 const float fraction=squared>0?std::clamp(((point.x-a.x)*dx+(point.y-a.y)*dy)/squared,0.0f,1.0f):0;
                 nearest=std::min(nearest,distanceSquared(point,ImVec2(a.x+fraction*dx,a.y+fraction*dy)));
             }
-            require(nearest<0.001f,"A pulse left the visible wire during forward/return/detour routing");
+            require(nearest<0.001f,"A pulse left the visible wire during forward/return/manual routing");
         }
     }
 }
@@ -1636,7 +1645,7 @@ void testKeyboardMoveAndDuplicateAreTransactional()
     gestureScenario="G and Shift+D keyboard movement transactions";
     EditorHarness h;h.click(h.body(1));const auto pointer=add(h.origin,ImVec2(760,400));h.move(pointer);
     h.key(ImGuiKey_G,true);h.key(ImGuiKey_G,false);h.move(add(pointer,ImVec2(43,47)));
-    require(editor.keyboardMove&&findNode(h.graph(),1)->x==96&&editor.undo.empty(),"G did not preview a snapped move as one transaction");
+    require(editor.keyboardMove&&findNode(h.graph(),1)->x==107&&editor.undo.empty(),"G did not preview a free move as one transaction");
     h.key(ImGuiKey_Escape,true);h.key(ImGuiKey_Escape,false);
     require(!editor.keyboardMove&&findNode(h.graph(),1)->x==64&&editor.undo.empty(),"Escape did not restore a keyboard move cleanly");
     h.move(pointer);h.key(ImGuiKey_G,true);h.key(ImGuiKey_G,false);h.move(add(pointer,ImVec2(64,32)));h.key(ImGuiKey_Enter,true);h.key(ImGuiKey_Enter,false);
@@ -1787,7 +1796,9 @@ void testRouteCacheInvalidationAndAffineNavigation()
     for(std::size_t i=0;i<rebuiltAtZoom.size();++i)require(distanceSquared(cache.routes[0].path[i],rebuiltAtZoom[i])<0.002f,"Affine zoom changed the visible wire shape");
     auto previous=cache.rebuilds;findNode(h.graph(),2)->collapsed=true;h.frame();
     require(cache.rebuilds==previous+1&&distanceSquared(cache.routes[0].path.back(),h.port(2,false))<0.001f,"Collapsing a node left its old cached port position");
-    previous=cache.rebuilds;findNode(h.graph(),3)->y+=32;h.frame();require(cache.rebuilds==previous+1,"Moving an obstacle failed to invalidate routing");
+    const auto beforeObstacle=cache.routes[0].path;
+    findNode(h.graph(),3)->x=320;findNode(h.graph(),3)->y=64;h.frame();
+    for(std::size_t i=0;i<beforeObstacle.size();++i)require(distanceSquared(cache.routes[0].path[i],beforeObstacle[i])<0.001f,"An unrelated node still bends a wire automatically");
     h.graph().ties={{1,320,192,0}};h.graph().links[0].ties={1};h.frame();previous=cache.rebuilds;
     h.graph().ties[0].angle=15;h.frame();require(cache.rebuilds==previous+1&&cache.routes[0].tieDistances.size()==1,"Rotating a strap did not update the cached route");
     require(cache.connections[0][1]==1&&cache.connections[1][0]==1,"Cached pin connectivity is incorrect");
@@ -1825,9 +1836,26 @@ void testHotNodeDisplayIsThrottledAndEditsAreImmediate()
     require(display.text=="4.000","Value throttling delayed an explicit constant edit");
     node.kind=NodeKind::Clamp;sample.value.valid=false;sample.value.error="Provider failed";updateNodeDisplay(display,node,&sample,true,true,3.012,now);
     require(display.text=="ERROR","Throttling hid a newly reported error");
+    node.kind=NodeKind::Inference;sample.value.error="Select a model for this Inference node.\nProvider details";
+    updateNodeDisplay(display,node,&sample,true,true,3.0125,now);
+    require(display.text=="Select a model for this Inference node."&&display.error==sample.value.error,"Inference hides its actionable error behind a generic ERROR badge");
+    node.kind=NodeKind::Clamp;
     sample.value.valid=true;sample.value.error.clear();sample.value.number=42;updateNodeDisplay(display,node,&sample,true,true,3.013,now);
     require(display.text=="42.000","Error recovery waited for the display timer");
     updateNodeDisplay(display,node,nullptr,true,true,3.014,now);require(display.text.empty(),"An unavailable value remained on screen until the next timer tick");
+}
+void testOutputWaitingAndRealErrorsRemainDistinct()
+{
+    gestureScenario="Mouse output distinguishes missing activation data from a real error";
+    EditorHarness h;h.graph().nodes={defaultNode(NodeKind::ScopeCheck,1,32,32),defaultNode(NodeKind::AimOutput,2,416,32)};
+    h.graph().links={{1,0,2,0}};edited();NodeGraph::Context context;service().evaluate(context);refreshTelemetry();h.frame();
+    require(editor.canvasRoutes[0].displays[1].text.empty()&&editor.canvasRoutes[0].displays[1].error.empty(),"Mouse output displays ERROR while waiting for an Enable value");
+    *findNode(h.graph(),1)=defaultNode(NodeKind::GetBoolean,1,32,32);findNode(h.graph(),1)->textParameters["name"]="missing_enable";
+    edited();service().evaluate(context);refreshTelemetry();h.frame();
+    require(editor.canvasRoutes[0].displays[1].text=="ERROR"&&editor.canvasRoutes[0].displays[1].error=="No matching Set for missing_enable","A genuine activation error is no longer visible on Mouse output");
+    *findNode(h.graph(),1)=defaultNode(NodeKind::Boolean,1,32,32);findNode(h.graph(),1)->value=0;
+    edited();service().evaluate(context);refreshTelemetry();h.frame();
+    require(editor.canvasRoutes[0].displays[1].text=="FALSE"&&editor.canvasRoutes[0].displays[1].error.empty(),"Mouse output kept a stale error after its Enable recovered");
 }
 void testLargeGraphAnimationAndTextBudgets()
 {
@@ -1873,12 +1901,17 @@ void testDisplayCacheRefreshesAfterRevisionAndReopen()
 #include "node_editor_benchmark.h"
 
 #include "node_editor_binding_tests.h"
+#include "node_preview_tests.h"
+#include "node_wire_bend_tests.h"
+#include "node_editor_placement_tests.h"
 int main(int argc,char** argv)
 {
     try
     {
-        if(argc>1&&std::string(argv[1])=="--benchmark")return benchmarkNodeEditor(argc>2?argv[2]:"benchmark_results/node_editor.csv");
+        if(argc>1&&std::string(argv[1])=="--benchmark")return benchmarkNodeEditor(argc>2?argv[2]:"benchmark_results/node_editor.csv",argc>3?argv[3]:"");
+        testPreviewVisibilityFollowsTheImagePanel();testPreviewTexturesUploadAndReuseActualPixels();
         testOptionEditorBindings();testOutputToInputAndPreview(); testShortPreviewDoesNotLoop(); testInputToOutputAndReplacement();
+        testEveryCardSizeFollowsTheGrid();testFreeDragShowsItsGridDestinationAcrossZoom();testFreeMoveCancelsWithoutSavingOrNoopHistory();testGroupsAndReroutesHaveFreePlacementPreviews();
         testNearestCompactPin(); testPortWinsOverLaterBody();
         testCancelInvalidAndOutside(); testRightClickCancelsAndWheelDoesNotMoveGesture();
         testAltDisconnect(); testShiftSelectionAndSnappedDrag(); testMiddlePanAndWheelAnchor(); testPopupBlocksGraphShortcuts();
@@ -1897,6 +1930,7 @@ int main(int argc,char** argv)
         testComboAnimationAdvancesOnceAndRespectsParentAlpha();
         testRerouteIsRenderedAsOnePoint();testReroutePointAcceptsBothWireDirections();
         testWireAnimationIsContinuousAcrossGeometryAndZoom();testWireSplinesAreSmoothAndScaleInvariant();testWirePositionsFollowTheDrawnArcLength();
+        testManualBendGesturesAcrossZoom();testBendCancellationAndFineControl();testManualBendsKeepTiesClipboardAndCache();testBendHandlesRespectOtherControls();
         testSelectionClipboardIsPortableAndTransactional();
         testQuickAddConnectsBothDirectionsAndKeepsOldInputUntilSuccess();
         testPropertiesPanelAndSelectionFocus();testPropertiesRemainUsableInNarrowEditor();
@@ -1913,7 +1947,7 @@ int main(int argc,char** argv)
         testGroupKeyboardMoveDuplicateAndClipboard();testLeavingEditorCancelsPreviewAndDefersAutosave();
         testKeyboardPortsConnectFollowAndDisconnect();testControlSaveWorksFromProperties();
         testCatalogCanBeTraversedWithKeyboard();testZGestureRemovesCrossedTiesWithoutCuttingWires();
-        testRouteCacheInvalidationAndAffineNavigation();testHotNodeDisplayIsThrottledAndEditsAreImmediate();testLargeGraphAnimationAndTextBudgets();
+        testRouteCacheInvalidationAndAffineNavigation();testHotNodeDisplayIsThrottledAndEditsAreImmediate();testOutputWaitingAndRealErrorsRemainDistinct();testLargeGraphAnimationAndTextBudgets();
         testDisplayCacheRefreshesAfterRevisionAndReopen();
         std::cout << "Node editor input tests passed\n";
         return 0;

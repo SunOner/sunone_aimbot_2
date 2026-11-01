@@ -21,12 +21,13 @@ constexpr std::size_t MaxWireTies = 64;
 constexpr std::size_t MaxTiesPerLink = 16;
 constexpr std::size_t MaxPins = 64;
 constexpr std::size_t MaxDataPins = 8;
+constexpr std::size_t MaxLivePreviews = 4;
 constexpr std::size_t GraphCount = 4;
 constexpr std::size_t MaxWorkspaceBytes = 4 * 1024 * 1024;
-constexpr int CurrentFormatVersion = 11;
+constexpr int CurrentFormatVersion = 13;
 constexpr std::int32_t MinInteger = -2147483647 - 1, MaxInteger = 2147483647;
 enum class GraphKind { Aim, AutoShoot, Recoil, Vision };
-enum class ValueType { Boolean, Float, Point, Detections, Target, Movement, Frame, Depth, Mask, Integer, String, Monitor, Monitors, Number = Float };
+enum class ValueType { Boolean, Float, Point, Detections, Target, Movement, Frame, Depth, Mask, Integer, String, Monitor, Monitors, OverlayStyle, LabelOptions, Number = Float };
 enum class NodeKind
 {
     AimHeld, ShootHeld, ZoomHeld, TargetValid, TargetObserved,
@@ -54,7 +55,9 @@ enum class NodeKind
     GetBoolean, SetBoolean, GetFloat, SetFloat, GetInteger, SetInteger, GetString, SetString,
     GetPoint, SetPoint, GetMonitor, SetMonitor, GetMonitorsValue, SetMonitorsValue,
     GetDetections, SetDetections, GetTarget, SetTarget, GetMovement, SetMovement,
-    GetFrame, SetFrame, GetDepth, SetDepth, GetMask, SetMask, Count,
+    GetFrame, SetFrame, GetDepth, SetDepth, GetMask, SetMask, ImagePreview,
+    OverlayBoxes, OverlayFrame, OverlayMotion, OverlayIcon, OverlayDepth, OverlayCorrection, OverlayOutput,
+    DatasetLabels, DatasetOutput, RerouteOverlay, RerouteLabels, GetOverlay, SetOverlay, GetLabels, SetLabels, Count,
     Float = Number, RerouteFloat = RerouteNumber
 };
 struct Point { double x = 0.0; double y = 0.0; };
@@ -132,6 +135,14 @@ struct Movement
     Point preciseCounts;
     bool hasPreciseCounts = false;
 };
+struct PreviewImage;
+using Preview=std::shared_ptr<const PreviewImage>;
+struct SettingsData
+{
+    std::map<std::string,double> numbers;
+    std::map<std::string,std::string> texts;
+};
+using Settings=std::shared_ptr<const SettingsData>;
 struct Value
 {
     ValueType type = ValueType::Boolean;
@@ -149,6 +160,16 @@ struct Value
     std::string text;
     Monitor monitor;
     MonitorList monitors;
+    Preview preview;
+    Settings settings;
+};
+struct PreviewImage
+{
+    int width=0,height=0,sourceWidth=0,sourceHeight=0;
+    ValueType sourceType=ValueType::Frame;
+    std::int64_t version=-1;
+    std::uint64_t generation=0;
+    std::vector<std::uint8_t> rgba;
 };
 struct Pin { const char* name; ValueType type; const char* defaultParameter = nullptr; bool option=false; };
 enum class ParameterKind { Number, Integer, Boolean };
@@ -211,6 +232,11 @@ double parameter(const Node& node, const std::string& key);
 std::string textParameter(const Node& node, const std::string& key);
 void initializeParameters(Node& node);
 Node defaultNode(NodeKind kind, int id, float x = 0, float y = 0);
+struct WireBend
+{
+    float roundness = 0.58f;
+    float twist = 0;
+};
 struct Link
 {
     int fromNode = 0;
@@ -219,6 +245,7 @@ struct Link
     int toPort = 0;
     // Ordered visual waypoints. They never merge or transform signal values.
     std::vector<int> ties;
+    WireBend bend; // Presentation only; relative to the wire's endpoints and ties.
 };
 struct WireTie
 {
@@ -299,6 +326,7 @@ struct Context
     std::function<bool(int nodeKey,const FrameStream&,const DetectionStream&,const Node&)> collect;
     std::function<bool(int nodeKey,const FrameStream&,const DetectionStream&,const MaskStream&,const FrameStream& depth,const Node&)> render;
     std::function<bool(int nodeKey,const FrameStream&,const Node&)> screenshot;
+    std::function<Preview(const Value&,const DetectionStream&,const Node&)> preview;
     std::function<std::string(int nodeKey)> nodeError;
 };
 struct Actions
@@ -357,6 +385,8 @@ public:
     bool hasDynamicProviders() const;
     Telemetry telemetry() const;
     void setTelemetryEnabled(bool enabled);
+    void setPreviewNodes(std::vector<int> nodes);
+    std::shared_ptr<const std::vector<int>> previewNodes() const;
     bool load(const std::string& path, std::string& error);
     bool save(const std::string& path, std::string& error) const;
 private:
@@ -367,6 +397,8 @@ private:
     mutable std::mutex telemetryMutex_;
     Telemetry telemetry_;
     std::atomic<bool> telemetryEnabled_{true};
+    std::shared_ptr<const std::vector<int>> previewNodes_;
+    std::atomic<std::int64_t> previewTouched_{0};
     std::shared_ptr<const ConfigurationSnapshot> configurationSnapshot_;
     std::mutex configurationMutex_;
     std::map<int,std::string> configurationErrors_;
@@ -389,6 +421,24 @@ private:
         std::map<int,EventState> events;
         std::map<int,FilterState> filters;
         std::map<int,Node> configurations;
+        struct SettingsState
+        {
+            Settings input,output;
+            std::map<std::string,double> numbers;
+            std::map<std::string,std::string> texts;
+            Node resolved;
+            bool resolvedOnce=false;
+        };
+        std::map<int,SettingsState> settings;
+        struct PreviewState
+        {
+            Preview image;
+            std::array<std::uint64_t,5> stamp{};
+            std::array<double,4> settings{};
+            std::chrono::steady_clock::time_point updatedAt{};
+            std::string error;
+        };
+        std::map<int,PreviewState> previews;
         std::array<std::vector<std::array<Value,MaxDataPins>>,GraphCount> inputStorage;
         std::array<std::vector<SignalState>,GraphCount> signals;
         std::shared_ptr<const Program> signalProgram;

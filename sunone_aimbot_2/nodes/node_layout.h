@@ -13,7 +13,7 @@
 // bounded operation; none of this runs in the evaluation or rendering loops.
 namespace NodeGraph::Layout
 {
-constexpr float Grid=32,CardWidth=190,HeaderHeight=28,PinSpacing=20,Gap=64,ColumnGap=96;
+constexpr float Grid=32,CardWidth=192,HeaderHeight=28,PinSpacing=20,Gap=64,ColumnGap=96;
 constexpr float MinWidth=160,MaxWidth=1024,MaxHeight=2048;
 inline float up(float value){return std::ceil(value/Grid)*Grid;}
 inline float snap(float value){return std::round(value/Grid)*Grid;}
@@ -21,7 +21,7 @@ inline bool isReroute(NodeKind kind)
 {
     return (kind>=NodeKind::RerouteBoolean&&kind<=NodeKind::RerouteMovement)||
         kind==NodeKind::RerouteFrame||kind==NodeKind::RerouteDepth||kind==NodeKind::RerouteMask||kind==NodeKind::RerouteInteger||
-        kind==NodeKind::RerouteString||kind==NodeKind::RerouteMonitor||kind==NodeKind::RerouteMonitors;
+        kind==NodeKind::RerouteString||kind==NodeKind::RerouteMonitor||kind==NodeKind::RerouteMonitors||kind==NodeKind::RerouteOverlay||kind==NodeKind::RerouteLabels;
 }
 inline bool inputVisible(const Node& node,std::size_t pin)
 {
@@ -55,25 +55,27 @@ inline float settingsTop(const Node& node)
     const auto& def=definition(node.kind);
     return HeaderHeight+10+PinSpacing*static_cast<float>(std::max(inputCount(node),def.outputs.size()));
 }
+inline float width(const Node& node){return isReroute(node.kind)?64:node.width>0?std::clamp(snap(node.width),MinWidth,MaxWidth):node.kind==NodeKind::ImagePreview?352:inputCount(node)>8?288:CardWidth;}
+inline float previewHeight(const Node& node){return node.kind==NodeKind::ImagePreview?std::clamp((width(node)-24)*9/16,64.0f,384.0f)+8:0;}
 inline float minimumHeight(const Node& node)
 {
     if(isReroute(node.kind))return 32;
     const float panel=std::min(naturalSettingsHeight(node),64.0f);
-    return settingsTop(node)+26+(hasSettings(node)?panel+8:0);
+    return settingsTop(node)+26+previewHeight(node)+(hasSettings(node)?panel+8:0);
 }
-inline float width(const Node& node){return isReroute(node.kind)?64:node.width>0?std::clamp(node.width,MinWidth,MaxWidth):inputCount(node)>8?288:CardWidth;}
 inline float height(const Node& node,bool expanded=false)
 {
     if(isReroute(node.kind))return 32;
     const auto& def=definition(node.kind);
-    if(node.collapsed&&!expanded)return std::max(56.0f,24+12.0f*static_cast<float>(std::max(inputCount(node),def.outputs.size())-1));
-    return node.height>0?std::clamp(node.height,minimumHeight(node),MaxHeight):settingsTop(node)+26+(hasSettings(node)?naturalSettingsHeight(node)+8:0);
+    if(node.collapsed&&!expanded)return up(std::max(56.0f,24+12.0f*static_cast<float>(std::max(inputCount(node),def.outputs.size())-1)));
+    return node.height>0?std::clamp(snap(node.height),up(minimumHeight(node)),MaxHeight):up(settingsTop(node)+26+previewHeight(node)+(hasSettings(node)?naturalSettingsHeight(node)+8:0));
 }
 inline float settingsHeight(const Node& node){return hasSettings(node)?std::max(0.0f,height(node,true)-settingsTop(node)-34):0;}
 struct Extent{float width=0,height=0;};
 
-inline bool arrange(Graph& graph)
+inline bool arrange(Graph& graph,int bandColumns=4)
 {
+    bandColumns=std::clamp(bandColumns,1,6);
     const auto before=graph;
     const int count=static_cast<int>(graph.nodes.size()),groupCount=static_cast<int>(graph.groups.size());
     if(!count&&!groupCount)return false;
@@ -137,10 +139,10 @@ inline bool arrange(Graph& graph)
         }
         int maximum=0;for(int n:ids)maximum=std::max(maximum,rank[n]);
         float bandY=0,right=0;
-        for(int band=0;band<=maximum;band+=6)
+        for(int band=0;band<=maximum;band+=bandColumns)
         {
             float x=0,bandHeight=0;
-            for(int column=band;column<=std::min(maximum,band+5);++column)
+            for(int column=band;column<=std::min(maximum,band+bandColumns-1);++column)
             {
                 std::vector<int> layer;for(int n:order)if(rank[n]==column)layer.push_back(n);
                 std::stable_sort(layer.begin(),layer.end(),[&](int a,int b){return critical[a]!=critical[b]?critical[a]>critical[b]:graph.nodes[a].id<graph.nodes[b].id;});

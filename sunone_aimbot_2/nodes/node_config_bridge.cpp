@@ -2,9 +2,61 @@
 #include "config.h"
 #include "keyboard/keycodes.h"
 #include <algorithm>
+#include <cctype>
+#include <filesystem>
 
 namespace NodeGraph
 {
+bool initializeMissingModels(Workspace& workspace,const std::string& preferredModel,const std::string& nativeBackend)
+{
+    namespace fs=std::filesystem;
+    auto& graph=workspace.graphs[static_cast<std::size_t>(GraphKind::Vision)];
+    const auto& def=definition(NodeKind::Inference);
+    const auto wired=[&](const Node& node,const char* key){
+        for(std::size_t p=0;p<def.inputs.size();++p)if(def.inputs[p].defaultParameter&&std::string(def.inputs[p].defaultParameter)==key)
+            return std::any_of(graph.links.begin(),graph.links.end(),[&](const Link& link){return link.toNode==node.id&&link.toPort==static_cast<int>(p);});
+        return false;
+    };
+    std::string candidate;bool searched=false,changed=false;
+    const auto supported=[&](const fs::path& path){
+        auto extension=path.extension().u8string();
+        std::transform(extension.begin(),extension.end(),extension.begin(),[](unsigned char c){return static_cast<char>(std::tolower(c));});
+        return extension==".onnx"||(nativeBackend=="TRT"&&extension==".engine");
+    };
+    const auto regular=[](const fs::path& path){std::error_code error;return fs::is_regular_file(path,error);};
+    const auto findCandidate=[&]{
+        try
+        {
+            if(!preferredModel.empty()&&preferredModel.size()<=1024&&preferredModel.find('\0')==std::string::npos)
+            {
+                const auto path=fs::u8path(preferredModel);
+                if(supported(path)&&(regular(path)||(!path.is_absolute()&&regular(fs::path("models")/path))))
+                {candidate=preferredModel;return;}
+            }
+            // A single compatible model is unambiguous. With several models,
+            // leave the choice visible instead of loading an arbitrary file.
+            std::error_code error;std::string only;std::size_t count=0;
+            for(fs::directory_iterator it("models",error),end;!error&&it!=end;it.increment(error))
+                if(supported(it->path())&&regular(it->path()))
+                {
+                    const auto name=it->path().filename().u8string();if(name.size()>1024)continue;
+                    only=name;if(++count>1)return;
+                }
+            if(!error&&count==1)candidate=std::move(only);
+        }
+        catch(const std::exception&){candidate.clear();}
+    };
+    for(auto& node:graph.nodes)
+    {
+        if(node.kind!=NodeKind::Inference||!textParameter(node,"model_path").empty()||wired(node,"model_path")||wired(node,"backend"))continue;
+        const auto backend=textParameter(node,"backend");
+        if(nativeBackend=="TRT"?backend!="TRT":(backend!="DML"&&backend!="CPU"))continue;
+        if(!searched){findCandidate();searched=true;}
+        if(candidate.empty())continue;
+        node.textParameters["model_path"]=candidate;changed=true;
+    }
+    return changed;
+}
 void migrateLegacySettings(Workspace& workspace, const Config& config, bool seedDefaults)
 {
     const bool legacy = workspace.sourceVersion < 3;
@@ -142,6 +194,8 @@ void migrateLegacySettings(Workspace& workspace, const Config& config, bool seed
             case NodeKind::FilterNms: set("threshold",config.nms_threshold);set("class_agnostic",1);set("max_candidates",config.max_detections);break;
             case NodeKind::LimitDetections: set("limit",config.max_detections);break;
             case NodeKind::CollectDataset:
+            case NodeKind::DatasetOutput:
+            case NodeKind::DatasetLabels:
                 set("enabled",config.collect_data_while_playing);set("collect_only_when_aimbot_running",config.collect_only_when_aimbot_running);
                 set("collect_only_when_targets_present",config.collect_only_when_targets_present);set("collect_save_every_n_frames",config.collect_save_every_n_frames);
                 set("collect_jpeg_quality",config.collect_jpeg_quality);set("auto_label_data",config.auto_label_data);
@@ -152,6 +206,8 @@ void migrateLegacySettings(Workspace& workspace, const Config& config, bool seed
                 set("cooldown_ms",config.screenshot_delay);setText("format","jpg");setText("output_dir","screenshots");
                 break;
             case NodeKind::RenderOverlay:
+            case NodeKind::OverlayBoxes:case NodeKind::OverlayFrame:case NodeKind::OverlayMotion:
+            case NodeKind::OverlayIcon:case NodeKind::OverlayDepth:case NodeKind::OverlayCorrection:case NodeKind::OverlayOutput:
                 set("enabled",config.game_overlay_enabled);
 #define GRAPH_SEED_FIELD(field) set(#field,config.field)
                 GRAPH_SEED_FIELD(game_overlay_max_fps);GRAPH_SEED_FIELD(game_overlay_draw_boxes);GRAPH_SEED_FIELD(game_overlay_compensate_latency);

@@ -96,7 +96,7 @@ void benchmarkGraph(int count,int width,bool routing=false,bool settings=false)
             for(int id=i*32+1;id<=std::min(count,(i+1)*32);++id)group.nodes.push_back(id);graph.groups.push_back(std::move(group));
         }
     }
-    std::string error;require(service().publish(editor.draft,error),error.c_str());editor.observedRevision=service().revision();
+    std::string error;if(!service().publish(editor.draft,error))throw std::runtime_error(error);editor.observedRevision=service().revision();
     editor.live.graphRevisions[0]=editor.observedRevision;
     for(int i=0;i<count;++i)
     {
@@ -108,7 +108,7 @@ double percentile(std::vector<double> values,double fraction)
 {
     if(values.empty())return -1;std::sort(values.begin(),values.end());return values[static_cast<std::size_t>((values.size()-1)*fraction)];
 }
-int benchmarkNodeEditor(const std::string& filename)
+int benchmarkNodeEditor(const std::string& filename,const std::string& filter={})
 {
     EditorBenchmarkGpu gpu;std::filesystem::path output(filename);
     if(output.has_parent_path())std::filesystem::create_directories(output.parent_path());
@@ -119,52 +119,92 @@ int benchmarkNodeEditor(const std::string& filename)
     if(!exists)csv<<header<<'\n';
     std::cout<<"Adapter: "<<gpu.adapter<<"\n"<<std::fixed<<std::setprecision(3);
     for(const auto resolution:{std::pair{1920,1080},std::pair{2560,1440}})
-        for(const std::string mode:{"idle","30hz","1000hz","pan1000hz","zoom1000hz","drag1000hz","resize1000hz","far1000hz","overviewzoom1000hz","routing1000hz","settings1000hz","options1000hz"})
+        for(const std::string mode:{"idle","30hz","1000hz","pan1000hz","zoom1000hz","drag1000hz","placement1000hz","resize1000hz","far1000hz","overviewzoom1000hz","routing1000hz","bend1000hz","settings1000hz","options1000hz","previews15hz"})
         {
+            if(!filter.empty()&&mode!=filter)continue;
+            const bool previews=mode=="previews15hz";const int graphIndex=previews?3:0;
             ImGui::CreateContext();auto& io=ImGui::GetIO();io.DisplaySize=ImVec2(static_cast<float>(resolution.first),static_cast<float>(resolution.second));
             io.DeltaTime=1.0f/144;io.IniFilename=io.LogFilename=nullptr;io.ConfigInputTrickleEventQueue=false;
             if(!io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\seguisb.ttf",16.5f))io.Fonts->AddFontDefault();
             require(ImGui_ImplDX11_Init(gpu.device.Get(),gpu.context.Get()),"Benchmark renderer initialization failed");
-            gpu.resize(resolution.first,resolution.second);benchmarkGraph(static_cast<int>(MaxNodes),resolution.first,mode=="routing1000hz",mode=="settings1000hz"||mode=="options1000hz");
+            gpu.resize(resolution.first,resolution.second);benchmarkGraph(static_cast<int>(MaxNodes),resolution.first,mode=="routing1000hz"||mode=="bend1000hz",mode=="settings1000hz"||mode=="options1000hz");
+            g_pd3dDevice=gpu.device.Get();g_pd3dDeviceContext=gpu.context.Get();
+            if(previews)
+            {
+                editor=Editor{};editor.draft=defaults();editor.initialized=true;editor.activeGraph=3;editor.fit.fill(false);editor.autoFit.fill(false);
+                for(auto& graph:editor.draft.graphs){graph.nodes.clear();graph.links.clear();graph.groups.clear();graph.ties.clear();}
+                auto& graph=editor.draft.graphs[3];graph.panX=graph.panY=16;graph.zoom=0.85f;
+                for(int id=1;id<=4;++id)graph.nodes.push_back(defaultNode(NodeKind::ImagePreview,id,32+(id-1)*384.0f,32));
+                graph.nodes.push_back(defaultNode(NodeKind::Float,5,32,576));
+                for(int id=6;id<=static_cast<int>(MaxNodes);++id)
+                {
+                    graph.nodes.push_back(defaultNode(NodeKind::Clamp,id,32+((id-6)%8)*224.0f,736+((id-6)/8)*128.0f));
+                    for(int pin=0;pin<3&&graph.links.size()<MaxLinks;++pin)graph.links.push_back({5,0,id,pin});
+                }
+                std::string error;if(!service().publish(editor.draft,error))throw std::runtime_error(error);editor.observedRevision=service().revision();editor.live.graphRevisions[3]=editor.observedRevision;
+                for(int id=1;id<=static_cast<int>(MaxNodes);++id){NodeValue value;value.nodeId=id;value.value.type=id<=4?ValueType::Boolean:ValueType::Float;value.value.boolean=true;editor.live.graphs[3].push_back(value);editor.liveIndex[3].emplace_back(id,id-1);}
+            }
             if(mode=="options1000hz")
             {
                 const auto& inputs=definition(NodeKind::Prediction).inputs;const auto found=std::find_if(inputs.begin(),inputs.end(),[](const Pin& pin){return pin.defaultParameter&&std::strcmp(pin.defaultParameter,"kalman_measurement_noise")==0;});
                 require(found!=inputs.end(),"Benchmark option input is missing");const int pin=static_cast<int>(found-inputs.begin());
-                for(auto& link:editor.draft.graphs[0].links)if(link.toPort==2){link.toPort=pin;link.fromNode=1;}
-                edited();editor.live.graphRevisions[0]=editor.observedRevision;for(auto& value:editor.live.graphs[0])value.readInputs|=std::uint64_t{1}<<pin;
+                for(auto& link:editor.draft.graphs[graphIndex].links)if(link.toPort==2){link.toPort=pin;link.fromNode=1;}
+                edited();editor.live.graphRevisions[graphIndex]=editor.observedRevision;for(auto& value:editor.live.graphs[graphIndex])value.readInputs|=std::uint64_t{1}<<pin;
             }
-            if(mode=="far1000hz"){editor.viewMode=0;editor.draft.graphs[0].zoom=0.3f;}
+            if(mode=="far1000hz"){editor.viewMode=0;editor.draft.graphs[graphIndex].zoom=0.3f;}
             if(mode=="overviewzoom1000hz")editor.viewMode=0;
-            if(mode=="resize1000hz"){editor.selection[0]={50};editor.selected[0]=50;}
+            if(mode=="resize1000hz"){editor.selection[graphIndex]={50};editor.selected[graphIndex]=50;}
+            if(mode=="placement1000hz")
+            {
+                selectAll(editor.draft.graphs[graphIndex],graphIndex);
+                captureDragSelection(editor.draft.graphs[graphIndex],graphIndex,true);
+                editor.moveOriginal=editor.draft;editor.keyboardMove=true;editor.moveGraph=graphIndex;
+                editor.dragStartMouse=ImVec2(static_cast<float>(resolution.first-25),static_cast<float>(resolution.second-25));
+            }
             io.AddMousePosEvent(static_cast<float>(resolution.first-25),static_cast<float>(resolution.second-25));
             std::vector<double> cpu,gpuTimes;int vertices=0,indices=0;std::size_t pulses=0;
             for(int frame=0;frame<210;++frame)
             {
-                const double time=ImGui::GetTime();const int hz=mode=="idle"?0:mode=="30hz"?30:1000;
+                const double time=ImGui::GetTime();const int hz=previews?15:mode=="idle"?0:mode=="30hz"?30:1000;
                 const double sample=std::floor(time*30)/30;
                 const auto now=std::chrono::steady_clock::now();
-                for(auto& value:editor.live.graphs[0])
+                for(auto& value:editor.live.graphs[graphIndex])
                 {
                     value.signalSequence=hz?static_cast<std::uint64_t>(sample*hz)+1:1;
                     value.signaledAt=now-std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(hz?time-sample:2));
                     value.value.number=hz?std::sin(sample)*100:1.25;
                 }
-                editor.live.graphSampledAt[0]=now;editor.telemetryAt=time+1;
-                if(mode=="pan1000hz")editor.draft.graphs[0].panX=static_cast<float>(16+std::sin(time)*24);
-                if(mode=="zoom1000hz")editor.draft.graphs[0].zoom=static_cast<float>(0.72+std::sin(time)*0.04);
-                if(mode=="overviewzoom1000hz")editor.draft.graphs[0].zoom=static_cast<float>(0.45+std::sin(time)*0.08);
-                if(mode=="drag1000hz")editor.draft.graphs[0].nodes[49].x=static_cast<float>((49%(resolution.first>=2000?16:12))*224+(frame%2)*32);
+                editor.live.graphSampledAt[graphIndex]=now;editor.telemetryAt=time+1;
+                if(mode=="pan1000hz")editor.draft.graphs[graphIndex].panX=static_cast<float>(16+std::sin(time)*24);
+                if(mode=="zoom1000hz")editor.draft.graphs[graphIndex].zoom=static_cast<float>(0.72+std::sin(time)*0.04);
+                if(mode=="overviewzoom1000hz")editor.draft.graphs[graphIndex].zoom=static_cast<float>(0.45+std::sin(time)*0.08);
+                if(mode=="drag1000hz")editor.draft.graphs[graphIndex].nodes[49].x=static_cast<float>((49%(resolution.first>=2000?16:12))*224+(frame%2)*32);
+                if(mode=="bend1000hz")editor.draft.graphs[graphIndex].links[0].bend={static_cast<float>(0.58+std::sin(time)*0.35),static_cast<float>(std::cos(time)*0.8)};
+                if(mode=="placement1000hz")io.AddMousePosEvent(editor.dragStartMouse.x+static_cast<float>(std::sin(time)*43),editor.dragStartMouse.y+static_cast<float>(std::cos(time)*29));
                 const auto started=std::chrono::steady_clock::now();
+                if(previews)
+                {
+                    require(editor.live.graphs[3].size()>=4,"Preview benchmark lost its synthetic telemetry");
+                    const auto version=static_cast<std::int64_t>(time*15);
+                    for(int i=0;i<4;++i)
+                    {
+                        auto& value=editor.live.graphs[3][i].value;if(value.preview&&value.preview->version==version)continue;
+                        auto image=std::make_shared<PreviewImage>();image->width=image->sourceWidth=320;image->height=image->sourceHeight=180;image->version=version;image->rgba.resize(320*180*4);
+                        for(std::size_t p=0;p<image->rgba.size();p+=4){image->rgba[p]=static_cast<std::uint8_t>(version*7+i*40);image->rgba[p+1]=static_cast<std::uint8_t>(p/4);image->rgba[p+2]=90;image->rgba[p+3]=255;}
+                        value.preview=image;
+                    }
+                }
+
                 if(mode=="resize1000hz")
                 {
-                    auto& node=editor.draft.graphs[0].nodes[49];node.width=static_cast<float>(256+(frame%2)*32);node.height=static_cast<float>(192+(frame%2)*32);
+                    auto& node=editor.draft.graphs[graphIndex].nodes[49];node.width=static_cast<float>(256+(frame%2)*32);node.height=static_cast<float>(192+(frame%2)*32);
                     // Include immediate publication, as a real resize gesture does.
                     edited(false);
                 }
                 ImGui_ImplDX11_NewFrame();NodeEditor_PrepareFrame();ImGui::NewFrame();
                 ImGui::SetNextWindowPos(ImVec2(0,0));ImGui::SetNextWindowSize(io.DisplaySize);
                 ImGui::Begin("Node benchmark",nullptr,ImGuiWindowFlags_NoDecoration|ImGuiWindowFlags_NoSavedSettings|ImGuiWindowFlags_NoMove);
-                drawEditor(0);ImGui::End();ImGui::Render();
+                drawEditor(graphIndex);ImGui::End();ImGui::Render();
                 const double build=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-started).count();
                 const auto timing=gpu.render();
                 if(frame>=30)
@@ -174,15 +214,15 @@ int benchmarkNodeEditor(const std::string& filename)
                     pulses=std::max(pulses,editor.drawnSignalPulses);
                 }
             }
-            const auto links=editor.draft.graphs[0].links.size();
+            const auto links=editor.draft.graphs[graphIndex].links.size();
             const auto timestamp=std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());std::tm utc{};gmtime_s(&utc,&timestamp);
-            const auto& cache=editor.canvasRoutes[0];std::uint64_t formats=0,flashes=0;for(const auto& display:cache.displays){formats+=display.formats;flashes+=display.flashes;}
+            const auto& cache=editor.canvasRoutes[graphIndex];std::uint64_t formats=0,flashes=0;for(const auto& display:cache.displays){formats+=display.formats;flashes+=display.flashes;}
             csv<<std::put_time(&utc,"%Y-%m-%dT%H:%M:%SZ")<<','<<NODE_BENCHMARK_COMMIT<<','<<NODE_BENCHMARK_DIRTY<<','<<NODE_BENCHMARK_BACKEND<<",synthetic-graph,d3d11-ui,"
-                <<std::quoted(gpu.adapter)<<','<<resolution.first<<','<<resolution.second<<','<<MaxNodes<<','<<links<<','<<(mode=="idle"?0:mode=="30hz"?30:1000)<<','<<mode<<','
+                <<std::quoted(gpu.adapter)<<','<<resolution.first<<','<<resolution.second<<','<<MaxNodes<<','<<links<<','<<(previews?15:mode=="idle"?0:mode=="30hz"?30:1000)<<','<<mode<<','
                 <<percentile(cpu,0.5)<<','<<percentile(cpu,0.95)<<','<<percentile(gpuTimes,0.5)<<','<<percentile(gpuTimes,0.95)<<','<<vertices<<','<<indices<<','<<pulses<<','<<cache.rebuilds<<','<<formats<<','<<flashes<<'\n';
             csv.flush();
             std::cout<<resolution.first<<'x'<<resolution.second<<' '<<mode<<" CPU p50/p95 "<<percentile(cpu,0.5)<<'/'<<percentile(cpu,0.95)<<" ms; GPU "<<percentile(gpuTimes,0.5)<<'/'<<percentile(gpuTimes,0.95)<<" ms; pulses "<<pulses<<std::endl;
-            ImGui_ImplDX11_Shutdown();ImGui::DestroyContext();editor=Editor{};
+            NodePreview::clear();ImGui_ImplDX11_Shutdown();ImGui::DestroyContext();editor=Editor{};g_pd3dDevice=nullptr;g_pd3dDeviceContext=nullptr;
         }
     std::cout<<"Results: "<<output.string()<<'\n';return 0;
 }

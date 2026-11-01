@@ -121,7 +121,7 @@ void testNamedValuesAndLazySelection()
 }
 void testAllInputGeometryAndDeepGraphs()
 {
-    auto workspace=defaults();const auto& render=node(workspace.graphs[3],13);const int pin=optionPin(NodeKind::RenderOverlay,"snap_boost");
+    auto workspace=defaults();const auto& render=node(workspace.graphs[3],13);const int pin=optionPin(NodeKind::OverlayOutput,"game_overlay_max_fps");
     require(Layout::inputVisible(render,pin)&&Layout::inputCount(render)==definition(render.kind).inputs.size(),"A default node hides some option inputs");
     Service service;publish(service,workspace);std::string text,error;Workspace loaded;
     require(serialize(workspace,text,error)&&deserialize(text,loaded,error)&&Layout::inputCount(node(loaded.graphs[3],13))==Layout::inputCount(render),"Export/import lost some visible inputs");
@@ -179,10 +179,92 @@ void testLocalInputTypesAndPersistence()
     node(graph,2).inputValues[0]=1;require(!validate(workspace,error),"A scalar literal was accepted for a Monitor input");node(graph,2).inputValues.clear();
     node(graph,1).inputTexts[0]=std::string(4097,'x');require(!validate(workspace,error),"An oversized local text input was accepted");
 }
+void testUnavailableEnableDoesNotInventAnError()
+{
+    const NodeKind outputs[]={NodeKind::AimOutput,NodeKind::AutoShootOutput,NodeKind::RecoilOutput,
+        NodeKind::VisionOutput,NodeKind::CollectDataset,NodeKind::RenderOverlay,NodeKind::ScreenshotOutput};
+    for(const auto kind:outputs)
+    {
+        const int index=kind==NodeKind::AimOutput?0:kind==NodeKind::AutoShootOutput?1:kind==NodeKind::RecoilOutput?2:3;
+        Service service;Fixture fixture;auto workspace=emptyWorkspace();auto& graph=workspace.graphs[index];
+        graph.nodes={defaultNode(NodeKind::ScopeCheck,1),defaultNode(kind,2)};graph.links={{1,0,2,0}};publish(service,workspace);
+        const auto evaluate=[&]{return index==3?service.evaluateVision(fixture.context):service.evaluate(fixture.context);};
+        const auto actions=evaluate();const auto telemetry=service.telemetry();const auto& output=sampleNode(telemetry,index,2);
+        require(!output.value.valid&&output.value.error.empty()&&!output.active,"An unavailable Enable without a target was mislabeled as an error");
+        require(output.readInputs==1&&!actions.aim&&!actions.autoShoot&&!actions.recoil&&!actions.visionDetections&&
+            actions.activeCollectorKeys.empty()&&actions.activeRenderKeys.empty()&&actions.activeScreenshotKeys.empty(),"An unavailable Enable executed an output or its data branch");
+        node(graph,1)=defaultNode(NodeKind::GetBoolean,1);node(graph,1).textParameters["name"]="missing_enable";publish(service,workspace);evaluate();
+        const auto failed=service.telemetry();
+        require(sampleNode(failed,index,2).value.error=="No matching Set for missing_enable","A real Enable error was hidden or replaced");
+        node(graph,1)=defaultNode(NodeKind::Boolean,1);node(graph,1).value=0;publish(service,workspace);evaluate();
+        const auto recovered=service.telemetry();const auto& inactive=sampleNode(recovered,index,2);
+        require(inactive.value.valid&&!inactive.value.boolean&&inactive.value.error.empty(),"An inactive output retained the prior Enable error");
+    }
+    Service service;VisionFixture fixture;auto workspace=emptyWorkspace();auto& vision=workspace.graphs[3];
+    vision.nodes={defaultNode(NodeKind::ScopeCheck,1),defaultNode(NodeKind::CaptureSource,2),defaultNode(NodeKind::CollectDataset,3)};
+    node(vision,3).parameters["enabled"]=1;vision.links={{1,0,2,optionPin(NodeKind::CaptureSource,"enabled")},{2,0,3,1}};
+    publish(service,workspace);service.evaluateVision(fixture.context);const auto waiting=service.telemetry();
+    require(sampleNode(waiting,3,2).value.error.empty()&&!sampleNode(waiting,3,2).value.valid&&fixture.captures==0&&fixture.collections==0,
+        "A provider with unavailable activation reported a false error or called its native service");
+}
+void testPreviewIsVisibleOnlyLazyAndThrottled()
+{
+    Service service;VisionFixture fixture;auto workspace=emptyWorkspace();auto& graph=workspace.graphs[3];
+    graph.nodes={defaultNode(NodeKind::CaptureSource,1),defaultNode(NodeKind::DepthInference,2),defaultNode(NodeKind::DepthToMask,3),defaultNode(NodeKind::ImagePreview,4)};
+    node(graph,2).parameters["enabled"]=1;node(graph,3).parameters["enabled"]=1;node(graph,4).parameters["draw_boxes"]=0;
+    graph.links={{1,0,2,0},{2,0,3,0},{1,0,4,1},{2,0,4,2},{3,0,4,3}};
+    int conversions=0;ValueType seen=ValueType::Boolean;
+    fixture.context.preview=[&](const Value& value,const DetectionStream&,const Node&){
+        ++conversions;seen=value.type;auto image=std::make_shared<PreviewImage>();image->width=4;image->height=2;image->rgba.resize(32,255);
+        image->generation=value.mask?value.mask->generation:value.frame->generation;image->version=value.mask?value.mask->version:value.frame->version;return Preview(image);
+    };
+    publish(service,workspace);service.evaluateVision(fixture.context);
+    require(fixture.captures==0&&conversions==0&&service.providerNodes(NodeKind::CaptureSource).empty(),"An invisible preview activated capture");
+    require(service.evaluateConfiguration(fixture.context).empty(),"An invisible preview configured native providers");
+    const auto revision=service.revision();service.setPreviewNodes({4});
+    const auto configured=service.evaluateConfiguration(fixture.context);
+    require(configured.size()==1&&configured[0].kind==NodeKind::CaptureSource&&conversions==0&&fixture.captures==0,"Preview preflight did not configure its selected source without reading pixels");
+    service.evaluateVision(fixture.context);
+    require(conversions==1&&fixture.captures==1&&fixture.depths==0&&fixture.masks==0&&seen==ValueType::Frame,"Auto preview executed an unselected depth/mask branch");
+    for(int i=0;i<20;++i)service.evaluateVision(fixture.context);
+    require(conversions==1&&fixture.captures==1,"Preview FPS limiting ran conversion or upstream providers on every frame");
+    std::this_thread::sleep_for(std::chrono::milliseconds(75));service.evaluateVision(fixture.context);
+    require(conversions==1,"An unchanged image was converted again");
+    for(int mode:{2,3})
+    {
+        node(graph,4).parameters["mode"]=mode;publish(service,workspace);
+        const int before=conversions;const auto providers=service.evaluateConfiguration(fixture.context);
+        require(std::any_of(providers.begin(),providers.end(),[](const Node& n){return n.kind==NodeKind::CaptureSource;})&&conversions==before,"A standalone depth/mask preview did not configure its upstream capture without converting pixels");
+        service.evaluateVision(fixture.context);
+        require(seen==(mode==2?ValueType::Depth:ValueType::Mask),"Changing preview mode did not select its typed input immediately");
+    }
+    auto telemetry=service.telemetry();require(sampleNode(telemetry,3,4).value.preview!=nullptr,"Preview pixels did not reach editor telemetry");
+    const int captures=fixture.captures;service.setPreviewNodes({});service.evaluateVision(fixture.context);
+    telemetry=service.telemetry();require(!sampleNode(telemetry,3,4).value.preview&&fixture.captures==captures,"A hidden preview retained pixels or ran its provider");
+    require(service.revision()>revision,"Mode settings did not change execution");
+    const auto stable=service.revision();service.setPreviewNodes({4});service.setTelemetryEnabled(false);service.evaluateVision(fixture.context);
+    require(!service.previewNodes()&&fixture.captures==captures&&service.revision()==stable,"Hiding monitoring restarted execution or left previews active");
+    std::string text,error;Workspace loaded;require(serialize(workspace,text,error)&&deserialize(text,loaded,error)&&node(loaded.graphs[3],4).kind==NodeKind::ImagePreview,"Preview nodes did not survive export/import");
+}
+void testPreviewCountAndCancellationAreBounded()
+{
+    Service service;VisionFixture fixture;auto workspace=emptyWorkspace();auto& graph=workspace.graphs[3];
+    graph.nodes={defaultNode(NodeKind::CaptureSource,1)};std::vector<int> requests;
+    for(int id=2;id<=6;++id){graph.nodes.push_back(defaultNode(NodeKind::ImagePreview,id));graph.links.push_back({1,0,id,1});requests.push_back(id);}
+    int converted=0;fixture.context.preview=[&](const Value&,const DetectionStream&,const Node&){++converted;auto image=std::make_shared<PreviewImage>();image->width=image->height=1;image->rgba.resize(4,255);return Preview(image);};
+    publish(service,workspace);service.setPreviewNodes(requests);service.evaluateVision(fixture.context);
+    require(converted==MaxLivePreviews,"Visible previews exceeded the conversion budget");
+    service.setPreviewNodes({2});const auto capture=fixture.context.captureFrame;
+    fixture.context.captureFrame=[&](int key,const Node& node){service.setPreviewNodes({});return capture(key,node);};
+    std::this_thread::sleep_for(std::chrono::milliseconds(75));service.evaluateVision(fixture.context);
+    require(converted==MaxLivePreviews,"A preview converted pixels after it was hidden during provider evaluation");
+}
 void testNodeBindings()
 {
     testEveryOptionHasATypedInput();testBoundOptionsReachNativeCallbacks();testWideOptionMasksAndTextOutputs();
     testMonitorsConfigureCaptureBeforeAFrameExists();testNamedValuesAndLazySelection();testAllInputGeometryAndDeepGraphs();testWiredKeyOverridesNoneFallback();
     testLocalScalarInputsExecuteAndFollowWires();testLocalInputTypesAndPersistence();
+    testUnavailableEnableDoesNotInventAnError();
+    testPreviewIsVisibleOnlyLazyAndThrottled();testPreviewCountAndCancellationAreBounded();
 }
 }

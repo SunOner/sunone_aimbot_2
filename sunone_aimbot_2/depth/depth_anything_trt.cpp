@@ -5,6 +5,7 @@
 #endif
 
 #include "depth_anything_trt.h"
+#include "model_path.h"
 
 #include <NvOnnxParser.h>
 #include <algorithm>
@@ -36,100 +37,11 @@ namespace depth_anything
             return true;
         }
 
-        bool PathComponentEquals(const std::filesystem::path& left, const std::filesystem::path& right)
-        {
-#ifdef _WIN32
-            const std::string leftStr = left.string();
-            const std::string rightStr = right.string();
-            return OtherTools::ToLowerAscii(leftStr) == OtherTools::ToLowerAscii(rightStr);
-#else
-            return left == right;
-#endif
-        }
-
-        bool PathStartsWith(const std::filesystem::path& path, const std::filesystem::path& prefix)
-        {
-            auto pathIt = path.begin();
-            auto prefixIt = prefix.begin();
-            for (; prefixIt != prefix.end(); ++prefixIt, ++pathIt)
-            {
-                if (pathIt == path.end())
-                {
-                    return false;
-                }
-                if (!PathComponentEquals(*pathIt, *prefixIt))
-                {
-                    return false;
-                }
-            }
-            return true;
-        }
-
-        bool ContainsParentTraversal(const std::filesystem::path& path)
-        {
-            for (const auto& part : path)
-            {
-                if (part == "..")
-                {
-                    return true;
-                }
-            }
-            return false;
-        }
-
         std::string MakeEnginePathFromOnnx(const std::string& onnxPath)
         {
-            std::filesystem::path enginePath(onnxPath);
+            std::filesystem::path enginePath=std::filesystem::u8path(onnxPath);
             enginePath.replace_extension(".engine");
-            return enginePath.string();
-        }
-
-        bool ResolveDepthModelPath(const std::string& modelPath, std::string& resolvedPath, std::string& error)
-        {
-            if (modelPath.empty())
-            {
-                error = "Depth model path is empty.";
-                return false;
-            }
-
-            std::filesystem::path requested(modelPath);
-            if (ContainsParentTraversal(requested))
-            {
-                error = "Depth model path must stay inside depth_models.";
-                return false;
-            }
-
-            const std::filesystem::path base = std::filesystem::path("depth_models").lexically_normal();
-            std::filesystem::path resolved = requested;
-            if (!requested.is_absolute() && !requested.has_root_name() && !requested.has_root_directory())
-            {
-                if (!PathStartsWith(requested, base))
-                {
-                    resolved = base / requested;
-                }
-            }
-            else
-            {
-                resolved = requested;
-            }
-
-            resolved = resolved.lexically_normal();
-            const std::filesystem::path baseAbs = std::filesystem::absolute(base).lexically_normal();
-            const std::filesystem::path resolvedAbs = std::filesystem::absolute(resolved).lexically_normal();
-            std::error_code ec;
-            if (!std::filesystem::exists(baseAbs, ec) || ec || !std::filesystem::is_directory(baseAbs, ec) || ec)
-            {
-                error = "Depth model directory not found: " + baseAbs.string();
-                return false;
-            }
-            if (!PathStartsWith(resolvedAbs, baseAbs))
-            {
-                error = "Depth model path must stay inside depth_models.";
-                return false;
-            }
-
-            resolvedPath = resolvedAbs.string();
-            return true;
+            return enginePath.u8string();
         }
 
         bool CheckCuda(cudaError_t status, const char* action, std::string& last_error)
@@ -240,12 +152,12 @@ namespace depth_anything
         max_input_size = kMaxInputSize;
 
         std::string resolvedPath;
-        if (!ResolveDepthModelPath(modelPath, resolvedPath, last_error))
+        if (!resolveModelPath(modelPath, resolvedPath, last_error))
         {
             return false;
         }
 
-        if (!std::filesystem::exists(resolvedPath))
+        if (!std::filesystem::exists(std::filesystem::u8path(resolvedPath)))
         {
             last_error = "Depth model file not found: " + resolvedPath;
             return false;
@@ -424,7 +336,7 @@ namespace depth_anything
         reset();
 
         std::string resolvedPath;
-        if (!ResolveDepthModelPath(modelPath, resolvedPath, last_error))
+        if (!resolveModelPath(modelPath, resolvedPath, last_error))
         {
             return false;
         }
@@ -435,7 +347,7 @@ namespace depth_anything
             return false;
         }
 
-        if (!std::filesystem::exists(resolvedPath))
+        if (!std::filesystem::exists(std::filesystem::u8path(resolvedPath)))
         {
             last_error = "Depth model file not found: " + resolvedPath;
             return false;
@@ -659,7 +571,7 @@ namespace depth_anything
             return true;
         }
 
-        std::ifstream engineStream(modelPath, std::ios::binary);
+        std::ifstream engineStream(std::filesystem::u8path(modelPath), std::ios::binary);
         if (!engineStream.is_open())
         {
             last_error = "Unable to open depth engine: " + modelPath;
@@ -876,7 +788,7 @@ namespace depth_anything
             last_error = "Failed to serialize depth engine.";
             return false;
         }
-        std::ofstream file(engine_path, std::ios::binary | std::ios::out);
+        std::ofstream file(std::filesystem::u8path(engine_path), std::ios::binary | std::ios::out);
         if (!file.is_open())
         {
             last_error = "Unable to write depth engine: " + engine_path;

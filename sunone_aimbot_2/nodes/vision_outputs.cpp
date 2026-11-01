@@ -358,6 +358,7 @@ void retainVisionOutputs(const Actions& actions)
     // state while the output remains registered; remove it on actual deletion,
     // bypass, parameter disable, or an unreachable output branch instead.
     for(const auto& node:NodeGraph::service().providerNodes(NodeKind::CollectDataset))collectorKeys.push_back(visionKey(node));
+    for(const auto& node:NodeGraph::service().providerNodes(NodeKind::DatasetOutput))collectorKeys.push_back(visionKey(node));
     for(const auto& node:NodeGraph::service().providerNodes(NodeKind::ScreenshotOutput))screenshotKeys.push_back(visionKey(node));
     retainVisionOutputs(actions.activeDepthKeys,collectorKeys,actions.activeRenderKeys);
     std::lock_guard<std::mutex> lock(statesMutex);

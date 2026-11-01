@@ -241,7 +241,7 @@ void testVisionExecutionAndLaziness()
     require(action.activeProviderKeys.size()==2&&action.activeDepthKeys.empty()&&action.activeMaskKeys.empty(),"Vision activity must identify actual providers only");
     Service wiredService;VisionFixture wiredFixture;auto wired=defaults();auto& wiredVision=wired.graphs[3];
     auto gate=defaultNode(NodeKind::Boolean,50);gate.value=0;wiredVision.nodes.push_back(gate);wiredVision.links.push_back({50,0,12,0});
-    publish(wiredService,wired);require(wiredService.providerNodes(NodeKind::CollectDataset).size()==1,"Wired auxiliary enables must retain registered providers while the trigger is false");
+    publish(wiredService,wired);require(wiredService.providerNodes(NodeKind::DatasetOutput).size()==1,"Wired auxiliary enables must retain registered providers while the trigger is false");
     wiredService.evaluateVision(wiredFixture.context);require(wiredFixture.collections==0,"A false wired enable must keep its auxiliary output inactive");
     node(wiredVision,50).value=1;publish(wiredService,wired);wiredService.evaluateVision(wiredFixture.context);
     require(wiredFixture.collections==1,"Wired enable must override the detached enabled parameter");
@@ -264,7 +264,7 @@ void testVisionDepthOrderingAndOptionalOutputs()
 void testVisionOptionalDepthFailure()
 {
     Service service;VisionFixture vision;auto workspace=defaults();auto& graph=workspace.graphs[3];
-    node(graph,13).parameters["enabled"]=1;node(graph,13).parameters["depth_debug_overlay_enabled"]=1;node(graph,3).parameters["enabled"]=1;
+    node(graph,13).parameters["enabled"]=1;settings(workspace,NodeKind::OverlayDepth,"depth_debug_overlay_enabled",1);node(graph,3).parameters["enabled"]=1;
     vision.unsupportedDepth=true;publish(service,workspace);auto action=service.evaluateVision(vision.context);
     require(action.visionDetections&&vision.renders==1&&!vision.renderedDepth,"Unavailable optional depth must not stop ordinary frame/detection rendering");
     const auto telemetry=service.telemetry();const auto found=std::find_if(telemetry.graphs[3].begin(),telemetry.graphs[3].end(),[](const NodeValue& value){return value.nodeId==3;});
@@ -429,6 +429,39 @@ void testWireTiesArePersistentVisualMetadata()
     invalid=workspace;invalid.graphs[0].ties[0].angle=std::numeric_limits<float>::infinity();require(!validate(invalid,error),"Invalid tie rotation must be rejected");
     graph.ties[0].x+=32;graph.ties[0].angle=-90;publish(service,workspace);require(service.revision()==revision,"Moving a tie reset running graph state");
 }
+void testWireBendsArePersistentVisualMetadata()
+{
+    Service service;auto workspace=defaults();publish(service,workspace);const auto revision=service.revision();
+    workspace.graphs[0].links[0].bend={0.25f,-0.75f};workspace.graphs[0].links[1].bend={1,1};
+    publish(service,workspace);require(service.revision()==revision,"Changing wire curvature restarted graph execution");
+    std::string text,error;Workspace restored;
+    require(serialize(workspace,text,error)&&deserialize(text,restored,error),"Wire bend export/import failed");
+    require(restored.graphs[0].links[0].bend.roundness==0.25f&&restored.graphs[0].links[0].bend.twist==-0.75f&&
+        restored.graphs[0].links[1].bend.roundness==1&&restored.graphs[0].links[1].bend.twist==1,"Wire bends lost precision or ordering on export/import");
+    for(const auto bend:{WireBend{-0.01f,0},WireBend{1.01f,0},WireBend{0.5f,-1.01f},WireBend{0.5f,1.01f},
+        WireBend{std::numeric_limits<float>::infinity(),0},WireBend{0.5f,std::numeric_limits<float>::quiet_NaN()}})
+    {
+        auto invalid=workspace;invalid.graphs[0].links[0].bend=bend;
+        require(!validate(invalid,error),"An out-of-range or non-finite wire bend was accepted");
+    }
+    // Version 12 already has all node settings but no wire curvature fields.
+    std::istringstream input(text);std::ostringstream legacy;std::string line;
+    while(std::getline(input,line))
+    {
+        if(line.rfind("SUNONE_NODE_GRAPH ",0)==0)line="SUNONE_NODE_GRAPH 12";
+        else if(line.rfind("LINK ",0)==0)
+        {
+            std::istringstream fields(line);std::string token;int from=0,out=0,to=0,in=0;std::size_t ties=0;
+            fields>>token>>from>>out>>to>>in>>ties;std::ostringstream link;
+            link<<token<<' '<<from<<' '<<out<<' '<<to<<' '<<in<<' '<<ties;
+            for(std::size_t i=0;i<ties;++i){int id=0;fields>>id;link<<' '<<id;}line=link.str();
+        }
+        legacy<<line<<'\n';
+    }
+    require(deserialize(legacy.str(),restored,error),"Version 12 workflows no longer load");
+    for(const auto& graph:restored.graphs)for(const auto& link:graph.links)
+        require(link.bend.roundness==WireBend{}.roundness&&link.bend.twist==0,"Old workflows received a non-neutral manual bend");
+}
 void testLayoutFitsExpandedNodesAndNestedGroups()
 {
     auto workspace=defaults();
@@ -499,6 +532,36 @@ void testHistoricalStarterLayoutMigrationPreservesWiring()
     legacy.groups[0].title="Custom stage";legacy.nodes[0].x+=64;
     require(!migrateStarterLayout(legacy),"Loading overwrote a custom layout");
 }
+void testSplitStarterWorkflowMigratesWithoutChangingLogic()
+{
+    auto workspace=defaults();auto& graph=workspace.graphs[3];
+    std::vector<int> outputs{11,12,13};
+    for(const auto& entry:graph.nodes)if((entry.kind>=NodeKind::OverlayBoxes&&entry.kind<=NodeKind::OverlayCorrection)||entry.kind==NodeKind::DatasetLabels)outputs.push_back(entry.id);
+    graph.groups={{1,"01 Capture and depth",0,0,256,192,0x40ffcd60u,{1,3,4}},
+        {2,"02 Model inference",0,0,256,192,0x40ff93adu,{5,2}},
+        {3,"03 Detection filters",0,0,256,192,0x40adde66u,{6,7,8,9,10}},
+        {4,"04 Vision and visual outputs",0,0,256,192,0x40ffcd60u,outputs},
+        {5,"05 Screenshots",0,0,256,192,0x40ff93adu,{15,14}}};
+    Layout::arrange(graph,6);
+    node(graph,1).parameters["capture_fps"]=237;node(graph,13).collapsed=true;
+    const auto old=graph;
+    Service service;publish(service,workspace);const auto revision=service.revision();
+    require(migrateStarterLayout(graph),"The previously shipped split workflow was not recognized");
+    publish(service,workspace);
+    require(service.revision()==revision&&graph.nodes.size()==old.nodes.size()&&graph.links.size()==old.links.size()&&
+        parameter(node(graph,1),"capture_fps")==237&&node(graph,13).collapsed,"Workflow migration changed runtime logic, settings or node state");
+    for(std::size_t i=0;i<old.links.size();++i)require(std::tie(graph.links[i].fromNode,graph.links[i].fromPort,graph.links[i].toNode,graph.links[i].toPort)==
+        std::tie(old.links[i].fromNode,old.links[i].fromPort,old.links[i].toNode,old.links[i].toPort),"Workflow migration changed a wire");
+    require(graph.groups.size()==6,"The default output branches were not separated into their stages");
+    const auto owner=[&](int id){for(const auto& group:graph.groups)if(std::find(group.nodes.begin(),group.nodes.end(),id)!=group.nodes.end())return group.id;return 0;};
+    require(owner(11)==owner(10)&&owner(12)!=owner(13)&&owner(14)!=owner(13),"Vision, dataset, overlay and screenshot outputs are still mixed together");
+    float oldRight=0,newRight=0;
+    for(const auto& group:old.groups)oldRight=std::max(oldRight,group.x+group.width);
+    for(const auto& group:graph.groups){newRight=std::max(newRight,group.x+group.width);require(group.width<=1408,"A default stage still stretches across too many columns");}
+    require(newRight<oldRight*0.8f,"The default workflow did not become more compact");
+    require(!Layout::arrange(graph)&&!migrateStarterLayout(graph),"The new default workflow changes on every arrangement/load");
+    graph=old;node(graph,1).x+=32;require(!migrateStarterLayout(graph),"A manually moved node was mistaken for shipped geometry");
+}
 void testManualDimensionsAreDurablePresentationOnly()
 {
     auto workspace=defaults();Service service;publish(service,workspace);const auto revision=service.revision();
@@ -530,9 +593,10 @@ void testDisableIsDistinctFromBypassAndPersists()
 }
 }
 #include "node_graph_binding_tests.h"
+#include "node_output_layers_tests.h"
 int main()
 {
-    try{testLayoutFitsExpandedNodesAndNestedGroups();testHistoricalStarterLayoutMigrationPreservesWiring();testManualDimensionsAreDurablePresentationOnly();testIntegerArithmeticAndConversions();testIntegerTargetPropertiesKeepLegacyConnections();testNodeBindings();}
+    try{testLayoutFitsExpandedNodesAndNestedGroups();testHistoricalStarterLayoutMigrationPreservesWiring();testSplitStarterWorkflowMigratesWithoutChangingLogic();testManualDimensionsAreDurablePresentationOnly();testIntegerArithmeticAndConversions();testIntegerTargetPropertiesKeepLegacyConnections();testNodeBindings();testOutputLayers();testWireBendsArePersistentVisualMetadata();}
     catch(const std::exception& error){std::cerr<<"Node layout test failed: "<<error.what()<<'\n';return 1;}
     try{testDefaultExecution();testPayloadAndFilters();testPerNodeSettingsAndPorts();testBranchActivityAndBypass();testKeyEvents();testCapturedInputDoesNotCreateEdges();testIncompleteAndValidation();testMovementMetadataAndTiming();testPersistence();testWireTiesArePersistentVisualMetadata();testDisableIsDistinctFromBypassAndPersists();testRealSignalTelemetryAndBriefEdges();testFrameSignalsIgnoreRepaintsAndMonitoringCanSleep();testNewInputEventsPropagateThroughUnchangedValues();testVisionExecutionAndLaziness();testVisionDepthOrderingAndOptionalOutputs();testVisionOptionalDepthFailure();testMultipleInferenceAndCaptureConstraint();testVisionProviderFailureIsolation();testConcurrentVisionAndControl();testScreenshotOutput();std::cout<<"Node graph tests passed\n";return 0;}
     catch(const std::exception& error){std::cerr<<"Node graph test failed: "<<error.what()<<'\n';return 1;}
