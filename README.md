@@ -132,4 +132,10 @@ This project is actively developed thanks to the people who support it on [Boost
 
 ## Star History
 
-[![Star History Chart](https://star-history.dera.page/svg?repos=SunOner/sunone_aimbot_2&type=date&legend=top-left)](https://star-history.dera.page/#SunOner/sunone_aimbot_2&type=date&legend=top-left)
+<a href="https://www.star-history.com/?repos=SunOner%2Fsunone_aimbot_2&amp;type=date&amp;legend=top-left">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=SunOner/sunone_aimbot_2&amp;type=date&amp;theme=dark&amp;legend=top-left" />
+    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=SunOner/sunone_aimbot_2&amp;type=date&amp;legend=top-left" />
+    <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=SunOner/sunone_aimbot_2&amp;type=date&amp;legend=top-left" />
+  </picture>
+</a>
