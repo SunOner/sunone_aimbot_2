@@ -18,11 +18,24 @@ HWND g_hwnd = nullptr;
 ID3D11Device* g_pd3dDevice=nullptr;
 ID3D11DeviceContext* g_pd3dDeviceContext=nullptr;
 std::vector<std::string> key_names{"None", "F2", "F6"};
-void Overlay_ExpandForNodes() {}
+#include "../sunone_aimbot_2/overlay/window_geometry.h"
+OverlayWindowGeometry::Presentation testWindowPresentation;
+bool testOverlayHidden=false;
+OverlayWindowGeometry::Mode Overlay_GetWindowMode() { return testWindowPresentation.mode; }
+void Overlay_ToggleMaximized() { testWindowPresentation.toggleMaximized({80,60,1100,740}); }
+void Overlay_ToggleFullscreen() { testWindowPresentation.toggleFullscreen({80,60,1100,740}); }
+void Overlay_Hide() { testOverlayHidden=true; }
+#include "../sunone_aimbot_2/overlay/source_choices.h"
+namespace SourceChoices {std::vector<Choice> enumerate(bool camera){return camera?std::vector<Choice>{{"Test camera","Camera"}}:std::vector<Choice>{{"Test window","Window"}};}}
 #include "../sunone_aimbot_2/overlay/node_editor.cpp"
 #include "imgui/imgui_internal.h"
 #include <iostream>
 #include <stdexcept>
+namespace cvm
+{
+DataCollectionUiState GetDataCollectionNodeUiState(int){return {};}
+void ResetDataCollectionNodeCounters(int){}
+}
 
 Config config{};
 
@@ -51,11 +64,14 @@ struct EditorHarness
     ImVec2 origin{};
     float windowWidth=1100;
     int graphIndex=0;
+    int workflow=0;
     std::string clipboard;
     std::vector<ImDrawVert> vertices;
 
     EditorHarness()
     {
+        testWindowPresentation={};
+        testOverlayHidden=false;
         ImGui::CreateContext();
         auto& io = ImGui::GetIO();
         io.DisplaySize = ImVec2(1200, 800);
@@ -113,8 +129,9 @@ struct EditorHarness
         ImGui::SetNextWindowSize(ImVec2(windowWidth, 740), ImGuiCond_Always);
         ImGui::Begin("Input regression", nullptr, ImGuiWindowFlags_NoDecoration |
             ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings);
-        drawEditor(graphIndex);
-        origin = editor.canvasOrigin[graphIndex];
+        if(workflow){draw_node_workflow(workflow);graphIndex=activePage(service().workspaceMetadata(),workflow);}
+        else drawEditor(graphIndex);
+        if(graphIndex>=0)origin = editor.canvasOrigin[graphIndex];
         const auto* draw = ImGui::GetWindowDrawList();
         vertices.assign(draw->VtxBuffer.begin(), draw->VtxBuffer.end());
         ImGui::End();
@@ -400,7 +417,7 @@ void testResizeCancellationMinimumAndGroupBounds()
         editor.redo.push_back(editor.draft);
         const auto grip=canvasAt(h,254,224);h.move(grip);h.button(ImGuiMouseButton_Left,true);
         h.move(add(grip,ImVec2(64,96)));
-        require(editor.resizeNode==1&&findGroup(h.graph(),1)->width>=320&&findGroup(h.graph(),1)->height>=352,"Resize did not grow the containing frame");
+        require(editor.resizeNode==1&&findGroup(h.graph(),1)->width==256&&findGroup(h.graph(),1)->height==288,"Resizing a node implicitly stretched its former group frame");
         if(cancellation==0){h.key(ImGuiKey_Escape,true);h.key(ImGuiKey_Escape,false);}
         if(cancellation==1){h.button(ImGuiMouseButton_Right,true);h.button(ImGuiMouseButton_Right,false);}
         if(cancellation==2)NodeEditor_EndInteraction();
@@ -497,8 +514,8 @@ void testGroupDragAndResizeAcrossZoom()
         const auto shrink = canvasAt(harness, group->x + group->width - 6, group->y + group->height - 6);
         harness.drag(shrink, add(shrink, ImVec2(-400 * zoom, -400 * zoom)));
         group = findGroup(harness.graph(),1);
-        require(group->width >= 512 && group->height >= 160,
-            "Group resize allowed registered nodes to escape its bounds");
+        require(group->width >= 128 && group->height >= 96&&group->nodes.empty(),
+            "Shrinking a group retained members outside its bounds");
     }
 }
 
@@ -681,7 +698,7 @@ void testInsertedRerouteMovesWithItsCommonGroup()
         gestureScenario="Inserted reroute group membership at zoom "+std::to_string(zoom);
         EditorHarness harness;
         arrangeCompactFixture(harness,zoom);
-        harness.graph().groups = {{1,"Common endpoint group",32,32,512,160,0x40ffcd60u,{1,2}}};
+        harness.graph().groups = {{1,"Common endpoint group",32,32,512,224,0x40ffcd60u,{1,2}}};
         harness.graph().links = {{1,0,2,0}};
         harness.frame();
         const auto source=harness.port(1,true),destination=harness.port(2,false);
@@ -708,7 +725,7 @@ void testInsertedRerouteMovesWithItsCommonGroup()
     gestureScenario="Inserted reroute expands common group frame";
     EditorHarness harness;
     arrangeCompactFixture(harness,1);
-    harness.graph().groups={{1,"Small common frame",32,32,512,160,0x40ffcd60u,{1,2}}};
+    harness.graph().groups={{1,"Small common frame",32,32,512,224,0x40ffcd60u,{1,2}}};
     harness.graph().links={{1,0,2,0}};
     insertReroute(harness.graph(),0,ImVec2(608,352),0);
     const auto* group=findGroup(harness.graph(),1);
@@ -753,11 +770,13 @@ void testWireContextKeepsRerouteAvailable()
     require(findNode(h.graph(),editor.selected[0])->kind==NodeKind::RerouteBoolean,"Wire menu inserted an incompatible reroute");
 }
 
-ImVec2 inlineField(EditorHarness& h,int id,float y=0,float x=70)
+LocalSettingsRow localFieldRow(EditorHarness& h,int id)
 {
-    const auto* node=findNode(h.graph(),id);const auto panel=settingsRect(h.graph(),h.origin,*node);
-    return add(panel.Min,ImVec2(x*h.graph().zoom,(y+16.5f)*h.graph().zoom));
+    const auto* node=findNode(h.graph(),id);const auto panel=settingsRect(h.graph(),h.origin,*node);const float scale=h.graph().zoom;
+    return localSettingsRow(add(panel.Min,ImVec2(5*scale,6*scale)),panel.GetWidth()-21*scale,ImGui::GetStyle().FontSizeBase*scale,scale);
 }
+ImVec2 inlineField(EditorHarness& h,int id)
+{return localFieldRow(h,id).value.GetCenter();}
 ImVec2 defaultField(EditorHarness& h,int id,int pin)
 {
     const auto& node=*findNode(h.graph(),id);const auto& input=definition(node.kind).inputs[pin];
@@ -794,17 +813,17 @@ void testInlineSettingsApplyAndOwnMouse()
         gestureScenario="Inline settings and mouse ownership at zoom "+std::to_string(zoom);
         EditorHarness h;h.graph().zoom=zoom;h.frame();
         const auto beforeX=findNode(h.graph(),1)->x,beforeY=findNode(h.graph(),1)->y;
-        h.click(inlineField(h,1,0,15));requireNoFieldGesture();
+        h.click(localFieldRow(h,1).label.GetCenter());requireNoFieldGesture();
         require(findNode(h.graph(),1)->value==0&&service().workspace().graphs[0].nodes[0].value==0,"Inline boolean did not apply immediately");
         history(false);h.frame();require(findNode(h.graph(),1)->value==1,"Inline checkbox did not create an undo entry");
         const auto panel=settingsRect(h.graph(),h.origin,*findNode(h.graph(),1));
-        const auto toggle=add(panel.Min,ImVec2((CardWidth-12-22)*zoom,16*zoom));
+        const auto toggle=inlineField(h,1);
         h.move(canvasAt(h,850,400));
         ImGui::GetIO().AddMousePosEvent(toggle.x,toggle.y);ImGui::GetIO().AddMouseButtonEvent(ImGuiMouseButton_Left,true);h.frame();
         h.button(ImGuiMouseButton_Left,false);requireNoFieldGesture();
         require(findNode(h.graph(),1)->value==0,"A switch missed a press coalesced with mouse entry");
         require(editor.canvasRoutes[0].displays[0].settingsContent<=nodeSettingsHeight(*findNode(h.graph(),1)),"A single switch created unnecessary settings scrolling");
-        replaceInlineText(h,inlineField(h,3,17),"42.5");
+        replaceInlineText(h,inlineField(h,3),"42.5");
         require(findNode(h.graph(),3)->value==42.5&&service().workspace().graphs[0].nodes[2].value==42.5,"Inline constant did not publish its entered value");
         history(false);h.frame();require(findNode(h.graph(),3)->value==0,"Undo did not restore the inline constant");
         require(findNode(h.graph(),1)->x==beforeX&&findNode(h.graph(),1)->y==beforeY,"Editing a setting moved its node");
@@ -823,7 +842,7 @@ void testIntegerInlineAndTypedConnections()
     EditorHarness h;h.graph().nodes={defaultNode(NodeKind::Integer,1,64,64),defaultNode(NodeKind::ToFloat,2,416,64),
         defaultNode(NodeKind::Float,3,64,288),defaultNode(NodeKind::IntegerAdd,4,416,288)};
     h.graph().links.clear();h.graph().groups.clear();edited();h.frame();
-    replaceInlineText(h,inlineField(h,1,17),"2147483647");
+    replaceInlineText(h,inlineField(h,1),"2147483647");
     require(findNode(h.graph(),1)->value==MaxInteger&&findNode(service().workspace().graphs[0],1)->value==MaxInteger,"Int field lost precision or failed to publish immediately");
     require(editor.canvasRoutes[0].displays[0].text=="2147483647","Int value was formatted with decimals or throttled after an edit");
     history(false);h.frame();require(findNode(h.graph(),1)->value==0,"Integer field was not undoable");
@@ -1606,7 +1625,7 @@ void testGroupMoveAndRightSelectionIncludeTies()
     EditorHarness h;arrangeTieFixture(h,1);std::vector<TieHit> hits;std::string error;
     for(const auto& link:h.graph().links)hits.push_back({linkKey(link),0,{}});
     require(createWireTie(h.graph(),0,hits,ImVec2(320,192),0,error),error.c_str());
-    h.graph().groups={{1,"Tied group",0,0,832,416,0x40ffcd60u,{1,2,3,4,5,6}}};edited(false);h.frame();
+    h.graph().groups={{1,"Tied group",0,0,832,480,0x40ffcd60u,{1,2,3,4,5,6}}};edited(false);h.frame();
     const auto header=canvasAt(h,120,14);h.fastDrag(header,add(header,ImVec2(40,40)));
     require(h.graph().ties[0].x==352&&h.graph().ties[0].y==224&&findNode(h.graph(),1)->x==64,"Moving the common group left its tie behind");
     h.drag(canvasAt(h,340,212),canvasAt(h,364,236),ImGuiMouseButton_Right);
@@ -1914,65 +1933,108 @@ void testDisplayCacheRefreshesAfterRevisionAndReopen()
 #include "node_editor_menu_tests.h"
 #include "node_catalog_search_tests.h"
 #include "node_catalog_preview_tests.h"
+#include "node_editor_workflow_tests.h"
+#include "node_editor_migration_audit_tests.h"
+#include "node_group_connection_tests.h"
+
+namespace
+{
+void testWindowButtonsStayOrderedAndReachable()
+{
+    for(float width:{220.0f,240.0f,358.0f,420.0f,610.0f,640.0f,680.0f,1100.0f})
+    {
+        EditorHarness h;h.windowWidth=width;h.frame();
+        const auto count=editor.toolbarItemCount;
+        require(count>=5&&count<=editor.toolbarItems.size(),"Window controls exceeded the native toolbar hit-test cache");
+        const auto help=editor.toolbarItems[count-4],hide=editor.toolbarItems[count-3],maximize=editor.toolbarItems[count-2],fullscreen=editor.toolbarItems[count-1];
+        require(help.y==hide.y&&hide.y==maximize.y&&maximize.y==fullscreen.y&&hide.x-help.z==4&&maximize.x-hide.z==4&&fullscreen.x-maximize.z==4,
+            "Help, hide, maximize and fullscreen are not ordered on one row");
+        require(fullscreen.z<=20+width&&help.x>=20,"Window controls fell outside a narrow toolbar");
+        require(NodeEditor_ToolbarContainsPoint(hide.x+16,hide.y+16)&&NodeEditor_ToolbarContainsPoint(maximize.x+16,maximize.y+16)&&NodeEditor_ToolbarContainsPoint(fullscreen.x+16,fullscreen.y+16),
+            "Native window dragging swallowed a window button");
+        const auto clickControl=[&](std::size_t offset){const auto r=editor.toolbarItems[editor.toolbarItemCount-offset];h.click({r.x+16,r.y+16});};
+        const auto revision=service().revision();const auto panX=h.graph().panX,panY=h.graph().panY,zoom=h.graph().zoom;
+        clickControl(2);require(Overlay_GetWindowMode()==OverlayWindowGeometry::Mode::Maximized,"Maximize button did not expand the window");
+        clickControl(1);require(Overlay_GetWindowMode()==OverlayWindowGeometry::Mode::Fullscreen,"Fullscreen button did not enter fullscreen");
+        clickControl(1);require(Overlay_GetWindowMode()==OverlayWindowGeometry::Mode::Maximized,"Leaving fullscreen forgot the previous maximized mode");
+        clickControl(2);require(Overlay_GetWindowMode()==OverlayWindowGeometry::Mode::Windowed,"Maximize button did not restore the original window");
+        require(!editor.dragNode&&!editor.wireNode&&editor.panButton<0&&service().revision()==revision&&h.graph().panX==panX&&h.graph().panY==panY&&h.graph().zoom==zoom,
+            "Window buttons modified graph navigation or started a canvas gesture");
+        clickControl(3);require(testOverlayHidden,"Hide button did not request overlay hiding");
+        require(service().revision()==revision&&!editor.dragNode&&!editor.wireNode&&editor.panButton<0,"Hide button changed the graph or started a canvas gesture");
+        clickControl(4);require(ImGui::IsPopupOpen(nullptr,ImGuiPopupFlags_AnyPopupId),"Help was lost when moving window controls");
+    }
+}
+}
+
 int main(int argc,char** argv)
 {
     try
     {
         if(argc>1&&std::string(argv[1])=="--benchmark")return benchmarkNodeEditor(argc>2?argv[2]:"benchmark_results/node_editor.csv",argc>3?argv[3]:"");
-        testPreviewVisibilityFollowsTheImagePanel();testPreviewTexturesUploadAndReuseActualPixels();
-        testOptionEditorBindings();testOutputToInputAndPreview(); testShortPreviewDoesNotLoop(); testInputToOutputAndReplacement();
-        testEveryCardSizeFollowsTheGrid();testFreeDragShowsItsGridDestinationAcrossZoom();testFreeMoveCancelsWithoutSavingOrNoopHistory();testGroupsAndReroutesHaveFreePlacementPreviews();
-        testEmptyDoubleClickCreatesOneRerouteAcrossZoomAndTabs();testEmptyDoubleClickRespectsGroupsToolsAndLimits();testLooseReroutesAdaptToTheFirstConnection();testMouseMenuHoverDoesNotHighlightAnUnrelatedFirstItem();
-        testCatalogSearchAddsWithTabAndEnter();testCatalogArrowsKeepSearchFocusAndScroll();testCatalogNoResultsAndEscapeAreSafe();testCatalogSearchQuickAddPreservesExistingConnections();testEmptyCatalogCanBrowseWithArrows();
-        testCatalogSearchMouseSelectionAndCreationErrors();
-        testCatalogOpeningFrameInputIsPreserved();
-        testCatalogSearchPopupFitsTheViewport();
-        testCatalogPreviewTracksSelectionWithoutExecuting();testCatalogPreviewShowsDefaultsAndBoundsLargeNodes();testCatalogPreviewPlacementAvoidsMenusAtViewportEdges();
-        testCatalogPreviewScrollDoesNotDismissMenusOrMoveTheGraph();
-        testCatalogCardWrapsFullValuesAndReusesLayout();
-        testCatalogPreviewFollowsEveryHoveredSubmenuRow();testCatalogSearchPreviewFollowsMouseRows();
-        testNearestCompactPin(); testPortWinsOverLaterBody();
-        testCancelInvalidAndOutside(); testRightClickCancelsAndWheelDoesNotMoveGesture();
-        testAltDisconnect(); testShiftSelectionAndSnappedDrag(); testMiddlePanAndWheelAnchor(); testPopupBlocksGraphShortcuts();
-        testGroupDragAndResizeAcrossZoom(); testAdditiveMarqueeAndMultiDragAcrossZoom();
-        testRerouteBodyAndPortsAcrossZoom(); testCollapseAndCollapsedPortsAcrossZoom();
-        testNodeResizeEdgesAndCoalescedRelease();testResizeCancellationMinimumAndGroupBounds();testManualSizeSurvivesCollapseClipboardAndSaving();testResizePresetsUseCardSpaceAndKeepPortsAccessible();
-        testSemanticZoomKeepsCardAndPortGeometry();testOverviewCaptionsFitAndReuseTheirLayout();testOverviewBodyRemainsSelectableAndDraggable();
-        testGroupHeaderWinsOverWireDoubleClick();
-        testInsertedRerouteMovesWithItsCommonGroup();testOverlappingGroupControlsUseOneTopmostTarget();
-        testDoubleClickCutsWireAcrossZoom();testWireContextKeepsRerouteAvailable();
-        testInlineSettingsApplyAndOwnMouse();testIntegerInlineAndTypedConnections();testSignalTypeColorsSurviveWireStates();testInputSettingsAndSemanticZoom();testStarterLayoutAccommodatesSettings();
-        testArrangeGraphIsUndoableAndKeepsExecution();
-        testLegacyCustomLayoutExpandsOnce();
-        testInlinePathsAndDrivenSettings();
-        testCoalescedReleaseFinalizesEveryDrag();testReleaseBackAtOriginRestoresDrag();
-        testComboAnimationAdvancesOnceAndRespectsParentAlpha();
-        testRerouteIsRenderedAsOnePoint();testReroutePointAcceptsBothWireDirections();
-        testWireAnimationIsContinuousAcrossGeometryAndZoom();testWireSplinesAreSmoothAndScaleInvariant();testWirePositionsFollowTheDrawnArcLength();
-        testManualBendGesturesAcrossZoom();testBendCancellationAndFineControl();testManualBendsKeepTiesClipboardAndCache();testBendHandlesRespectOtherControls();
-        testSelectionClipboardIsPortableAndTransactional();
-        testQuickAddConnectsBothDirectionsAndKeepsOldInputUntilSuccess();
-        testPropertiesPanelAndSelectionFocus();testPropertiesRemainUsableInNarrowEditor();
-        testImportedLayoutSnapsWithoutShrinkingGroups();testFailedLoadCannotAutosaveOverTheOriginal();
-        testNavigationUsesTheEntireGestureAndRightClickRelease();testRightSelectionNeverPansOrMovesNodes();
-        testCatalogSubmenusOpenOnHoverAndCreateANode();
-        testWireTieGestureMovementRotationAndClipboard();testTieCancellationAndOrderedRerouteSplit();
-        testGroupMoveAndRightSelectionIncludeTies();
-        testTieRotationUsesFifteenDegreeSteps();
-        testLibrarySelectionAndNodeStateShortcuts();testKeyboardMoveAndDuplicateAreTransactional();
-        testCutCrossedConnectionsWithControlRightDrag();
-        testCutAnimationRetractsAndHasAFixedBudget();
-        testMouseConfirmsKeyboardMoveAndHelpOpens();
-        testGroupKeyboardMoveDuplicateAndClipboard();testLeavingEditorCancelsPreviewAndDefersAutosave();
-        testKeyboardPortsConnectFollowAndDisconnect();testControlSaveWorksFromProperties();
-        testCatalogCanBeTraversedWithKeyboard();testZGestureRemovesCrossedTiesWithoutCuttingWires();
-        testRouteCacheInvalidationAndAffineNavigation();testHotNodeDisplayIsThrottledAndEditsAreImmediate();testOutputWaitingAndRealErrorsRemainDistinct();testLargeGraphAnimationAndTextBudgets();
-        testDisplayCacheRefreshesAfterRevisionAndReopen();
+        const auto run=[&](const char* name,auto test){if(argc>2&&std::string(argv[1])=="--test"&&std::string(argv[2])!=name)return;gestureScenario=name;if(argc>1&&std::string(argv[1])=="--trace")std::cerr<<"Running "<<name<<std::endl;test();};
+        run("testWindowButtonsStayOrderedAndReachable",testWindowButtonsStayOrderedAndReachable);
+        run("testSharedCalibrationTemplatesAndLayout",testSharedCalibrationTemplatesAndLayout);
+        run("testRuntimeTuningAndReloadUseEditorTransactions",testRuntimeTuningAndReloadUseEditorTransactions);
+        run("testWorkflowManagementIsImmediateAndUndoable",testWorkflowManagementIsImmediateAndUndoable);run("testWorkflowUsesCanvasWithoutPageTabs",testWorkflowUsesCanvasWithoutPageTabs);run("testModelExportJobLifecycle",testModelExportJobLifecycle);
+        run("testPreviewVisibilityFollowsTheImagePanel",testPreviewVisibilityFollowsTheImagePanel);run("testPreviewTexturesUploadAndReuseActualPixels",testPreviewTexturesUploadAndReuseActualPixels);
+        run("testOptionEditorBindings",testOptionEditorBindings);run("testOutputToInputAndPreview",testOutputToInputAndPreview); run("testShortPreviewDoesNotLoop",testShortPreviewDoesNotLoop); run("testInputToOutputAndReplacement",testInputToOutputAndReplacement);
+        run("testEveryCardSizeFollowsTheGrid",testEveryCardSizeFollowsTheGrid);run("testFreeDragShowsItsGridDestinationAcrossZoom",testFreeDragShowsItsGridDestinationAcrossZoom);run("testFreeMoveCancelsWithoutSavingOrNoopHistory",testFreeMoveCancelsWithoutSavingOrNoopHistory);run("testGroupsAndReroutesHaveFreePlacementPreviews",testGroupsAndReroutesHaveFreePlacementPreviews);
+        run("testEmptyDoubleClickCreatesOneRerouteAcrossZoomAndTabs",testEmptyDoubleClickCreatesOneRerouteAcrossZoomAndTabs);run("testEmptyDoubleClickRespectsGroupsToolsAndLimits",testEmptyDoubleClickRespectsGroupsToolsAndLimits);run("testLooseReroutesAdaptToTheFirstConnection",testLooseReroutesAdaptToTheFirstConnection);run("testMouseMenuHoverDoesNotHighlightAnUnrelatedFirstItem",testMouseMenuHoverDoesNotHighlightAnUnrelatedFirstItem);
+        run("testCatalogSearchAddsWithTabAndEnter",testCatalogSearchAddsWithTabAndEnter);run("testCatalogArrowsKeepSearchFocusAndScroll",testCatalogArrowsKeepSearchFocusAndScroll);run("testCatalogNoResultsAndEscapeAreSafe",testCatalogNoResultsAndEscapeAreSafe);run("testCatalogSearchQuickAddPreservesExistingConnections",testCatalogSearchQuickAddPreservesExistingConnections);run("testEmptyCatalogCanBrowseWithArrows",testEmptyCatalogCanBrowseWithArrows);
+        run("testCatalogSearchMouseSelectionAndCreationErrors",testCatalogSearchMouseSelectionAndCreationErrors);
+        run("testCatalogOpeningFrameInputIsPreserved",testCatalogOpeningFrameInputIsPreserved);
+        run("testCatalogSearchPopupFitsTheViewport",testCatalogSearchPopupFitsTheViewport);
+        run("testCatalogPreviewTracksSelectionWithoutExecuting",testCatalogPreviewTracksSelectionWithoutExecuting);run("testCatalogPreviewShowsDefaultsAndBoundsLargeNodes",testCatalogPreviewShowsDefaultsAndBoundsLargeNodes);run("testCatalogPreviewPlacementAvoidsMenusAtViewportEdges",testCatalogPreviewPlacementAvoidsMenusAtViewportEdges);
+        run("testCatalogPreviewScrollDoesNotDismissMenusOrMoveTheGraph",testCatalogPreviewScrollDoesNotDismissMenusOrMoveTheGraph);
+        run("testCatalogCardWrapsFullValuesAndReusesLayout",testCatalogCardWrapsFullValuesAndReusesLayout);
+        run("testCatalogPreviewFollowsEveryHoveredSubmenuRow",testCatalogPreviewFollowsEveryHoveredSubmenuRow);run("testCatalogSearchPreviewFollowsMouseRows",testCatalogSearchPreviewFollowsMouseRows);
+        run("testNearestCompactPin",testNearestCompactPin); run("testPortWinsOverLaterBody",testPortWinsOverLaterBody);
+        run("testCancelInvalidAndOutside",testCancelInvalidAndOutside); run("testRightClickCancelsAndWheelDoesNotMoveGesture",testRightClickCancelsAndWheelDoesNotMoveGesture);
+        run("testNodesLeaveAndEnterGroupsAcrossZoom",testNodesLeaveAndEnterGroupsAcrossZoom);run("testKeyboardNodeMoveDoesNotCarryItsFrame",testKeyboardNodeMoveDoesNotCarryItsFrame);
+        run("testGroupBoundaryCancellationAndMultipleNodes",testGroupBoundaryCancellationAndMultipleNodes);run("testFrameAndNodeResizingUpdateMembership",testFrameAndNodeResizingUpdateMembership);run("testNestedGroupMovesAndDetachment",testNestedGroupMovesAndDetachment);
+        run("testMagneticWireTargetsAcrossZoomAndDirections",testMagneticWireTargetsAcrossZoomAndDirections);run("testMagneticTargetChoosesNearestPortAndRevalidates",testMagneticTargetChoosesNearestPortAndRevalidates);run("testMagneticWireCancellationAndTypeSafety",testMagneticWireCancellationAndTypeSafety);
+        run("testDistantGroupTitlesAreReadableAndCached",testDistantGroupTitlesAreReadableAndCached);run("testLongGroupTitlesAndFitStayWithinBounds",testLongGroupTitlesAndFitStayWithinBounds);run("testOverviewGroupTitleIsADragHandle",testOverviewGroupTitleIsADragHandle);
+        run("testAltDisconnect",testAltDisconnect); run("testShiftSelectionAndSnappedDrag",testShiftSelectionAndSnappedDrag); run("testMiddlePanAndWheelAnchor",testMiddlePanAndWheelAnchor); run("testPopupBlocksGraphShortcuts",testPopupBlocksGraphShortcuts);
+        run("testGroupDragAndResizeAcrossZoom",testGroupDragAndResizeAcrossZoom); run("testAdditiveMarqueeAndMultiDragAcrossZoom",testAdditiveMarqueeAndMultiDragAcrossZoom);
+        run("testRerouteBodyAndPortsAcrossZoom",testRerouteBodyAndPortsAcrossZoom); run("testCollapseAndCollapsedPortsAcrossZoom",testCollapseAndCollapsedPortsAcrossZoom);
+        run("testNodeResizeEdgesAndCoalescedRelease",testNodeResizeEdgesAndCoalescedRelease);run("testResizeCancellationMinimumAndGroupBounds",testResizeCancellationMinimumAndGroupBounds);run("testManualSizeSurvivesCollapseClipboardAndSaving",testManualSizeSurvivesCollapseClipboardAndSaving);run("testResizePresetsUseCardSpaceAndKeepPortsAccessible",testResizePresetsUseCardSpaceAndKeepPortsAccessible);
+        run("testSemanticZoomKeepsCardAndPortGeometry",testSemanticZoomKeepsCardAndPortGeometry);run("testOverviewCaptionsFitAndReuseTheirLayout",testOverviewCaptionsFitAndReuseTheirLayout);run("testOverviewBodyRemainsSelectableAndDraggable",testOverviewBodyRemainsSelectableAndDraggable);
+        run("testGroupHeaderWinsOverWireDoubleClick",testGroupHeaderWinsOverWireDoubleClick);
+        run("testInsertedRerouteMovesWithItsCommonGroup",testInsertedRerouteMovesWithItsCommonGroup);run("testOverlappingGroupControlsUseOneTopmostTarget",testOverlappingGroupControlsUseOneTopmostTarget);
+        run("testDoubleClickCutsWireAcrossZoom",testDoubleClickCutsWireAcrossZoom);run("testWireContextKeepsRerouteAvailable",testWireContextKeepsRerouteAvailable);
+        run("testInlineSettingsApplyAndOwnMouse",testInlineSettingsApplyAndOwnMouse);run("testIntegerInlineAndTypedConnections",testIntegerInlineAndTypedConnections);run("testSignalTypeColorsSurviveWireStates",testSignalTypeColorsSurviveWireStates);run("testInputSettingsAndSemanticZoom",testInputSettingsAndSemanticZoom);run("testStarterLayoutAccommodatesSettings",testStarterLayoutAccommodatesSettings);
+        run("testArrangeGraphIsUndoableAndKeepsExecution",testArrangeGraphIsUndoableAndKeepsExecution);
+        run("testLegacyCustomLayoutExpandsOnce",testLegacyCustomLayoutExpandsOnce);
+        run("testInlinePathsAndDrivenSettings",testInlinePathsAndDrivenSettings);
+        run("testCoalescedReleaseFinalizesEveryDrag",testCoalescedReleaseFinalizesEveryDrag);run("testReleaseBackAtOriginRestoresDrag",testReleaseBackAtOriginRestoresDrag);
+        run("testComboAnimationAdvancesOnceAndRespectsParentAlpha",testComboAnimationAdvancesOnceAndRespectsParentAlpha);
+        run("testRerouteIsRenderedAsOnePoint",testRerouteIsRenderedAsOnePoint);run("testReroutePointAcceptsBothWireDirections",testReroutePointAcceptsBothWireDirections);
+        run("testWireAnimationIsContinuousAcrossGeometryAndZoom",testWireAnimationIsContinuousAcrossGeometryAndZoom);run("testWireSplinesAreSmoothAndScaleInvariant",testWireSplinesAreSmoothAndScaleInvariant);run("testWirePositionsFollowTheDrawnArcLength",testWirePositionsFollowTheDrawnArcLength);
+        run("testManualBendGesturesAcrossZoom",testManualBendGesturesAcrossZoom);run("testBendCancellationAndFineControl",testBendCancellationAndFineControl);run("testManualBendsKeepTiesClipboardAndCache",testManualBendsKeepTiesClipboardAndCache);run("testBendHandlesRespectOtherControls",testBendHandlesRespectOtherControls);
+        run("testSelectionClipboardIsPortableAndTransactional",testSelectionClipboardIsPortableAndTransactional);
+        run("testQuickAddConnectsBothDirectionsAndKeepsOldInputUntilSuccess",testQuickAddConnectsBothDirectionsAndKeepsOldInputUntilSuccess);
+        run("testPropertiesPanelAndSelectionFocus",testPropertiesPanelAndSelectionFocus);run("testPropertiesRemainUsableInNarrowEditor",testPropertiesRemainUsableInNarrowEditor);
+        run("testImportedLayoutSnapsWithoutShrinkingGroups",testImportedLayoutSnapsWithoutShrinkingGroups);run("testFailedLoadCannotAutosaveOverTheOriginal",testFailedLoadCannotAutosaveOverTheOriginal);
+        run("testNavigationUsesTheEntireGestureAndRightClickRelease",testNavigationUsesTheEntireGestureAndRightClickRelease);run("testRightSelectionNeverPansOrMovesNodes",testRightSelectionNeverPansOrMovesNodes);
+        run("testCatalogSubmenusOpenOnHoverAndCreateANode",testCatalogSubmenusOpenOnHoverAndCreateANode);
+        run("testWireTieGestureMovementRotationAndClipboard",testWireTieGestureMovementRotationAndClipboard);run("testTieCancellationAndOrderedRerouteSplit",testTieCancellationAndOrderedRerouteSplit);
+        run("testGroupMoveAndRightSelectionIncludeTies",testGroupMoveAndRightSelectionIncludeTies);
+        run("testTieRotationUsesFifteenDegreeSteps",testTieRotationUsesFifteenDegreeSteps);
+        run("testLibrarySelectionAndNodeStateShortcuts",testLibrarySelectionAndNodeStateShortcuts);run("testKeyboardMoveAndDuplicateAreTransactional",testKeyboardMoveAndDuplicateAreTransactional);
+        run("testCutCrossedConnectionsWithControlRightDrag",testCutCrossedConnectionsWithControlRightDrag);
+        run("testCutAnimationRetractsAndHasAFixedBudget",testCutAnimationRetractsAndHasAFixedBudget);
+        run("testMouseConfirmsKeyboardMoveAndHelpOpens",testMouseConfirmsKeyboardMoveAndHelpOpens);
+        run("testGroupKeyboardMoveDuplicateAndClipboard",testGroupKeyboardMoveDuplicateAndClipboard);run("testLeavingEditorCancelsPreviewAndDefersAutosave",testLeavingEditorCancelsPreviewAndDefersAutosave);
+        run("testKeyboardPortsConnectFollowAndDisconnect",testKeyboardPortsConnectFollowAndDisconnect);run("testControlSaveWorksFromProperties",testControlSaveWorksFromProperties);
+        run("testCatalogCanBeTraversedWithKeyboard",testCatalogCanBeTraversedWithKeyboard);run("testZGestureRemovesCrossedTiesWithoutCuttingWires",testZGestureRemovesCrossedTiesWithoutCuttingWires);
+        run("testRouteCacheInvalidationAndAffineNavigation",testRouteCacheInvalidationAndAffineNavigation);run("testHotNodeDisplayIsThrottledAndEditsAreImmediate",testHotNodeDisplayIsThrottledAndEditsAreImmediate);run("testOutputWaitingAndRealErrorsRemainDistinct",testOutputWaitingAndRealErrorsRemainDistinct);run("testLargeGraphAnimationAndTextBudgets",testLargeGraphAnimationAndTextBudgets);
+        run("testDisplayCacheRefreshesAfterRevisionAndReopen",testDisplayCacheRefreshesAfterRevisionAndReopen);
         std::cout << "Node editor input tests passed\n";
         return 0;
     }
     catch (const std::exception& error)
     {
-        std::cerr << error.what() << '\n'; return 1;
+        std::cerr << gestureScenario << ": " << error.what() << '\n'; return 1;
     }
 }

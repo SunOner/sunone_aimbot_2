@@ -9,4 +9,6 @@ void migrateLegacySettings(Workspace& workspace, const Config& config, bool seed
 // Startup fills only empty, unwired local model inputs. Runtime still reads
 // the selected path from the graph, including any connected override.
 bool initializeMissingModels(Workspace& workspace,const std::string& preferredModel,const std::string& nativeBackend);
+bool importLegacyCalibrations(Workspace& workspace,const Config& config);
+bool adjustActiveDefaults(Workspace& workspace,int offsetDirection,int recoilDirection,bool head);
 }

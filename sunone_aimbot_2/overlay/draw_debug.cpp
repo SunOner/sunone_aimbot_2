@@ -1,499 +1,90 @@
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #define WIN32_LEAN_AND_MEAN
-#define _WINSOCKAPI_
 #include <winsock2.h>
 #include <Windows.h>
-
-#include <algorithm>
-#include <cstdio>
-#include <d3d11.h>
-#include <iostream>
-#include <string>
-#include <vector>
-
 #include "imgui/imgui.h"
-#include "scr/data_collector.h"
-#include "sunone_aimbot_2.h"
-#include "overlay.h"
+#include "overlay/draw_settings.h"
+#include "overlay/overlay.h"
 #include "overlay/config_dirty.h"
-#include "include/other_tools.h"
-#include "capture.h"
 #include "overlay/ui_sections.h"
-
-#ifdef USE_CUDA
-#include "depth/depth_mask.h"
-#endif
-
-#ifndef SAFE_RELEASE
-#define SAFE_RELEASE(p)       \
-    do {                      \
-        if ((p) != nullptr) { \
-            (p)->Release();   \
-            (p) = nullptr;    \
-        }                     \
-    } while (0)
-#endif
-
-int prev_screenshot_delay = config.screenshot_delay;
-bool prev_verbose = config.verbose;
-
-static ID3D11Texture2D* g_debugTex = nullptr;
-static ID3D11ShaderResourceView* g_debugSRV = nullptr;
-static int texW = 0, texH = 0;
-
-static ID3D11Texture2D* g_maskTex = nullptr;
-static ID3D11ShaderResourceView* g_maskSRV = nullptr;
-static int maskTexW = 0, maskTexH = 0;
-
-static float debug_scale = 0.5f;
-static char g_collectOutputDirBuffer[512] = {};
-static std::string g_collectOutputDirMirror;
-static char g_collectClassFilterBuffer[256] = {};
-static std::string g_collectClassFilterMirror;
-
-static void syncDebugTextBuffer(char* buffer, size_t buffer_size, std::string& mirror, const std::string& value)
-{
-    if (mirror == value)
-        return;
-
-    std::snprintf(buffer, buffer_size, "%s", value.c_str());
-    buffer[buffer_size - 1] = '\0';
-    mirror = value;
-}
-
-static bool applyDebugTextBuffer(std::string& target, std::string& mirror, const char* buffer)
-{
-    const std::string value = buffer ? std::string(buffer) : std::string();
-    if (target == value && mirror == value)
-        return false;
-
-    target = value;
-    mirror = value;
-    return true;
-}
-
-static int findDebugKeyIndexByName(const std::string& keyName)
-{
-    for (size_t k = 0; k < key_names.size(); ++k)
-    {
-        if (key_names[k] == keyName)
-            return static_cast<int>(k);
-    }
-    return 0;
-}
-
-static bool drawScreenshotButtonRows()
-{
-    if (key_names_cstrs.empty())
-    {
-        ImGui::TextDisabled("No key list available.");
-        return false;
-    }
-
-    bool changed = false;
-    if (config.screenshot_button.empty())
-    {
-        config.screenshot_button.push_back("None");
-        changed = true;
-    }
-
-    for (size_t i = 0; i < config.screenshot_button.size();)
-    {
-        std::string& currentKeyName = config.screenshot_button[i];
-        int currentIndex = findDebugKeyIndexByName(currentKeyName);
-        const std::string rowLabel = (config.screenshot_button.size() > 1)
-            ? "Screenshot " + std::to_string(i + 1)
-            : "Screenshot";
-
-        ImGui::PushID(static_cast<int>(i));
-
-        const auto row = OverlayUI::BeginSettingRow(rowLabel.c_str());
-        const float actionBtnW = ImGui::GetFrameHeight();
-        float comboWidth = row.controlWidth - (actionBtnW * 2.0f + 7.0f);
-        if (comboWidth < 1.0f)
-            comboWidth = 1.0f;
-        ImGui::SetNextItemWidth(comboWidth);
-
-        if (ImGui::Combo("##value", &currentIndex, key_names_cstrs.data(), static_cast<int>(key_names_cstrs.size())))
-        {
-            currentKeyName = key_names[currentIndex];
-            changed = true;
-        }
-
-        ImGui::SameLine(0.0f, 4.0f);
-        if (ImGui::Button("+", ImVec2(actionBtnW, 0.0f)))
-        {
-            config.screenshot_button.insert(config.screenshot_button.begin() + static_cast<std::vector<std::string>::difference_type>(i + 1), "None");
-            changed = true;
-        }
-
-        ImGui::SameLine(0.0f, 3.0f);
-        bool removedCurrent = false;
-        if (ImGui::Button("-", ImVec2(actionBtnW, 0.0f)))
-        {
-            if (config.screenshot_button.size() <= 1)
-            {
-                config.screenshot_button[0] = "None";
-            }
-            else
-            {
-                config.screenshot_button.erase(config.screenshot_button.begin() + static_cast<std::vector<std::string>::difference_type>(i));
-                removedCurrent = true;
-            }
-            changed = true;
-        }
-
-        OverlayUI::EndSettingRow(row);
-        ImGui::PopID();
-
-        if (removedCurrent)
-            continue;
-
-        ++i;
-    }
-
-    return changed;
-}
-
-static void uploadDebugFrame(const cv::Mat& bgr)
-{
-    if (bgr.empty()) return;
-
-    if (!g_debugTex || bgr.cols != texW || bgr.rows != texH)
-    {
-        SAFE_RELEASE(g_debugTex);
-        SAFE_RELEASE(g_debugSRV);
-
-        texW = bgr.cols;  texH = bgr.rows;
-
-        D3D11_TEXTURE2D_DESC td = {};
-        td.Width = texW;
-        td.Height = texH;
-        td.MipLevels = td.ArraySize = 1;
-        td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-        td.SampleDesc.Count = 1;
-        td.Usage = D3D11_USAGE_DYNAMIC;
-        td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-        td.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
-
-        g_pd3dDevice->CreateTexture2D(&td, nullptr, &g_debugTex);
-
-        D3D11_SHADER_RESOURCE_VIEW_DESC sd = {};
-        sd.Format = td.Format;
-        sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-        sd.Texture2D.MipLevels = 1;
-        g_pd3dDevice->CreateShaderResourceView(g_debugTex, &sd, &g_debugSRV);
-    }
-
-    static cv::Mat rgba;
-    cv::cvtColor(bgr, rgba, cv::COLOR_BGR2RGBA);
-
-    D3D11_MAPPED_SUBRESOURCE ms;
-    if (SUCCEEDED(g_pd3dDeviceContext->Map(g_debugTex, 0,
-        D3D11_MAP_WRITE_DISCARD, 0, &ms)))
-    {
-        for (int y = 0; y < texH; ++y)
-            memcpy((uint8_t*)ms.pData + ms.RowPitch * y,
-                rgba.ptr(y), texW * 4);
-        g_pd3dDeviceContext->Unmap(g_debugTex, 0);
-    }
-}
-
-static void uploadMaskFrame(const cv::Mat& rgba)
-{
-    if (rgba.empty()) return;
-
-    if (!g_maskTex || rgba.cols != maskTexW || rgba.rows != maskTexH)
-    {
-        SAFE_RELEASE(g_maskTex);
-        SAFE_RELEASE(g_maskSRV);
-
-        maskTexW = rgba.cols;
-        maskTexH = rgba.rows;
-
-        D3D11_TEXTURE2D_DESC td = {};
-        td.Width = maskTexW;
-        td.Height = maskTexH;
-        td.MipLevels = td.ArraySize = 1;
-        td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-        td.SampleDesc.Count = 1;
-        td.Usage = D3D11_USAGE_DYNAMIC;
-        td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-        td.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
-
-        g_pd3dDevice->CreateTexture2D(&td, nullptr, &g_maskTex);
-
-        D3D11_SHADER_RESOURCE_VIEW_DESC sd = {};
-        sd.Format = td.Format;
-        sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-        sd.Texture2D.MipLevels = 1;
-        g_pd3dDevice->CreateShaderResourceView(g_maskTex, &sd, &g_maskSRV);
-    }
-
-    D3D11_MAPPED_SUBRESOURCE ms;
-    if (SUCCEEDED(g_pd3dDeviceContext->Map(g_maskTex, 0,
-        D3D11_MAP_WRITE_DISCARD, 0, &ms)))
-    {
-        for (int y = 0; y < maskTexH; ++y)
-            memcpy((uint8_t*)ms.pData + ms.RowPitch * y,
-                rgba.ptr(y), maskTexW * 4);
-        g_pd3dDeviceContext->Unmap(g_maskTex, 0);
-    }
-}
-
-static bool drawDataCollectionSection()
-{
-    syncDebugTextBuffer(g_collectOutputDirBuffer, sizeof(g_collectOutputDirBuffer), g_collectOutputDirMirror, config.collect_output_dir);
-    syncDebugTextBuffer(g_collectClassFilterBuffer, sizeof(g_collectClassFilterBuffer), g_collectClassFilterMirror, config.auto_label_record_classes);
-
-    bool changed = false;
-    if (!OverlayUI::BeginSection("Data Collection", "debug_section_data_collection"))
-        return false;
-
-    changed |= OverlayUI::CheckboxRow("Collect data while playing", &config.collect_data_while_playing);
-    changed |= OverlayUI::CheckboxRow("Only when aimbot is active", &config.collect_only_when_aimbot_running);
-    changed |= OverlayUI::CheckboxRow("Only when targets exist", &config.collect_only_when_targets_present);
-
-    int saveEveryNFrames = config.collect_save_every_n_frames;
-    if (OverlayUI::SliderIntRow("Save every N frames", &saveEveryNFrames, 1, 120))
-    {
-        config.collect_save_every_n_frames = saveEveryNFrames;
-        changed = true;
-    }
-
-    int jpegQuality = config.collect_jpeg_quality;
-    if (OverlayUI::SliderIntRow("JPEG quality", &jpegQuality, 50, 100))
-    {
-        config.collect_jpeg_quality = jpegQuality;
-        changed = true;
-    }
-
-    if (OverlayUI::InputTextRow("Output folder", g_collectOutputDirBuffer, sizeof(g_collectOutputDirBuffer)))
-        changed |= applyDebugTextBuffer(config.collect_output_dir, g_collectOutputDirMirror, g_collectOutputDirBuffer);
-
-    if (OverlayUI::BeginSubsection("Auto Label"))
-    {
-        changed |= OverlayUI::CheckboxRow("Write YOLO txt labels", &config.auto_label_data);
-
-        ImGui::BeginDisabled(!config.auto_label_data);
-
-        float minConf = config.auto_label_min_conf;
-        if (OverlayUI::SliderFloatRow("Min confidence", &minConf, 0.01f, 0.99f, "%.2f"))
-        {
-            config.auto_label_min_conf = minConf;
-            changed = true;
-        }
-
-        int maxBoxes = config.auto_label_max_boxes;
-        if (OverlayUI::SliderIntRow("Max boxes per file", &maxBoxes, 1, 100))
-        {
-            config.auto_label_max_boxes = maxBoxes;
-            changed = true;
-        }
-
-        if (OverlayUI::InputTextRow("Class filter", g_collectClassFilterBuffer, sizeof(g_collectClassFilterBuffer)))
-            changed |= applyDebugTextBuffer(config.auto_label_record_classes, g_collectClassFilterMirror, g_collectClassFilterBuffer);
-
-        ImGui::TextDisabled("Leave class filter empty to record all classes. Use comma-separated ids like 0,1.");
-        ImGui::EndDisabled();
-
-        OverlayUI::EndSubsection();
-    }
-
-    const cvm::DataCollectionUiState ui = cvm::GetDataCollectionUiState("", config.ai_model.c_str(), config);
-    ImGui::Separator();
-    ImGui::Text("Observed frames: %llu", static_cast<unsigned long long>(ui.observed_frame_count));
-    ImGui::Text("Save attempts: %llu", static_cast<unsigned long long>(ui.attempted_sample_count));
-    ImGui::Text("Images saved: %llu", static_cast<unsigned long long>(ui.saved_image_count));
-    ImGui::Text("Label files: %llu", static_cast<unsigned long long>(ui.saved_label_count));
-    ImGui::TextWrapped("Resolved folder: %s", ui.resolved_output_dir.c_str());
-    if (!ui.status.empty())
-        ImGui::TextWrapped("Status: %s", ui.status.c_str());
-    else
-        ImGui::TextDisabled("Status: idle");
-
-    if (OverlayUI::ButtonRow("Resolved folder", "Copy path", "copy_resolved_path"))
-        ImGui::SetClipboardText(ui.resolved_output_dir.c_str());
-
-    if (OverlayUI::ButtonRow("Collect counters", "Reset counters", "reset_collect_counters"))
-        cvm::ResetDataCollectionRuntime();
-
-    OverlayUI::EndSection();
-    return changed;
-}
-
-void draw_debug_frame()
-{
-    cv::Mat frameCopy;
-    {
-        std::lock_guard<std::mutex> lk(frameMutex);
-        if (!latestFrame.empty())
-            latestFrame.copyTo(frameCopy);
-    }
-
-    uploadDebugFrame(frameCopy);
-
-    if (!g_debugSRV) return;
-
-    {
-        const auto row = OverlayUI::BeginSettingRow("Debug scale");
-        ImGui::SliderFloat("##value", &debug_scale, 0.1f, 2.0f, "%.1fx");
-        OverlayUI::EndSettingRow(row);
-    }
-
-    ImVec2 image_size(texW * debug_scale, texH * debug_scale);
-    ImGui::Image((ImTextureID)(intptr_t)g_debugSRV, image_size);
-
-    ImVec2 image_pos = ImGui::GetItemRectMin();
-    ImDrawList* draw_list = ImGui::GetWindowDrawList();
-
-#ifdef USE_CUDA
-    if (config.depth_mask_enabled)
-    {
-        auto& depthMask = depth_anything::GetDepthMaskGenerator();
-        cv::Mat mask = depthMask.getMask();
-        if (!mask.empty() && mask.size() == frameCopy.size())
-        {
-            cv::Mat alpha(mask.size(), CV_8U, cv::Scalar(0));
-            alpha.setTo(config.depth_mask_alpha, mask);
-
-            std::vector<cv::Mat> channels(4);
-            channels[0] = cv::Mat(mask.size(), CV_8U, cv::Scalar(255));
-            channels[1] = cv::Mat(mask.size(), CV_8U, cv::Scalar(0));
-            channels[2] = cv::Mat(mask.size(), CV_8U, cv::Scalar(0));
-            channels[3] = alpha;
-
-            cv::Mat rgba;
-            cv::merge(channels, rgba);
-            uploadMaskFrame(rgba);
-
-            if (g_maskSRV)
-            {
-                ImVec2 overlay_max(image_pos.x + image_size.x, image_pos.y + image_size.y);
-                draw_list->AddImage((ImTextureID)(intptr_t)g_maskSRV, image_pos, overlay_max);
-            }
-        }
-    }
-#endif
-
-    {
-        std::lock_guard<std::mutex> lock(detectionBuffer.mutex);
-        for (size_t i = 0; i < detectionBuffer.boxes.size(); ++i)
-        {
-            const cv::Rect& box = detectionBuffer.boxes[i];
-
-            ImVec2 p1(image_pos.x + box.x * debug_scale,
-                image_pos.y + box.y * debug_scale);
-            ImVec2 p2(p1.x + box.width * debug_scale,
-                p1.y + box.height * debug_scale);
-
-            ImU32 color = IM_COL32(255, 0, 0, 255);
-
-            draw_list->AddRect(p1, p2, color, 0.0f, 2.0f);
-
-            if (i < detectionBuffer.classes.size())
-            {
-                std::string label = std::to_string(detectionBuffer.classes[i]);
-                draw_list->AddText(ImVec2(p1.x, p1.y - 16), IM_COL32(255, 255, 0, 255), label.c_str());
-            }
-        }
-    }
-
-    if (config.draw_futurePositions && globalMouseThread)
-    {
-        auto futurePts = globalMouseThread->getFuturePositions();
-        if (!futurePts.empty())
-        {
-            float scale_x = static_cast<float>(texW) / config.detection_resolution;
-            float scale_y = static_cast<float>(texH) / config.detection_resolution;
-
-            ImVec2 clip_min = image_pos;
-            ImVec2 clip_max = ImVec2(image_pos.x + texW * debug_scale,
-                image_pos.y + texH * debug_scale);
-            draw_list->PushClipRect(clip_min, clip_max, true);
-
-            int totalPts = static_cast<int>(futurePts.size());
-            for (size_t i = 0; i < futurePts.size(); ++i)
-            {
-                int px = static_cast<int>(futurePts[i].first * scale_x);
-                int py = static_cast<int>(futurePts[i].second * scale_y);
-                ImVec2 pt(image_pos.x + px * debug_scale,
-                    image_pos.y + py * debug_scale);
-
-                int b = static_cast<int>(255 - (i * 255.0 / totalPts));
-                int r = static_cast<int>(i * 255.0 / totalPts);
-                int g = 50;
-
-                ImU32 fillColor = IM_COL32(r, g, b, 255);
-                ImU32 outlineColor = IM_COL32(255, 255, 255, 255);
-
-                draw_list->AddCircleFilled(pt, 4.0f * debug_scale, fillColor);
-                draw_list->AddCircle(pt, 4.0f * debug_scale, outlineColor, 0, 1.0f);
-            }
-
-            draw_list->PopClipRect();
-        }
-    }
-}
-
-void draw_capture_preview()
-{
-    if (OverlayUI::BeginSection("Capture Preview", "capture_section_preview"))
-    {
-        {
-            const auto row = OverlayUI::BeginSettingRow("Show Preview Window");
-            if (ImGui::Checkbox("##value", &config.show_window))
-            {
-                OverlayConfig_MarkDirty();
-            }
-            OverlayUI::EndSettingRow(row);
-        }
-
-        if (config.show_window)
-        {
-            draw_debug_frame();
-        }
-
-        OverlayUI::EndSection();
-    }
-}
+#include "nodes/node_graph.h"
+#include "runtime/thread_loops.h"
+#include "scr/data_collector.h"
+#include <opencv2/core.hpp>
+#include <chrono>
+#include <cmath>
+#include <iostream>
+#include <mutex>
+#include <vector>
 
 void draw_debug()
 {
-    bool changed = false;
-
-    if (OverlayUI::BeginSection("Screenshot Buttons", "debug_section_screenshot_buttons"))
+    static NodeGraph::Workspace workspace;static NodeGraph::Telemetry telemetry;
+    static std::vector<TrackDebugInfo> tracks;static int locked=-1;static double sampled=-1;
+    if(ImGui::GetTime()-sampled>=0.15||sampled<0)
     {
-        if (drawScreenshotButtonRows())
-            changed = true;
-
-        if (OverlayUI::InputIntRow("Screenshot delay", &config.screenshot_delay, 50, 500))
-            changed = true;
-        if (OverlayUI::CheckboxRow("Verbose console output", &config.verbose))
-            changed = true;
-
-        if (config.screenshot_delay < 0)
-            config.screenshot_delay = 0;
-
-        if (OverlayUI::ButtonRow("OpenCV", "Print build information", "button_cv2_build_info"))
-        {
-            std::cout << cv::getBuildInformation() << std::endl;
-        }
-
+        workspace=NodeGraph::service().workspace();telemetry=NodeGraph::service().telemetry();
+        {std::lock_guard<std::mutex> lock(g_trackerDebugMutex);tracks=g_trackerDebugTracks;locked=g_trackerLockedId;}
+        sampled=ImGui::GetTime();
+    }
+    if(OverlayUI::BeginSection("Diagnostics","diagnostic_options"))
+    {
+        if(OverlayUI::CheckboxRow("Verbose console output",&config.verbose))OverlayConfig_MarkDirty();
+        if(ImGui::Button("OpenCV build information"))std::cout<<cv::getBuildInformation()<<std::endl;
+        ImGui::PushTextWrapPos(0);ImGui::TextDisabled("Capture, recording and screenshot settings are edited in their workflow nodes.");ImGui::PopTextWrapPos();
         OverlayUI::EndSection();
     }
-
-    changed |= drawDataCollectionSection();
-
-    if (prev_screenshot_delay != config.screenshot_delay ||
-        prev_verbose != config.verbose)
+    if(OverlayUI::BeginSection("Active workflow nodes","diagnostic_nodes"))
     {
-        prev_screenshot_delay = config.screenshot_delay;
-        prev_verbose = config.verbose;
-        changed = true;
+        bool any=false;
+        for(std::size_t graph=0;graph<workspace.graphs.size();++graph)
+        {
+            const auto& page=workspace.graphs[graph];if(!page.active||!page.enabled)continue;
+            for(const auto& node:page.nodes)
+            {
+                using K=NodeGraph::NodeKind;
+                if(node.kind!=K::CaptureSource&&node.kind!=K::Inference&&node.kind!=K::DepthInference&&node.kind!=K::DatasetOutput&&node.kind!=K::CollectDataset&&node.kind!=K::ScreenshotOutput&&node.kind!=K::OverlayOutput)continue;
+                any=true;ImGui::PushID(static_cast<int>(graph));ImGui::PushID(node.id);
+                ImGui::Separator();ImGui::Text("%s / %s",NodeGraph::workflowTitle(page).c_str(),NodeGraph::pageTitle(page).c_str());
+                ImGui::Text("%s #%d",NodeGraph::definition(node.kind).title,node.id);
+                const NodeGraph::NodeValue* value=nullptr;
+                if(telemetry.graphRevisions[graph]==NodeGraph::service().revision())
+                    for(const auto& item:telemetry.graphs[graph])if(item.nodeId==node.id){value=&item;break;}
+                if(node.disabled)ImGui::TextDisabled("Disabled");else if(node.bypassed)ImGui::TextDisabled("Bypassed");
+                else if(value&&!value->value.error.empty()){ImGui::PushTextWrapPos(0);ImGui::TextColored(ImVec4(1,0.4f,0.4f,1),"%s",value->value.error.c_str());ImGui::PopTextWrapPos();}
+                else ImGui::TextDisabled("%s",value&&value->active?"Active":"Waiting");
+                if(node.kind==K::DatasetOutput||node.kind==K::CollectDataset)
+                {
+                    const auto state=cvm::GetDataCollectionNodeUiState(static_cast<int>(graph)*NodeGraph::NodeKeyStride+node.id);
+                    ImGui::Text("Images: %llu   Labels: %llu",static_cast<unsigned long long>(state.saved_image_count),static_cast<unsigned long long>(state.saved_label_count));
+                    if(!state.resolved_output_dir.empty()){ImGui::PushTextWrapPos(0);ImGui::TextUnformatted(state.resolved_output_dir.c_str());ImGui::PopTextWrapPos();}
+                    if(!state.status.empty()){ImGui::PushTextWrapPos(0);ImGui::TextUnformatted(state.status.c_str());ImGui::PopTextWrapPos();}
+                }
+                if(ImGui::Button("Open node"))Overlay_OpenGraphNode(static_cast<int>(graph),node.id);
+                ImGui::PopID();ImGui::PopID();
+            }
+        }
+        if(!any)ImGui::TextDisabled("No source or output nodes in active pages.");
+        OverlayUI::EndSection();
     }
-
-    if (changed)
+    if(OverlayUI::BeginSection("Tracker","diagnostic_tracker"))
     {
-        OverlayConfig_MarkDirty();
+        ImGui::Text("Latest tracker: %zu tracks / locked ID %d",tracks.size(),locked);
+        if(ImGui::BeginTable("##tracks",7,ImGuiTableFlags_Borders|ImGuiTableFlags_RowBg|ImGuiTableFlags_ScrollY,ImVec2(0,240)))
+        {
+            for(const char* name:{"ID","Class","Locked","Observed","Missed","Position","Speed"})ImGui::TableSetupColumn(name);
+            ImGui::TableHeadersRow();ImGuiListClipper clipper;clipper.Begin(static_cast<int>(tracks.size()));
+            while(clipper.Step())for(int i=clipper.DisplayStart;i<clipper.DisplayEnd;++i)
+            {
+                const auto& track=tracks[i];ImGui::TableNextRow();ImGui::TableNextColumn();ImGui::Text("%d",track.trackId);
+                ImGui::TableNextColumn();ImGui::Text("%d",track.classId);ImGui::TableNextColumn();ImGui::TextUnformatted(track.isLocked?"Yes":"No");
+                ImGui::TableNextColumn();ImGui::TextUnformatted(track.observedThisFrame?"Yes":"No");ImGui::TableNextColumn();ImGui::Text("%d",track.missedFrames);
+                ImGui::TableNextColumn();ImGui::Text("%.0f, %.0f",track.pivotX,track.pivotY);ImGui::TableNextColumn();ImGui::Text("%.0f",std::hypot(track.velocityX,track.velocityY));
+            }
+            ImGui::EndTable();
+        }
+        OverlayUI::EndSection();
     }
 }

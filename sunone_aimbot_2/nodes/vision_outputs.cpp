@@ -68,7 +68,7 @@ std::unordered_map<int,std::shared_ptr<MaskBuildState>> maskBuildStates;
 std::map<int,std::shared_ptr<const OverlayPacket>> renderPackets;
 std::unordered_map<int,ScreenshotState> screenshotStates;
 
-int visionKey(const Node& node){return static_cast<int>(GraphKind::Vision)*1000001+node.id;}
+int visionKey(const Node& node){return node.runtimeKey?node.runtimeKey:static_cast<int>(GraphKind::Vision)*1000001+node.id;}
 FrameStream frameError(const FrameStream& input,const std::string& error)
 {
     auto output=input?std::make_shared<FrameData>(*input):std::make_shared<FrameData>();
@@ -102,7 +102,7 @@ cv::Mat heldMask(const cv::Mat& current,const Node& node,std::int64_t version,st
 {
     const int hold=std::clamp(static_cast<int>(parameter(node,"depth_mask_hold_frames")),0,1000);
     if(hold==0)return current;
-    std::lock_guard<std::mutex> lock(statesMutex);auto& state=maskHoldStates[node.id];
+    std::lock_guard<std::mutex> lock(statesMutex);auto& state=maskHoldStates[visionKey(node)];
     if(state.generation!=generation||state.ttl.size()!=current.size()||state.settings!=node.parameters)
     {state=MaskHoldState{};state.settings=node.parameters;}
     state.generation=generation;
@@ -162,7 +162,7 @@ NodeGraph::MaskStream depthToMask(const FrameStream& depth,const Node& node)
     {
         if(!depth||!depth->storage)throw std::runtime_error(depth&&!depth->error.empty()?depth->error:"Depth to Mask requires a depth image.");
         std::shared_ptr<MaskBuildState> state;
-        {std::lock_guard<std::mutex> lock(statesMutex);auto& entry=maskBuildStates[node.id];if(!entry)entry=std::make_shared<MaskBuildState>();state=entry;}
+        {std::lock_guard<std::mutex> lock(statesMutex);auto& entry=maskBuildStates[visionKey(node)];if(!entry)entry=std::make_shared<MaskBuildState>();state=entry;}
         std::lock_guard<std::mutex> stateLock(state->mutex);
         const auto now=Clock::now();const double requestedFps=parameter(node,"depth_mask_fps"),fps=requestedFps>0?requestedFps:5;
         if(state->cached&&state->cached->generation==depth->generation&&state->cached->width==depth->width&&state->cached->height==depth->height&&
@@ -363,9 +363,9 @@ void retainVisionOutputs(const Actions& actions)
     retainVisionOutputs(actions.activeDepthKeys,collectorKeys,actions.activeRenderKeys);
     std::lock_guard<std::mutex> lock(statesMutex);
     for(auto it=maskHoldStates.begin();it!=maskHoldStates.end();)
-        if(std::find(actions.activeMaskKeys.begin(),actions.activeMaskKeys.end(),static_cast<int>(GraphKind::Vision)*1000001+it->first)==actions.activeMaskKeys.end())it=maskHoldStates.erase(it);else++it;
+        if(std::find(actions.activeMaskKeys.begin(),actions.activeMaskKeys.end(),it->first)==actions.activeMaskKeys.end())it=maskHoldStates.erase(it);else++it;
     for(auto it=maskBuildStates.begin();it!=maskBuildStates.end();)
-        if(std::find(actions.activeMaskKeys.begin(),actions.activeMaskKeys.end(),static_cast<int>(GraphKind::Vision)*1000001+it->first)==actions.activeMaskKeys.end())it=maskBuildStates.erase(it);else++it;
+        if(std::find(actions.activeMaskKeys.begin(),actions.activeMaskKeys.end(),it->first)==actions.activeMaskKeys.end())it=maskBuildStates.erase(it);else++it;
     for(auto it=screenshotStates.begin();it!=screenshotStates.end();)
         if(std::find(screenshotKeys.begin(),screenshotKeys.end(),it->first)==screenshotKeys.end())it=screenshotStates.erase(it);else++it;
 }

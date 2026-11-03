@@ -88,6 +88,45 @@ void testAllSizeAndDpiCombinationsStayInside()
                 }
             }
 }
+
+void testPresentationModesRestoreWithoutDrift()
+{
+    const Rect saved{80,60,1100,700},work{0,40,1920,1000},screen{0,0,1920,1080};
+    Presentation state;
+    for(int i=0;i<20;++i)
+    {
+        state.toggleMaximized(saved);
+        require(state.mode==Mode::Maximized&&equal(state.bounds(work,screen,96),work),"Maximize did not use the exact taskbar-safe work area");
+        state.toggleFullscreen(work);
+        require(state.mode==Mode::Fullscreen&&equal(state.bounds(work,screen,96),screen),"Fullscreen was clamped to the taskbar or inset margins");
+        state.toggleFullscreen(screen);
+        require(state.mode==Mode::Maximized&&equal(state.restored,saved),"Fullscreen forgot maximized mode or overwrote restore geometry");
+        state.toggleMaximized(work);
+        require(state.mode==Mode::Windowed&&equal(state.bounds(work,screen,96),saved),"Repeated mode switches drifted the saved window");
+    }
+    state.toggleFullscreen(saved);state.toggleFullscreen(screen);
+    require(state.mode==Mode::Windowed&&equal(state.bounds(work,screen,96),saved),"Windowed fullscreen did not restore the normal window");
+    state.toggleFullscreen(saved);state.toggleMaximized(screen);
+    require(state.mode==Mode::Maximized&&equal(state.restored,saved),"Switching directly from fullscreen to maximize lost the original window");
+    state.toggleMaximized(work);
+    require(equal(state.bounds(work,screen,96),saved),"Restoring after a direct mode change lost the normal window");
+}
+
+void testPresentationFollowsMonitorChanges()
+{
+    const Rect saved{-1500,-500,1100,740},work{-1920,-1040,1880,1040},screen{-1920,-1080,1920,1080};
+    Presentation state;state.toggleMaximized(saved);
+    require(equal(state.bounds(work,screen,144),work),"Maximize ignored negative monitor coordinates or a side taskbar");
+    state.toggleFullscreen(work);
+    require(equal(state.bounds(work,screen,192),screen),"Fullscreen used the primary monitor or DPI inset");
+    const Rect changedWork{48,0,976,728},changedScreen{0,0,1024,768};
+    require(equal(state.bounds(changedWork,changedScreen,144),changedScreen),"Fullscreen did not follow a display change");
+    state.toggleFullscreen(changedScreen);
+    require(equal(state.bounds(changedWork,changedScreen,144),changedWork),"Maximize did not follow a work area change");
+    state.toggleMaximized(changedWork);
+    requireInside(state.bounds(changedWork,changedScreen,144),changedWork);
+    require(equal(state.restored,saved),"Monitor recovery destroyed the original restore rectangle");
+}
 }
 
 int main()
@@ -100,6 +139,8 @@ int main()
         testNegativeMonitorCoordinatesAndTaskbarEdges();
         testRestoringDisconnectedMonitorAndChangedResolution();
         testAllSizeAndDpiCombinationsStayInside();
+        testPresentationModesRestoreWithoutDrift();
+        testPresentationFollowsMonitorChanges();
         std::cout << "Overlay window geometry regressions passed\n";
         return 0;
     }

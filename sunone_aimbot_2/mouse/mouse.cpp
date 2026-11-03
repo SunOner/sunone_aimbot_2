@@ -15,7 +15,6 @@
 
 #include "mouse.h"
 #include "capture.h"
-#include "config.h"
 #include "detection_buffer.h"
 #include "runtime/input_state.h"
 
@@ -24,11 +23,7 @@ namespace
 double currentFrameIntervalSec()
 {
     double fps = static_cast<double>(captureFps.load());
-    if (fps <= 0.0)
-    {
-        std::lock_guard<std::mutex> lock(configMutex);
-        fps = (config.capture_fps > 0) ? static_cast<double>(config.capture_fps) : 60.0;
-    }
+    if (fps <= 0.0) fps = 60.0;
 
     fps = std::clamp(fps, 15.0, 500.0);
     return 1.0 / fps;
@@ -38,7 +33,7 @@ template <typename States>
 bool hasGraphStateCapacity(const States& states, int nodeKey)
 {
     constexpr int graphStride = 1000001;
-    if (nodeKey <= 0 || nodeKey >= graphStride * 3)
+    if (nodeKey <= 0 || nodeKey >= graphStride * static_cast<int>(NodeGraph::MaxGraphs))
         return false;
     const int graph = nodeKey / graphStride;
     std::size_t count = 0;
@@ -49,76 +44,20 @@ bool hasGraphStateCapacity(const States& states, int nodeKey)
 }
 }
 
-MouseThread::MouseThread(
-    int resolution,
-    int fovX,
-    int fovY,
-    double minSpeedMultiplier,
-    double maxSpeedMultiplier,
-    double predictionInterval,
-    IMouseInput* mouseInputDevice)
-    : screen_width(resolution),
-    screen_height(resolution),
-    prediction_interval(predictionInterval),
-    fov_x(fovX),
-    fov_y(fovY),
-    max_distance(std::hypot(resolution, resolution) / 2.0),
-    min_speed_multiplier(minSpeedMultiplier),
-    max_speed_multiplier(maxSpeedMultiplier),
-    center_x(resolution / 2.0),
-    center_y(resolution / 2.0),
-    mouseInput(mouseInputDevice),
-
-    prev_velocity_x(0.0),
-    prev_velocity_y(0.0),
-    prev_x(0.0),
-    prev_y(0.0)
+MouseThread::MouseThread(int resolution,IMouseInput* mouseInputDevice)
+    :screen_width(std::max(1,resolution)),screen_height(std::max(1,resolution)),
+     center_x(screen_width*0.5),center_y(screen_height*0.5),mouseInput(mouseInputDevice)
 {
-    prev_time = std::chrono::steady_clock::time_point();
-    last_target_time = std::chrono::steady_clock::now();
-
     wind_mouse_enabled=true;wind_G=9;wind_W=3;wind_M=10;wind_D=12;
-    resetWindState();
-    clearWindDebugTrail();
-    targetKalman.setSettings(aim::AimKalmanSettings{});
-    targetKalman.reset();
-    lastKalmanTelemetry = {};
-    lastPredictionLookaheadSec = 0.0;
-    lastDetectionDelaySec = 0.0;
-
-    detectionGeneration = detectionBuffer.currentGeneration();
-    moveWorker = std::thread(&MouseThread::moveWorkerLoop, this);
+    resetWindState();clearWindDebugTrail();
+    detectionGeneration=detectionBuffer.currentGeneration();
+    moveWorker=std::thread(&MouseThread::moveWorkerLoop,this);
 }
-
-void MouseThread::updateConfig(const Config& snapshot)
+void MouseThread::setCaptureResolution(int resolution)
 {
-    std::lock_guard<std::mutex> lock(pendingConfigMutex);
-    pendingConfig = snapshot;
-}
-
-bool MouseThread::applyPendingConfig()
-{
-    std::optional<Config> snapshot;
-    {
-        std::lock_guard<std::mutex> lock(pendingConfigMutex);
-        snapshot.swap(pendingConfig);
-    }
-    if (!snapshot)
-        return false;
-
-    // Wait for dispatch and invalidate popped commands before changing the
-    // geometry also read by the worker's motion compensation/debug code.
     resetPrediction();
-
-    const int resolution = snapshot->detection_resolution;
-    screen_width = screen_height = resolution;
-    fov_x = snapshot->fovX;
-    fov_y = snapshot->fovY;
-    center_x = center_y = resolution / 2.0;
-    max_distance = std::hypot(resolution, resolution) / 2.0;
+    screen_width=screen_height=std::max(1,resolution);center_x=screen_width*0.5;center_y=screen_height*0.5;
     clearWindDebugTrail();
-    targetKalman.setSettings(aim::AimKalmanSettings{});
-    return true;
 }
 
 MouseThread::~MouseThread()
@@ -368,8 +307,8 @@ void MouseThread::appendWindDebugStep(int dx, int dy, double pixelScaleX, double
     if (dx == 0 && dy == 0)
         return;
 
-    const auto delta = pixelScaleX!=0&&pixelScaleY!=0
-        ?std::make_pair(dx*pixelScaleX,dy*pixelScaleY):mouseCountsToScreenPixels(dx,dy);
+    const auto delta=std::make_pair(dx*pixelScaleX,dy*pixelScaleY);
+    if(!std::isfinite(delta.first)||!std::isfinite(delta.second))return;
     double deltaPxX = delta.first;
     double deltaPxY = delta.second;
     if (std::abs(deltaPxX) < 1e-8 && std::abs(deltaPxY) < 1e-8)
@@ -401,54 +340,13 @@ void MouseThread::pruneWindDebugTrailLocked(const std::chrono::steady_clock::tim
         windDebugTrail.pop_front();
 }
 
-std::pair<double, double> MouseThread::mouseCountsToScreenPixels(int dx, int dy) const
-{
-    double deltaPxX = static_cast<double>(dx);
-    double deltaPxY = static_cast<double>(dy);
-
-    {
-        std::lock_guard<std::mutex> cfgLock(configMutex);
-        const Config::GameProfile* gpPtr = nullptr;
-
-        auto activeIt = config.game_profiles.find(config.active_game);
-        if (activeIt != config.game_profiles.end())
-            gpPtr = &activeIt->second;
-        else
-        {
-            auto unifiedIt = config.game_profiles.find("UNIFIED");
-            if (unifiedIt != config.game_profiles.end())
-                gpPtr = &unifiedIt->second;
-        }
-
-        if (gpPtr && gpPtr->sens != 0.0 && gpPtr->yaw != 0.0 && gpPtr->pitch != 0.0)
-        {
-            const double fovNow = std::max(1.0, fov_x);
-            const double fovScale = (gpPtr->fovScaled && gpPtr->baseFOV > 1.0) ? (fovNow / gpPtr->baseFOV) : 1.0;
-            const double degX = static_cast<double>(dx) * gpPtr->sens * gpPtr->yaw * fovScale;
-            const double degY = static_cast<double>(dy) * gpPtr->sens * gpPtr->pitch * fovScale;
-
-            const double degPerPxX = fov_x / std::max(1.0, screen_width);
-            const double degPerPxY = fov_y / std::max(1.0, screen_height);
-
-            if (std::abs(degPerPxX) > 1e-8 && std::abs(degPerPxY) > 1e-8)
-            {
-                deltaPxX = degX / degPerPxX;
-                deltaPxY = degY / degPerPxY;
-            }
-        }
-    }
-
-    return { deltaPxX, deltaPxY };
-}
-
 void MouseThread::recordMotionCompensationStep(int dx, int dy, double pixelScaleX, double pixelScaleY)
 {
     if (dx == 0 && dy == 0)
         return;
 
-    const auto delta = (pixelScaleX != 0.0 || pixelScaleY != 0.0)
-        ? std::make_pair(dx * pixelScaleX, dy * pixelScaleY)
-        : mouseCountsToScreenPixels(dx, dy);
+    const auto delta=std::make_pair(dx*pixelScaleX,dy*pixelScaleY);
+    if(!std::isfinite(delta.first)||!std::isfinite(delta.second))return;
     if (std::abs(delta.first) < 1e-8 && std::abs(delta.second) < 1e-8)
         return;
 
@@ -490,23 +388,26 @@ std::pair<double, double> MouseThread::getMotionCompensationSince(
     return { x, y };
 }
 
-void MouseThread::restorePredictionState(const PredictionNodeState& state)
-{
-    prev_x = state.x; prev_y = state.y;
-    prev_velocity_x = state.velocityX; prev_velocity_y = state.velocityY;
-    prev_time = state.time;
-    targetKalman = state.kalman;
-    lastKalmanTelemetry = state.telemetry;
-    lastPredictionLookaheadSec = state.lookaheadSec;
-    lastDetectionDelaySec = state.detectionDelaySec;
-}
-
 std::pair<double, double> MouseThread::graphPredict(int nodeKey, double pointX, double pointY,
     std::chrono::steady_clock::time_point observationTime, const NodeGraph::Node& node,
     double lookahead, bool reset)
 {
     const auto invalid = std::make_pair(std::numeric_limits<double>::quiet_NaN(), std::numeric_limits<double>::quiet_NaN());
     if (!std::isfinite(pointX) || !std::isfinite(pointY) || !std::isfinite(lookahead)) return invalid;
+    const auto motion=graphEstimateMotion(nodeKey,{pointX,pointY},observationTime,node,reset);
+    if(observationTime.time_since_epoch().count()==0)observationTime=std::chrono::steady_clock::now();
+    const double delay=std::clamp(std::chrono::duration<double>(std::chrono::steady_clock::now()-observationTime).count(),0.0,0.35);
+    if(NodeGraph::parameter(node,"kalman_compensate_detection_delay")!=0)lookahead+=delay;
+    lookahead=std::clamp(lookahead+NodeGraph::parameter(node,"kalman_additional_prediction_ms")*0.001,0.0,1.5);
+    const auto state=graphPredictionStates.find(nodeKey);if(state!=graphPredictionStates.end())state->second.lookaheadSec=lookahead;
+    const auto result=NodeGraph::projectPoint(motion.position,motion.velocity,lookahead,motion.damping,motion.ready);
+    return {result.x,result.y};
+}
+NodeGraph::MotionData MouseThread::graphEstimateMotion(int nodeKey,NodeGraph::Point point,
+    std::chrono::steady_clock::time_point observationTime,const NodeGraph::Node& node,bool reset)
+{
+    NodeGraph::MotionData invalid;invalid.damping=std::numeric_limits<double>::quiet_NaN();
+    if(!std::isfinite(point.x)||!std::isfinite(point.y))return invalid;
     auto found = graphPredictionStates.find(nodeKey);
     if (found == graphPredictionStates.end())
     {
@@ -530,17 +431,10 @@ std::pair<double, double> MouseThread::graphPredict(int nodeKey, double pointX, 
     state.kalman.setSettings(settings);
     if (reset || gap<0 || gap>timeout) state.kalman.reset();
     const double dt = gap>0 ? std::clamp(gap,1.0/500.0,0.25) : currentFrameIntervalSec();
-    const double delay = std::clamp(std::chrono::duration<double>(now-observationTime).count(),0.0,0.35);
-    if (NodeGraph::parameter(node,"kalman_compensate_detection_delay")!=0) lookahead+=delay;
-    lookahead+=NodeGraph::parameter(node,"kalman_additional_prediction_ms")*0.001;
-    lookahead=std::clamp(lookahead,0.0,1.5);
-    state.telemetry=state.kalman.update(pointX,pointY,dt,lookahead);
-    state.time=observationTime;state.x=pointX;state.y=pointY;
-    state.velocityX=state.telemetry.velocity_x;state.velocityY=state.telemetry.velocity_y;
-    state.lookaheadSec=lookahead;state.detectionDelaySec=delay;
-    // Existing diagnostics can display the most recent node without owning its state.
-    restorePredictionState(state);
-    return {state.telemetry.predicted_x,state.telemetry.predicted_y};
+    const auto telemetry=state.kalman.update(point.x,point.y,dt,0);
+    state.time=observationTime;state.lookaheadSec=0;
+    return {{telemetry.estimate_x,telemetry.estimate_y},{telemetry.velocity_x,telemetry.velocity_y},
+        state.kalman.settings().velocity_damping,telemetry.prediction_ready,telemetry.warmup_remaining==0};
 }
 
 std::vector<std::pair<double,double>> MouseThread::graphFuturePositions(int nodeKey,int frames) const
@@ -587,14 +481,15 @@ void MouseThread::sendMovementToDriver(int dx, int dy, std::uint64_t generation,
     }
 }
 
-void MouseThread::moveRelative(int dx, int dy)
+void MouseThread::dispatchGraphRecoil(int counts,double pixelsPerCount)
 {
-    sendMovementToDriver(dx, dy, detectionGeneration);
+    if(!std::isfinite(pixelsPerCount))return;
+    sendMovementToDriver(0,counts,detectionGeneration,0,pixelsPerCount);
 }
 
-double MouseThread::graphSpeedCurve(double pointX,double pointY,const NodeGraph::Node& node)
+double MouseThread::graphSpeedCurve(double pointX,double pointY,NodeGraph::Point center,double maximumDistance,const NodeGraph::Node& node)
 {
-    const double distance=std::hypot(pointX-center_x,pointY-center_y);
+    const double distance=std::hypot(pointX-center.x,pointY-center.y);
     const double minimum=NodeGraph::parameter(node,"min_speed"),maximum=NodeGraph::parameter(node,"max_speed");
     const double snap=NodeGraph::parameter(node,"snap_radius"),nearRadius=NodeGraph::parameter(node,"near_radius");
     if(!std::isfinite(distance))return std::numeric_limits<double>::quiet_NaN();
@@ -604,7 +499,7 @@ double MouseThread::graphSpeedCurve(double pointX,double pointY,const NodeGraph:
         const double curve=1-std::pow(1-distance/nearRadius,NodeGraph::parameter(node,"exponent"));
         return minimum+(maximum-minimum)*curve;
     }
-    return minimum+(maximum-minimum)*std::clamp(distance/std::max(1.0,max_distance),0.0,1.0);
+    return minimum+(maximum-minimum)*std::clamp(distance/std::max(1.0,maximumDistance),0.0,1.0);
 }
 
 NodeGraph::Movement MouseThread::graphMouseDelta(double pointX,double pointY,double speed,
@@ -622,8 +517,8 @@ NodeGraph::Movement MouseThread::graphMouseDelta(double pointX,double pointY,dou
     if(NodeGraph::parameter(node,"legacy_fps")!=0 && captureFps.load()>30)
     {const double correction=30.0/captureFps.load();dx*=correction;dy*=correction;}
     if(!std::isfinite(dx)||!std::isfinite(dy))return movement;
-    movement.pixelScaleX=sens*yaw*scale*screen_width/fovX;
-    movement.pixelScaleY=sens*pitch*scale*screen_height/fovY;
+    const auto calibration=NodeGraph::mousePixelCalibration(node,{static_cast<double>(screen_width),static_cast<double>(screen_height)});
+    movement.pixelScaleX=calibration.x;movement.pixelScaleY=calibration.y;
     movement.preciseCounts={dx,dy};movement.hasPreciseCounts=true;
     const int x=static_cast<int>(std::clamp(dx,-32767.0,32767.0)),y=static_cast<int>(std::clamp(dy,-32767.0,32767.0));
     if(x||y)movement.steps.push_back({x,y});
@@ -699,22 +594,6 @@ void MouseThread::dispatchGraphMovement(const NodeGraph::Movement& movement)
         queueMove(step.dx, step.dy, movement.pixelScaleX, movement.pixelScaleY);
 }
 
-bool MouseThread::check_target_in_scope(double target_x, double target_y, double target_w, double target_h, double reduction_factor)
-{
-    double center_target_x = target_x + target_w / 2.0;
-    double center_target_y = target_y + target_h / 2.0;
-
-    double reduced_w = target_w * (reduction_factor / 2.0);
-    double reduced_h = target_h * (reduction_factor / 2.0);
-
-    double x1 = center_target_x - reduced_w;
-    double x2 = center_target_x + reduced_w;
-    double y1 = center_target_y - reduced_h;
-    double y2 = center_target_y + reduced_h;
-
-    return (center_x > x1 && center_x < x2 && center_y > y1 && center_y < y2);
-}
-
 void MouseThread::clearQueuedMoves()
 {
     std::lock_guard<std::mutex> dispatchLock(dispatchMutex);
@@ -760,16 +639,7 @@ void MouseThread::resetPrediction()
     graphPredictionStates.clear();
     graphWindStates.clear();
     clearQueuedMoves();
-    prev_time = std::chrono::steady_clock::time_point();
-    prev_x = 0;
-    prev_y = 0;
-    prev_velocity_x = 0;
-    prev_velocity_y = 0;
-    targetKalman.reset();
-    lastKalmanTelemetry = {};
-    lastPredictionLookaheadSec = 0.0;
-    lastDetectionDelaySec = 0.0;
-    target_detected.store(false);
+
 }
 
 void MouseThread::storeFuturePositions(const std::vector<std::pair<double, double>>& positions)

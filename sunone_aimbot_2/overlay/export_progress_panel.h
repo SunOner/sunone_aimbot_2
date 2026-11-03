@@ -196,7 +196,7 @@ inline void DrawPhaseRows(ImDrawList* draw, const ProgressSnapshot& snapshot,
 }
 
 inline void DrawTensorRtExportPanel(const char* id, const char* title,
-    const char* subtitle, const char* modelName, const char* cancelLabel)
+    const char* subtitle, const char* modelName, const char* cancelLabel,void (*cancel)()=nullptr)
 {
     ProgressSnapshot snapshot = CaptureProgress();
 
@@ -303,7 +303,7 @@ inline void DrawTensorRtExportPanel(const char* id, const char* title,
     }
     if (ImGui::Button(cancelLabel ? cancelLabel : "Cancel export", ImVec2(buttonW, 0.0f)))
     {
-        gTrtExportCancelRequested = true;
+        if(cancel)cancel();else gTrtExportCancelRequested = true;
     }
     if (snapshot.cancelRequested)
     {

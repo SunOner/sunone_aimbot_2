@@ -18,6 +18,7 @@
 #include "config.h"
 #include "detection_buffer.h"
 #include "runtime/input_state.h"
+#include "keyboard/graph_key_state.h"
 #include "runtime/thread_loops.h"
 #include "nodes/node_graph.h"
 
@@ -92,12 +93,16 @@ void mouseThreadFunction(MouseThread& mouseThread)
     std::uint64_t graphRevision = 0;
     struct PredictionCache { NodeGraph::Point input; NodeGraph::Point output; };
     std::unordered_map<int, PredictionCache> predictionCache;
+    struct MotionCache {NodeGraph::Point input;NodeGraph::MotionData output;};
+    std::unordered_map<int,MotionCache> motionCache;
+    double observationDelaySeconds=0;
     std::unordered_map<int, NodeGraph::Movement> windCache;
     bool inputWasCaptured = false;
 
     auto resetSelections = [&]() {
         selectionStates.clear();
         predictionCache.clear();
+        motionCache.clear();
         windCache.clear();
         mouseThread.clearFuturePositions();
         mouseThread.resetPrediction();
@@ -108,9 +113,6 @@ void mouseThreadFunction(MouseThread& mouseThread)
 
     while (!shouldExit)
     {
-        if (mouseThread.applyPendingConfig())
-            resetSelections();
-
         bool hasNewDetection = false;
         int detectionResolution = 0;
         bool pausedNow = false;
@@ -169,15 +171,10 @@ void mouseThreadFunction(MouseThread& mouseThread)
             assignInputDevices();
         }
 
-        if (detection_resolution_changed.load() || detectionResolution != appliedDetectionResolution)
+        if(detectionResolution!=appliedDetectionResolution)
         {
-            {
-                std::lock_guard<std::mutex> cfgLock(configMutex);
-                appliedDetectionResolution = config.detection_resolution;
-                mouseThread.updateConfig(config);
-            }
-            mouseThread.applyPendingConfig();
-            resetSelections();
+            appliedDetectionResolution=detectionResolution;
+            mouseThread.setCaptureResolution(detectionResolution);resetSelections();
         }
 
         const auto requestedRevision = NodeGraph::service().revision();
@@ -212,19 +209,21 @@ void mouseThreadFunction(MouseThread& mouseThread)
         context.aimHeld = aimingNow;
         context.shootHeld = shooting.load();
         context.zoomHeld = zooming.load();
+        context.controlActive = graphAimActive.load();
         context.center = { detectionResolution * 0.5, detectionResolution * 0.5 };
         context.captureFps = captureFps.load();
         context.elapsedSeconds = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - runtimeStartedAt).count();
         context.detectionsAvailable = lastVersion >= 0;
         context.detections = detections;
+        if(hasNewDetection)observationDelaySeconds=std::clamp(std::chrono::duration<double>(std::chrono::steady_clock::now()-detectionTimestamp).count(),0.0,0.35);
+        context.observationDelaySeconds=observationDelaySeconds;
 
         context.selectTarget = [&](int nodeKey,const NodeGraph::DetectionStream& stream,bool lockTarget,const NodeGraph::Node& node) {
             NodeGraph::TargetData selected;
             if(!stream || stream->generation!=controlGeneration) return selected;
             auto& state=selectionStates[nodeKey];
-            const int mode=node.kind==NodeGraph::NodeKind::TargetNearest?1:
-                node.kind==NodeGraph::NodeKind::TargetTracker?2:static_cast<int>(NodeGraph::parameter(node,"mode"));
+            const int mode=node.kind==NodeGraph::NodeKind::TrackDetections?2:node.kind==NodeGraph::NodeKind::ChooseTarget?1:static_cast<int>(NodeGraph::parameter(node,"mode"));
             TargetSelectionSettings settings;
             settings.classPlayer=static_cast<int>(NodeGraph::parameter(node,"class_player"));
             settings.classHead=static_cast<int>(NodeGraph::parameter(node,"class_head"));
@@ -309,8 +308,9 @@ void mouseThreadFunction(MouseThread& mouseThread)
             else if(state.target){state.target.reset();state.trackId=-1;state.observed=state.moveEligible=false;}
             return selected;
         };
-        context.inScope = [&](const NodeGraph::TargetData& target,double multiplier) {
-            return target.valid&&target.observed&&mouseThread.check_target_in_scope(target.x,target.y,target.width,target.height,multiplier);
+        context.inScope = [](const NodeGraph::TargetData& target,double multiplier,NodeGraph::Point center) {
+            return target.valid&&target.observed&&std::abs(target.x+target.width*0.5-center.x)<target.width*multiplier*0.5&&
+                std::abs(target.y+target.height*0.5-center.y)<target.height*multiplier*0.5;
         };
         context.predict = [&](int nodeKey,NodeGraph::Point point,const NodeGraph::Node& node,double lookahead,bool reset) {
             if(hasNewDetection)
@@ -330,8 +330,23 @@ void mouseThreadFunction(MouseThread& mouseThread)
                 point.x+found->second.output.x-found->second.input.x,
                 point.y+found->second.output.y-found->second.input.y};
         };
-        context.speedCurve = [&](NodeGraph::Point point,const NodeGraph::Node& node) {
-            return mouseThread.graphSpeedCurve(point.x,point.y,node);
+        context.speedCurve = [&](NodeGraph::Point point,NodeGraph::Point center,double maximumDistance,const NodeGraph::Node& node) {
+            return mouseThread.graphSpeedCurve(point.x,point.y,center,maximumDistance,node);
+        };
+        context.estimateMotion=[&](int key,NodeGraph::Point point,const NodeGraph::Node& node,bool reset){
+            if(hasNewDetection)motionCache[key]={point,mouseThread.graphEstimateMotion(key,point,detectionTimestamp,node,reset)};
+            else if(reset){motionCache.erase(key);mouseThread.graphEstimateMotion(key,point,detectionTimestamp,node,true);}
+            const auto found=motionCache.find(key);
+            if(found==motionCache.end())return NodeGraph::MotionData{point,{},NodeGraph::parameter(node,"kalman_velocity_damping"),false,false};
+            auto motion=found->second.output;motion.position.x+=point.x-found->second.input.x;motion.position.y+=point.y-found->second.input.y;return motion;
+        };
+        context.futureTrail=[&](const NodeGraph::MotionData& motion,double seconds,const NodeGraph::Node& node){
+            if(!hasNewDetection)return;
+            const int frames=static_cast<int>(NodeGraph::parameter(node,"prediction_futurePositions"));
+            const double dt=trackerFrameIntervalSec(captureFps.load());
+            std::vector<std::pair<double,double>> points;points.reserve(frames);
+            for(int i=1;i<=frames;++i){const auto p=NodeGraph::projectPoint(motion.position,motion.velocity,seconds+i*dt,motion.damping,motion.futureReady);points.emplace_back(p.x,p.y);}
+            mouseThread.storeFuturePositions(points);
         };
         context.mouseDelta = [&](NodeGraph::Point point,double speed,NodeGraph::Point center,const NodeGraph::Node& node) {
             return mouseThread.graphMouseDelta(point.x,point.y,speed,center,node);
@@ -345,7 +360,7 @@ void mouseThreadFunction(MouseThread& mouseThread)
             const auto delta=mouseThread.getMotionCompensationSince(detectionTimestamp);
             return NodeGraph::Point{point.x-delta.first,point.y-delta.second};
         };
-        context.keyDown = [](int virtualKey) {return !editorInputCaptured.load()&&virtualKey>0&&virtualKey<256&&(GetAsyncKeyState(virtualKey)&0x8000)!=0;};
+        context.keyDown = GraphInput::keyDown;
 
         const auto actions = NodeGraph::service().evaluate(context);
         if(editorInputCaptured.load())
@@ -366,7 +381,7 @@ void mouseThreadFunction(MouseThread& mouseThread)
         graphAimActive = actions.valid && actions.aim;
 
         if (actions.valid && actions.aim && hasNewDetection)
-            mouseThread.dispatchGraphMovement(actions.movement);
+            for(const auto& movement:actions.movements)mouseThread.dispatchGraphMovement(movement);
         else if (!actions.valid || !actions.aim)
             mouseThread.clearQueuedMoves();
 
@@ -376,6 +391,8 @@ void mouseThreadFunction(MouseThread& mouseThread)
         if(actions.activePredictionKeys.empty())mouseThread.clearFuturePositions();
         for(auto it=predictionCache.begin();it!=predictionCache.end();)
             if(std::find(actions.activePredictionKeys.begin(),actions.activePredictionKeys.end(),it->first)==actions.activePredictionKeys.end())it=predictionCache.erase(it);else++it;
+        for(auto it=motionCache.begin();it!=motionCache.end();)
+            if(std::find(actions.activePredictionKeys.begin(),actions.activePredictionKeys.end(),it->first)==actions.activePredictionKeys.end())it=motionCache.erase(it);else++it;
         for(auto it=windCache.begin();it!=windCache.end();)
             if(std::find(actions.activeWindKeys.begin(),actions.activeWindKeys.end(),it->first)==actions.activeWindKeys.end())it=windCache.erase(it);else++it;
         for(auto it=selectionStates.begin();it!=selectionStates.end();)
@@ -391,7 +408,8 @@ void mouseThreadFunction(MouseThread& mouseThread)
         if (actions.valid && actions.recoil && std::isfinite(actions.recoilStrength))
         {
             const int compensation = static_cast<int>(std::clamp(actions.recoilStrength, -1000.0, 1000.0));
-            mouseThread.moveRelative(0, compensation);
+            const double pixelsPerCount=actions.recoilStrength!=0?actions.recoilPixelDeltaY/actions.recoilStrength:0;
+            mouseThread.dispatchGraphRecoil(compensation,pixelsPerCount);
         }
     }
 }

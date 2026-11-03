@@ -1,4 +1,5 @@
 #include "nodes/node_graph.h"
+#include <set>
 #include "nodes/node_layout.h"
 
 #include <algorithm>
@@ -51,6 +52,10 @@ std::uint64_t signalStamp(const Value& value)
         if(value.monitor)monitor(*value.monitor);if(value.monitors)for(const auto& m:*value.monitors)monitor(m);break;
     }
     case T::Point: scalar(value.point.x); scalar(value.point.y); break;
+    case T::Motion:
+        scalar(value.motion.position.x);scalar(value.motion.position.y);scalar(value.motion.velocity.x);scalar(value.motion.velocity.y);
+        scalar(value.motion.damping);mix(value.motion.ready);mix(value.motion.futureReady);break;
+    case T::Calibration:mix(reinterpret_cast<std::uintptr_t>(value.calibration.get()));break;
     case T::Target:
         mix(value.target.valid); mix(value.target.observed); mix(value.target.fresh); mix(value.target.trackId); mix(value.target.missedFrames);
         mix(value.target.classId); mix(value.target.pointPrepared); scalar(value.target.x); scalar(value.target.y); scalar(value.target.ageSeconds);
@@ -87,6 +92,7 @@ bool signalIsActive(const Value& value)
     case T::Monitor:return static_cast<bool>(value.monitor);
     case T::Monitors:return static_cast<bool>(value.monitors);
     case T::OverlayStyle:case T::LabelOptions:return static_cast<bool>(value.settings);
+    case T::Calibration:return static_cast<bool>(value.calibration);
     default: return true;
     }
 }
@@ -139,6 +145,12 @@ void promoteInteger(Value& value,ValueType input)
     if(value.type==T::Integer&&input==T::Float){value.number=static_cast<double>(value.integer);value.type=T::Float;}
 }
 Value point(Point p) { Value r; r.type = T::Point; r.point = p; r.valid = std::isfinite(p.x) && std::isfinite(p.y); return r; }
+Value motionValue(MotionData motion)
+{
+    Value value;value.type=T::Motion;value.motion=motion;
+    value.valid=point(motion.position).valid&&point(motion.velocity).valid&&std::isfinite(motion.damping)&&motion.damping>=0&&motion.damping<=3;
+    return value;
+}
 Value target(TargetData t)
 {
     Value r; r.type = T::Target; r.target = t;
@@ -194,10 +206,10 @@ template<class Predicate> DetectionStream filterStream(const DetectionStream& in
     return output;
 }
 bool isStyleNode(K k){return k>=K::OverlayBoxes&&k<=K::OverlayCorrection;}
-bool isSink(K k) { return k == K::AimOutput || k == K::AutoShootOutput || k == K::RecoilOutput ||
+bool isSink(K k) { return k == K::AimOutput || k == K::AutoShootOutput || k == K::RecoilOutput || k==K::RecoilProfileOutput || k==K::SharedRecoilOutput ||
     k==K::VisionOutput || k==K::CollectDataset || k==K::RenderOverlay||k==K::ScreenshotOutput||k==K::ImagePreview||k==K::OverlayOutput||k==K::DatasetOutput; }
 bool isAuxiliarySink(K k){return k==K::CollectDataset||k==K::RenderOverlay||k==K::ScreenshotOutput||k==K::ImagePreview||k==K::OverlayOutput||k==K::DatasetOutput;}
-bool isVisionOnly(K k){return k==K::CaptureSource||k==K::Inference||k==K::DepthInference||k==K::DepthToMask||
+bool isVisionOnly(K k){return k==K::CurrentFrame||k==K::CaptureSource||k==K::Inference||k==K::DepthInference||k==K::DepthToMask||
     k==K::ApplyMask||k==K::FilterMask||k==K::CollectDataset||k==K::RenderOverlay||k==K::VisionOutput||
     k==K::RerouteFrame||k==K::RerouteDepth||k==K::RerouteMask||k==K::ScreenshotOutput||k==K::ImagePreview||
     (k>=K::OverlayBoxes&&k<=K::SetLabels);}
@@ -209,6 +221,7 @@ struct CompiledNode
     bool active = false;
     bool potentiallyActive = false;
     int variableSource=-1;
+    int sharedGraph=-1,sharedIndex=-1;
     std::vector<std::size_t> bindings;
     CompiledNode() { inputs.fill(-1); }
 };
@@ -234,7 +247,7 @@ bool compileGraph(const Graph& graph, CompiledGraph& compiled, std::string& erro
     std::vector<std::vector<int>> outgoing(graph.nodes.size());
     std::unordered_map<std::string,int> variables;
     std::vector<int> variableSources(graph.nodes.size(),-1);
-    int sinks = 0;
+    std::set<K> sinks;
     for (std::size_t i = 0; i < graph.nodes.size(); ++i)
     {
         const Node& n = graph.nodes[i];
@@ -259,7 +272,7 @@ bool compileGraph(const Graph& graph, CompiledGraph& compiled, std::string& erro
         const auto& spec = definition(n.kind);
         if (spec.inputs.size() > MaxPins || spec.dataInputs>MaxDataPins || n.parameters.size() > 64 || n.textParameters.size() > 16)
         { error = "Node parameter or pin limit exceeded."; return false; }
-        if(variableGet(n.kind)||variableSet(n.kind))
+        if(variableGet(n.kind)||variableSet(n.kind)||calibrationIdentifier(n.kind))
         {
             const auto name=textParameter(n,"name");
             if(name.empty()){error="Named values require a nonempty name.";return false;}
@@ -296,10 +309,10 @@ bool compileGraph(const Graph& graph, CompiledGraph& compiled, std::string& erro
             {error="Invalid text input default.";return false;}
         if (isSink(n.kind))
         {
-            const K expected = graph.kind == GraphKind::Aim ? K::AimOutput :
-                graph.kind == GraphKind::AutoShoot ? K::AutoShootOutput : graph.kind==GraphKind::Recoil?K::RecoilOutput:K::VisionOutput;
-            if (n.kind != expected && !(graph.kind==GraphKind::Vision&&isAuxiliarySink(n.kind))) { error = "Output node belongs to another graph."; return false; }
-            if(!isAuxiliarySink(n.kind))++sinks;
+            if ((graph.kind==GraphKind::Vision)!=(n.kind==K::VisionOutput||isAuxiliarySink(n.kind)))
+            { error="Output node belongs to another execution domain.";return false; }
+            if(!isAuxiliarySink(n.kind)&&!sinks.insert(n.kind).second)
+            {error="Each graph can have at most one output of each type.";return false;}
         }
     }
     std::unordered_set<int> groupIds, groupedNodes;
@@ -314,8 +327,6 @@ bool compileGraph(const Graph& graph, CompiledGraph& compiled, std::string& erro
             if (indices.find(member) == indices.end() || !groupedNodes.insert(member).second)
             { error = "Group members must exist and belong to only one group."; return false; }
     }
-    if (sinks > 1)
-    { error = "Each graph can have at most one matching output node."; return false; }
     std::unordered_set<int> tieIds;
     for(const auto& tie:graph.ties)
         if(tie.id<=0||tie.id>1000000||!tieIds.insert(tie.id).second||!finiteBound(tie.x,1000000)||!finiteBound(tie.y,1000000)||!finiteBound(tie.angle,360))
@@ -453,13 +464,22 @@ bool compileGraph(const Graph& graph, CompiledGraph& compiled, std::string& erro
     {error="Only one reachable Capture Source is supported in a Vision graph.";return false;}
     return true;
 }
+bool providerMayBeEnabled(const CompiledNode& node)
+{
+    if(parameter(node.node,"enabled")!=0)return true;
+    const auto& inputs=definition(node.node.kind).inputs;
+    for(std::size_t pin=0;pin<inputs.size();++pin)
+        if(inputs[pin].defaultParameter&&std::strcmp(inputs[pin].defaultParameter,"enabled")==0&&node.inputs[pin]>=0)return true;
+    return isSink(node.node.kind)&&node.inputs[0]>=0;
+}
 bool sameExecution(const Workspace& a,const Workspace& b)
 {
+    if(a.graphs.size()!=b.graphs.size())return false;
     for (std::size_t g = 0; g < a.graphs.size(); ++g)
     {
         const Graph& first = a.graphs[g];
         const Graph& second = b.graphs[g];
-        if (first.kind != second.kind || first.nodes.size() != second.nodes.size() || first.links.size() != second.links.size()) return false;
+        if (first.kind != second.kind || first.active!=second.active || first.enabled!=second.enabled || first.nodes.size() != second.nodes.size() || first.links.size() != second.links.size()) return false;
         std::unordered_map<int,const Node*> nodes;
         for (const Node& node : first.nodes) nodes.emplace(node.id,&node);
         for (const Node& node : second.nodes)
@@ -518,7 +538,7 @@ const std::vector<Definition>& definitions()
         {K::Prediction,"Prediction","Aim","Apply the existing Kalman/delay prediction to the input point.",{{"Point",T::Point}},{{"Predicted",T::Point}}},
         {K::AimOutput,"Mouse output","Outputs","Dispatch the prepared mouse movement batch when Enable is true.",{{"Enable",T::Boolean},{"Movement",T::Movement}},{}},
         {K::AutoShootOutput,"Auto shoot","Outputs","Request shooting for the connected target when Enable is true.",{{"Enable",T::Boolean},{"Target",T::Target}},{}},
-        {K::RecoilOutput,"Recoil movement","Outputs","Send vertical recoil compensation with the requested strength.",{{"Enable",T::Boolean},{"Strength",T::Number}},{}},
+        {K::RecoilOutput,"Recoil movement","Outputs","Send vertical recoil counts. Connect Mouse calibration to include the movement in camera compensation and trails.",{{"Enable",T::Boolean},{"Strength",T::Number},{"Pixels per count",T::Point}},{}},
         {K::Detections,"Detections","Inputs","Current detection stream. Connect this to target selection to run tracking and selection, including target-loss updates.",{},{{"Detections",T::Detections}}},
         {K::AimPoint,"Aim point","Aim","Read the selected target's aim point after head/body offsets.",{{"Target",T::Target}},{{"Point",T::Point}}},
         {K::ScopeCheck,"Scope check","Aim","True when the connected target is within the configured auto shoot scope.",{{"Target",T::Target}},{{"In scope",T::Boolean}}},
@@ -638,6 +658,37 @@ const std::vector<Definition>& definitions()
         const char* title=item.first==K::GetOverlay?"Get overlay style":item.first==K::SetOverlay?"Set overlay style":item.first==K::GetLabels?"Get label options":"Set label options";
         defs.push_back({item.first,title,"Named values","Share settings by name within this graph.",get?std::vector<Pin>{}:std::vector<Pin>{{"Value",item.second}},{{"Value",item.second}},{},{{"name","Name","value",128}}});
     }
+    defs.push_back({K::CurrentFrame,"Frame input","Vision","Read the current frame from the active capture workflow.",{},{{"Frame",T::Frame}}});
+    defs.push_back({K::MouseCalibration,"Mouse calibration","Mouse","Convert one device count to screen pixels using this node's mouse profile and the current capture dimensions. Connect to Recoil movement.",{},{{"Pixels per count",T::Point}}});
+    defs.push_back({K::RecoilProfileOutput,"Recoil movement (local profile)","Outputs","Recoil output with its own calibration. Preserves old graphs at the node limit; use Mouse calibration and Recoil movement for separate cards.",{{"Enable",T::Boolean},{"Strength",T::Number}}, {}});
+    defs.push_back({K::ChooseTarget,"Nearest target","Targets","Select the nearest candidate. Filter classes and choose the aim point in separate nodes.",{{"Detections",T::Detections}},{{"Target",T::Target}}});
+    defs.push_back({K::TrackDetections,"Track target","Targets","Associate detections and keep the selected track. Geometry, velocity, offsets and prediction are separate graph stages.",{{"Detections",T::Detections},{"Lock",T::Boolean}},{{"Target",T::Target}}});
+    defs.push_back({K::BoxPoint,"Point in box","Geometry","Position + Size * Anchor. Anchor uses relative coordinates, for example 0.5, 0.5 for the center.",{{"Position",T::Point},{"Size",T::Point},{"Anchor",T::Point}},{{"Point",T::Point}}});
+    defs.push_back({K::TargetAnchor,"Aim offsets","Targets","Choose the relative head/body anchor from the connected class ID.",{{"Class",T::Integer},{"Body offset",T::Float,"body_y_offset"},{"Head offset",T::Float,"head_y_offset"}},{{"Anchor",T::Point}}});
+    defs.push_back({K::BoxContainsPoint,"Point in box?","Geometry","Check the point against the scaled box. Connect Target observed separately when a real observation is required.",{{"Position",T::Point},{"Size",T::Point},{"Point",T::Point},{"Multiplier",T::Float,"multiplier"}},{{"Inside",T::Boolean}}});
+    defs.push_back({K::MotionEstimate,"Estimate motion","Motion","Filter new point observations once and estimate their velocity. Read Position, Velocity, Damping and Ready from this shared sample.",{{"Point",T::Point},{"Reset",T::Boolean}},{{"Motion",T::Motion}}});
+    defs.push_back({K::MotionPosition,"Filtered position","Motion","Read the filtered position from an estimated motion sample.",{{"Motion",T::Motion}},{{"Position",T::Point}}});
+    defs.push_back({K::MotionVelocity,"Velocity","Motion","Read the estimated velocity in pixels per second. Estimation is shared with Filtered position.",{{"Motion",T::Motion}},{{"Velocity",T::Point}}});
+    defs.push_back({K::MotionDamping,"Velocity damping","Motion","Read the sample's damping for the projection formula.",{{"Motion",T::Motion}},{{"Damping",T::Float}}});
+    defs.push_back({K::MotionReady,"Motion ready","Motion","True after filter warmup. Connect to Project point to keep warmup behavior explicit.",{{"Motion",T::Motion}},{{"Ready",T::Boolean}}});
+    defs.push_back({K::PredictionTime,"Prediction time","Motion","Combine lookahead, measured observation delay and an extra time offset.",{{"Lookahead",T::Float,"lookahead"}},{{"Seconds",T::Float}}});
+    defs.push_back({K::ProjectPoint,"Project point","Motion","Project Position along Velocity for the requested time, with optional damping and warmup gating.",{{"Position",T::Point},{"Velocity",T::Point},{"Seconds",T::Float,"seconds"},{"Damping",T::Float,"damping"},{"Ready",T::Boolean,"ready"}},{{"Point",T::Point}}});
+    defs.push_back({K::FutureTrail,"Future trail","Motion","Pass the point through and optionally publish future sample positions for Overlay trails.",{{"Point",T::Point},{"Motion",T::Motion},{"Seconds",T::Float,"seconds"}},{{"Point",T::Point}}});
+    defs.push_back({K::RerouteMotion,"Reroute motion","Routing","Route an estimated motion sample.",{{"Motion",T::Motion}},{{"Motion",T::Motion}}});
+    defs.push_back({K::GetMotion,"Get motion","Named values","Read the matching motion sample in this graph.",{},{{"Motion",T::Motion}},{},{{"name","Name","motion",128}}});
+    defs.push_back({K::SetMotion,"Set motion","Named values","Share this motion sample by name within the graph.",{{"Motion",T::Motion}},{{"Motion",T::Motion}},{},{{"name","Name","motion",128}}});
+    defs.push_back({K::MouseProfile,"Mouse calibration","Mouse","Named FOV and device calibration shared by aiming and recoil. Place it in any enabled Logic workflow; edit its inputs to update both consumers.",{},{{"Calibration",T::Calibration}}});
+    defs.push_back({K::SharedCalibration,"Shared calibration","Mouse","Read the named Mouse calibration from an enabled Logic workflow. Missing or ambiguous names stop this branch.",{},{{"Calibration",T::Calibration}},{},{{"name","Name","mouse",128}}});
+    defs.push_back({K::CalibrationScale,"Pixels per count","Mouse","Read the shared calibration's screen-pixel feedback scale, including the legacy raw-count fallback for zero profile axes.",{{"Calibration",T::Calibration}},{{"Pixels per count",T::Point}}});
+    defs.push_back({K::PointDelta,"Point delta","Points","Subtract Center from Point before movement conversion.",{{"Point",T::Point},{"Center",T::Point}},{{"Delta",T::Point}},{{"implicit_center","Use capture center",1,0,1,P::Boolean}}});
+    defs.push_back({K::PixelsToCounts,"Pixels to counts","Mouse","Convert pixel displacement to precise device counts. Zero sensitivity or profile axes produce no aim movement.",{{"Delta",T::Point},{"Calibration",T::Calibration}},{{"Movement",T::Movement}}});
+    defs.push_back({K::ApplyMouseSpeed,"Apply speed","Mouse","Scale precise mouse counts before FPS normalization and integer quantization. Carries calibration into motion feedback.",{{"Movement",T::Movement},{"Speed",T::Float}},{{"Movement",T::Movement}}});
+    defs.push_back({K::SharedMouseDelta,"Mouse delta (shared, combined)","Combined nodes","Compatibility form for full graphs. Uses the same named calibration as recoil.",{{"Point",T::Point},{"Speed",T::Float},{"Center",T::Point}},{{"Movement",T::Movement}},{},{{"name","Name","mouse",128}}});
+    defs.push_back({K::SharedRecoilOutput,"Recoil (shared, combined)","Outputs","Recoil output using a named common profile when there is no room for separate reader nodes.",{{"Enable",T::Boolean},{"Strength",T::Float}}, {},{},{{"name","Name","mouse",128}}});
+    defs.push_back({K::RerouteCalibration,"Reroute calibration","Routing","Route a shared mouse calibration.",{{"Calibration",T::Calibration}},{{"Calibration",T::Calibration}}});
+    defs.push_back({K::GetCalibration,"Get calibration","Named values","Read the matching local Set calibration.",{},{{"Calibration",T::Calibration}},{},{{"name","Name","calibration",128}}});
+    defs.push_back({K::SetCalibration,"Set calibration","Named values","Share this calibration by name inside this graph.",{{"Calibration",T::Calibration}},{{"Calibration",T::Calibration}},{},{{"name","Name","calibration",128}}});
+    defs.push_back({K::SharedCalibrationScale,"Shared scale (combined)","Combined nodes","Read the named shared profile's pixels-per-count scale in a full graph.",{},{{"Pixels per count",T::Point}},{},{{"name","Name","mouse",128}}});
     defs[static_cast<std::size_t>(K::String)].textParameters={{"value","Value","",4096}};
     defs[static_cast<std::size_t>(K::FloatToString)].parameters={{"digits","Decimal places",3,0,12,P::Integer}};
     defs[static_cast<std::size_t>(K::MonitorAt)].parameters={{"index","Index",0,0,255,P::Integer}};
@@ -656,6 +707,16 @@ const std::vector<Definition>& definitions()
         {"kalman_reset_timeout_sec","Reset timeout (seconds)",0.5,0.05,3},
         {"prediction_futurePositions","Future positions",20,0,300,P::Integer},
         {"draw_futurePositions","Draw future positions",0,0,1,P::Boolean}};
+    auto& estimate=defs[static_cast<size_t>(K::MotionEstimate)];
+    for(const auto& spec:prediction.parameters)if(std::string(spec.key).rfind("kalman_",0)==0&&std::strcmp(spec.key,"kalman_compensate_detection_delay")&&std::strcmp(spec.key,"kalman_additional_prediction_ms"))estimate.parameters.push_back(spec);
+    defs[static_cast<size_t>(K::PredictionTime)].parameters={prediction.parameters[0],prediction.parameters[8],prediction.parameters[9]};
+    defs[static_cast<size_t>(K::PredictionTime)].parameters[1].label="Include delay";
+    defs[static_cast<size_t>(K::ProjectPoint)].parameters={{"seconds","Seconds",0,0,1.5},{"damping","Damping",0,0,3},{"ready","Ready",1,0,1,P::Boolean}};
+    defs[static_cast<size_t>(K::FutureTrail)].parameters={{"seconds","Seconds",0,0,1.5},prediction.parameters[11],prediction.parameters[12]};
+    defs[static_cast<size_t>(K::FutureTrail)].parameters[1].label="Trail frames";
+    defs[static_cast<size_t>(K::FutureTrail)].parameters[2].label="Show trail";
+    defs[static_cast<size_t>(K::TargetAnchor)].parameters={{"class_head","Head class",1,0,100000,P::Integer},{"body_y_offset","Body Y offset",0.15,0,1},{"head_y_offset","Head Y offset",0.05,0,1}};
+    defs[static_cast<size_t>(K::BoxContainsPoint)].parameters={{"multiplier","Scope multiplier",1,0.01,5}};
     auto selection=[](bool legacy,int mode) { return std::vector<ParameterSpec>{
         {"mode","Selection mode",static_cast<double>(mode),1,2,P::Integer,"Nearest|Tracker"},
         {"class_player","Body class",0,0,100000,P::Integer},{"class_head","Head class",1,0,100000,P::Integer},
@@ -669,15 +730,20 @@ const std::vector<Definition>& definitions()
     defs[static_cast<size_t>(K::Target)].parameters.push_back({"legacy_camera_compensation","Legacy camera compensation",1,0,1,P::Boolean});
     defs[static_cast<size_t>(K::TargetNearest)].parameters=selection(false,1);
     defs[static_cast<size_t>(K::TargetTracker)].parameters=selection(false,2);
+    defs[static_cast<size_t>(K::TrackDetections)].parameters={{"class_player","Body class",0,0,100000,P::Integer},{"class_head","Head class",1,0,100000,P::Integer},{"max_missed_frames","Missed frame limit",6,0,120,P::Integer}};
+    for(const auto& entry:std::vector<std::pair<K,const char*>>{{K::Target,"Target (combined)"},{K::TargetNearest,"Nearest target (combined)"},{K::TargetTracker,"Track target (combined)"},
+        {K::AimPoint,"Aim point (combined)"},{K::ScopeCheck,"Scope check (combined)"},{K::Prediction,"Prediction (combined)"}})
+    {defs[static_cast<size_t>(entry.first)].title=entry.second;defs[static_cast<size_t>(entry.first)].category="Combined nodes";}
     auto& aimPoint=defs[static_cast<size_t>(K::AimPoint)];
     aimPoint.description="Calculate the aim point from bounding box, class and per-node relative offsets.";
     aimPoint.inputs={{"Target",T::Target},{"Body offset",T::Number,"body_y_offset"},{"Head offset",T::Number,"head_y_offset"}};
     aimPoint.parameters={{"class_head","Head class",1,0,100000,P::Integer},{"body_y_offset","Body Y offset",0.15,0,1},{"head_y_offset","Head Y offset",0.05,0,1}};
     auto& scope=defs[static_cast<size_t>(K::ScopeCheck)];
-    scope.inputs={{"Target",T::Target},{"Multiplier",T::Number,"multiplier"}};
+    scope.inputs={{"Target",T::Target},{"Multiplier",T::Number,"multiplier"},{"Center",T::Point}};
     scope.parameters={{"multiplier","Scope multiplier",1,0.01,5}};
+    defs[static_cast<size_t>(K::SpeedCurve)].inputs={{"Point",T::Point},{"Center",T::Point}};
     defs[static_cast<size_t>(K::SpeedCurve)].parameters={{"min_speed","Minimum speed",1,0.01,20},{"max_speed","Maximum speed",1,0.01,20},
-        {"snap_radius","Snap radius",0,0,1000},{"near_radius","Near radius",0,0,2000},{"exponent","Speed curve exponent",1,0.1,10},{"snap_boost","Snap boost",1,0,20}};
+        {"snap_radius","Snap radius",0,0,1000},{"near_radius","Near radius",0,0,2000},{"exponent","Speed curve exponent",1,0.1,10},{"snap_boost","Snap boost",1,0,20},{"max_distance","Maximum distance (0 uses frame)",0,0,1000000}};
     auto& delta=defs[static_cast<size_t>(K::MouseDelta)];
     delta.inputs={{"Point",T::Point},{"Speed",T::Number},{"Center",T::Point}};
     delta.parameters={{"fov_x","Horizontal FOV",90,1,179,P::Integer},{"fov_y","Vertical FOV",90,1,179,P::Integer},
@@ -685,6 +751,19 @@ const std::vector<Definition>& definitions()
         {"fov_scaled","Scale sensitivity with FOV",0,0,1,P::Boolean},{"base_fov","Base FOV",90,0,179},
         {"legacy_center","Legacy implicit center",0,0,1,P::Boolean},{"legacy_fps","Legacy implicit FPS scaling",0,0,1,P::Boolean}};
     delta.textParameters={{"profile_name","Profile name","UNIFIED",128}};
+    auto& calibration=defs[static_cast<size_t>(K::MouseCalibration)];
+    calibration.parameters.assign(delta.parameters.begin(),delta.parameters.begin()+7);
+    calibration.textParameters=delta.textParameters;
+    defs[static_cast<size_t>(K::MouseProfile)].parameters=calibration.parameters;
+    defs[static_cast<size_t>(K::MouseProfile)].textParameters=calibration.textParameters;
+    defs[static_cast<size_t>(K::MouseProfile)].textParameters[0].label="Calibration label";
+    defs[static_cast<size_t>(K::MouseProfile)].textParameters.push_back({"name","Shared name","mouse",128});
+    defs[static_cast<size_t>(K::SharedMouseDelta)].parameters={delta.parameters[7],delta.parameters[8]};
+    delta.title="Mouse delta (combined)";delta.category="Combined nodes";
+    calibration.title="Local calibration (legacy)";calibration.category="Combined nodes";
+    auto& recoil=defs[static_cast<size_t>(K::RecoilProfileOutput)];
+    recoil.parameters=calibration.parameters;
+    recoil.textParameters=calibration.textParameters;
     defs[static_cast<size_t>(K::WindMotion)].parameters={{"enabled","Wind enabled",1,0,1,P::Boolean},
         {"wind_G","Gravity",9,0.05,50},{"wind_W","Wind",3,0,80},{"wind_M","Maximum step",10,1,100},{"wind_D","Distance",12,1,100}};
     for(K kind:{K::AutoAimEnabled,K::AutoShootEnabled,K::RecoilEnabled})
@@ -693,10 +772,11 @@ const std::vector<Definition>& definitions()
     defs[static_cast<size_t>(K::FilterClasses)].parameters={{"class_a","First class",0,-1,100000,P::Integer},{"class_b","Second class",1,-1,100000,P::Integer},{"class_b_enabled","Allow second class",1,0,1,P::Boolean}};
     defs[static_cast<size_t>(K::FilterConfidence)].parameters={{"threshold","Minimum confidence",0.1,0,1}};
     defs[static_cast<size_t>(K::FilterSize)].parameters={{"min_area","Minimum area",0,0,1e9},{"max_area","Maximum area",1e9,0,1e9}};
-    defs[static_cast<size_t>(K::FilterCircle)].parameters={{"enabled","Enabled",1,0,1,P::Boolean},{"radius","Radius (pixels)",160,0,100000}};
+    defs[static_cast<size_t>(K::FilterCircle)].parameters={{"enabled","Enabled",1,0,1,P::Boolean},{"radius","Radius (pixels)",160,0,100000},
+        {"radius_percent","Radius percent (0 uses pixels)",0,0,100,P::Integer}};
     defs[static_cast<size_t>(K::PreferClass)].parameters={{"class_id","Preferred class",1,0,100000,P::Integer},{"enabled","Enabled",1,0,1,P::Boolean}};
     defs[static_cast<size_t>(K::CameraCompensation)].parameters={{"enabled","Enabled",1,0,1,P::Boolean}};
-    defs[static_cast<size_t>(K::NormalizeFps)].parameters={{"base_fps","Base FPS",30,1,1000}};
+    defs[static_cast<size_t>(K::NormalizeFps)].parameters={{"base_fps","Base FPS",30,1,1000},{"enabled","Enabled",1,0,1,P::Boolean},{"preserve_fraction","Keep precise counts",0,0,1,P::Boolean}};
     for(K kind:{K::KeyHeld,K::KeyPressed,K::KeyReleased})
         defs[static_cast<size_t>(kind)].parameters={{"virtual_key","Virtual key code (0=None)",2,0,255,P::Integer}};
     auto& capture=defs[static_cast<size_t>(K::CaptureSource)];
@@ -784,7 +864,7 @@ const std::vector<Definition>& definitions()
         const auto exists=[&](const char* key){return std::any_of(def.inputs.begin(),def.inputs.end(),[&](const Pin& p){return p.defaultParameter&&std::strcmp(p.defaultParameter,key)==0;});};
         for(const auto& spec:def.parameters)if(!exists(spec.key))
             def.inputs.push_back({spec.label,spec.kind==P::Boolean?T::Boolean:spec.kind==P::Integer?T::Integer:T::Float,spec.key,true});
-        for(const auto& spec:def.textParameters)if(!exists(spec.key)&&!((variableGet(def.kind)||variableSet(def.kind))&&std::strcmp(spec.key,"name")==0))
+        for(const auto& spec:def.textParameters)if(!exists(spec.key)&&!((variableGet(def.kind)||variableSet(def.kind)||calibrationIdentifier(def.kind))&&std::strcmp(spec.key,"name")==0))
             def.inputs.push_back({spec.label,T::String,spec.key,true});
     }
     return defs;
@@ -811,7 +891,101 @@ void initializeParameters(Node& node)
 Node defaultNode(NodeKind kind,int id,float x,float y)
 {
     Node node;node.id=id;node.kind=kind;node.x=x;node.y=y;
-    node.value=kind==K::Boolean?1:0;initializeParameters(node);return node;
+    node.value=kind==K::Boolean?1:0;initializeParameters(node);if(kind==K::ApplyMouseSpeed)node.inputValues[1]=1;return node;
+}
+Point projectPoint(Point position,Point velocity,double seconds,double damping,bool ready)
+{
+    const double t=ready?std::clamp(seconds,0.0,1.5):0;
+    const double scale=damping>1e-6?(1-std::exp(-damping*t))/damping:t;
+    return {position.x+velocity.x*scale,position.y+velocity.y*scale};
+}
+Point mousePixelCalibration(const Node& node,Point frameSize)
+{
+    const double sens=parameter(node,"sens"),yaw=parameter(node,"yaw"),pitch=parameter(node,"pitch");
+    // The legacy conversion used raw counts when any profile axis was zero.
+    if(sens==0||yaw==0||pitch==0)return {1,1};
+    const double fovX=std::max(1.0,parameter(node,"fov_x")),fovY=std::max(1.0,parameter(node,"fov_y"));
+    const double base=parameter(node,"base_fov");
+    const double scale=parameter(node,"fov_scaled")!=0&&base>1?fovX/base:1;
+    return {sens*yaw*scale*std::max(1.0,frameSize.x)/fovX,sens*pitch*scale*std::max(1.0,frameSize.y)/fovY};
+}
+bool calibrationIdentifier(NodeKind kind){return kind==K::MouseProfile||kind==K::SharedCalibration||kind==K::SharedMouseDelta||kind==K::SharedRecoilOutput||kind==K::SharedCalibrationScale;}
+CalibrationData mouseCalibration(const Node& node,Point size)
+{
+    CalibrationData result;const double x=parameter(node,"fov_x"),y=parameter(node,"fov_y"),base=parameter(node,"base_fov");
+    const double sensitivity=parameter(node,"sens"),yaw=parameter(node,"yaw"),pitch=parameter(node,"pitch");
+    const double scale=parameter(node,"fov_scaled")!=0&&base>1?x/base:1;
+    result.degreesPerPixel={x/std::max(1.0,size.x),y/std::max(1.0,size.y)};
+    result.countsPerDegree={sensitivity*yaw*scale,sensitivity*pitch*scale};
+    result.pixelsPerCount=mousePixelCalibration(node,size);result.aimEnabled=sensitivity!=0&&yaw!=0&&pitch!=0&&x>0&&y>0;
+    result.profileName=textParameter(node,"profile_name");return result;
+}
+Movement pixelsToCounts(Point delta,const CalibrationData& calibration)
+{
+    Movement result;if(!calibration.aimEnabled)return result;
+    const double x=delta.x*calibration.degreesPerPixel.x/calibration.countsPerDegree.x;
+    const double y=delta.y*calibration.degreesPerPixel.y/calibration.countsPerDegree.y;
+    result.preciseCounts={x,y};result.hasPreciseCounts=true;result.pixelScaleX=calibration.pixelsPerCount.x;result.pixelScaleY=calibration.pixelsPerCount.y;
+    if(!std::isfinite(x)||!std::isfinite(y))return result;
+    const int dx=static_cast<int>(std::clamp(x,-32767.0,32767.0)),dy=static_cast<int>(std::clamp(y,-32767.0,32767.0));
+    if(dx||dy)result.steps.push_back({dx,dy});return result;
+}
+Movement applyMouseSpeed(const Movement& input,double speed)
+{
+    Movement result;result.pixelScaleX=input.pixelScaleX;result.pixelScaleY=input.pixelScaleY;
+    if(input.hasPreciseCounts)
+    {
+        const double x=input.preciseCounts.x*speed,y=input.preciseCounts.y*speed;result.preciseCounts={x,y};result.hasPreciseCounts=true;
+        if(!std::isfinite(x)||!std::isfinite(y))return result;
+        const int dx=static_cast<int>(std::clamp(x,-32767.0,32767.0)),dy=static_cast<int>(std::clamp(y,-32767.0,32767.0));
+        if(dx||dy)result.steps.push_back({dx,dy});
+    }
+    else for(const auto& step:input.steps)
+    {result.steps.push_back({static_cast<int>(std::lround(std::clamp(step.dx*speed,-32767.0,32767.0))),static_cast<int>(std::lround(std::clamp(step.dy*speed,-32767.0,32767.0)))});}
+    return result;
+}
+void migrateRecoilCalibration(Workspace& workspace)
+{
+    Node profile=defaultNode(K::MouseDelta,1);
+    for(const auto& graph:workspace.graphs)if(graph.active&&graph.kind!=GraphKind::Vision)
+    {
+        const auto found=std::find_if(graph.nodes.begin(),graph.nodes.end(),[](const Node& node){return node.kind==K::MouseDelta;});
+        if(found!=graph.nodes.end()){profile=*found;break;}
+    }
+    for(auto& graph:workspace.graphs)
+    {
+        std::vector<int> outputs;
+        for(const auto& node:graph.nodes)if(node.kind==K::RecoilOutput&&
+            std::none_of(graph.links.begin(),graph.links.end(),[&](const Link& link){return link.toNode==node.id&&link.toPort==2;}))outputs.push_back(node.id);
+        if(outputs.empty())continue;
+        Node calibration=defaultNode(K::MouseCalibration,1);
+        for(const auto& spec:definition(K::MouseCalibration).parameters)calibration.parameters[spec.key]=parameter(profile,spec.key);
+        calibration.textParameters["profile_name"]=textParameter(profile,"profile_name");
+        float bottom=0;
+        while(std::any_of(graph.nodes.begin(),graph.nodes.end(),[&](const Node& node){return node.id==calibration.id;}))++calibration.id;
+        for(const auto& node:graph.nodes)bottom=std::max(bottom,node.y+Layout::height(node));
+        if(graph.nodes.size()>=MaxNodes||graph.links.size()+outputs.size()>MaxLinks)
+        {
+            // A full graph keeps the same formula on its output card rather
+            // than dropping the calibration or adding nodes beyond its limit.
+            for(auto& node:graph.nodes)if(std::find(outputs.begin(),outputs.end(),node.id)!=outputs.end())
+            {
+                node.kind=K::RecoilProfileOutput;
+                for(const auto& spec:definition(K::MouseCalibration).parameters)node.parameters[spec.key]=parameter(calibration,spec.key);
+                node.textParameters["profile_name"]=textParameter(calibration,"profile_name");
+                if(node.height>0&&node.height<Layout::minimumHeight(node))node.height=Layout::up(Layout::minimumHeight(node));
+            }
+            continue;
+        }
+        calibration.y=Layout::up(bottom+64);
+        for(int id:outputs)graph.links.push_back({calibration.id,0,id,2});
+        if(graph.groups.size()<MaxGroups)
+        {
+            int id=1;for(const auto& group:graph.groups)id=std::max(id,group.id+1);
+            graph.groups.push_back({id,"Mouse calibration",-32,calibration.y-64,Layout::width(calibration)+64,Layout::height(calibration)+96,0x40adde66u,{calibration.id}});
+        }
+        graph.nodes.push_back(std::move(calibration));
+    }
 }
 const Definition& definition(NodeKind kind)
 {
@@ -837,15 +1011,15 @@ const char* typeName(ValueType type)
         case T::Detections: return "Detections"; case T::Target: return "Target"; case T::Movement: return "Mouse movement";
         case T::Frame:return "Frame";case T::Depth:return "Depth";case T::Mask:return "Mask";
         case T::String:return "String";case T::Monitor:return "Monitor";case T::Monitors:return "Monitors";
-        case T::OverlayStyle:return "Overlay style";case T::LabelOptions:return "Label options"; }
+        case T::OverlayStyle:return "Overlay style";case T::LabelOptions:return "Label options";case T::Motion:return "Motion sample";case T::Calibration:return "Mouse calibration"; }
     return "Unknown";
 }
 bool canConnectTypes(ValueType output,ValueType input)
 {
     return output==input||(output==T::Integer&&input==T::Float);
 }
-bool variableGet(NodeKind kind){return (kind>=K::GetBoolean&&kind<=K::SetMask&&((static_cast<int>(kind)-static_cast<int>(K::GetBoolean))%2)==0)||kind==K::GetOverlay||kind==K::GetLabels;}
-bool variableSet(NodeKind kind){return (kind>=K::GetBoolean&&kind<=K::SetMask&&!variableGet(kind))||kind==K::SetOverlay||kind==K::SetLabels;}
+bool variableGet(NodeKind kind){return (kind>=K::GetBoolean&&kind<=K::SetMask&&((static_cast<int>(kind)-static_cast<int>(K::GetBoolean))%2)==0)||kind==K::GetOverlay||kind==K::GetLabels||kind==K::GetMotion||kind==K::GetCalibration;}
+bool variableSet(NodeKind kind){return (kind>=K::GetBoolean&&kind<=K::SetMask&&!variableGet(kind))||kind==K::SetOverlay||kind==K::SetLabels||kind==K::SetMotion||kind==K::SetCalibration;}
 MonitorList systemMonitors()
 {
     static std::mutex mutex;static MonitorList cached;static std::chrono::steady_clock::time_point sampled{};
@@ -885,7 +1059,7 @@ MonitorList systemMonitors()
 static Workspace previousStarterGraphs(bool compact=true,bool expanded=true)
 {
     Workspace w;
-    for (std::size_t i = 0; i < GraphCount; ++i) w.graphs[i].kind = static_cast<GraphKind>(i);
+    for (std::size_t i = 0; i < GraphCount; ++i) {w.graphs[i].kind = static_cast<GraphKind>(i);w.graphs[i].workflow=static_cast<int>(i)+1;}
     w.graphs[0].nodes = {{1,K::AimHeld,0,0},{2,K::TargetValid,512,320},{3,K::And,512,64},
         {4,K::Target,256,320},{5,K::Prediction,0,544},{6,K::AimOutput,768,736},
         {7,K::Detections,0,320},{8,K::AimPoint,768,320},
@@ -1031,7 +1205,9 @@ static void readableStarterLayout(Graph& graph,int columns=4,bool stages=true)
             {4,"04 Fire conditions and output",0,0,0,0,blue,{4,5,10,6}}};break;
     case GraphKind::Recoil:
         graph.groups={{1,"01 Shoot and zoom",0,0,0,0,blue,{1,2,4}},
-            {2,"02 Recoil settings and output",0,0,0,0,green,{3,5,6,7}}};break;
+            {2,"02 Recoil settings and output",0,0,0,0,green,{3,5,6,7}}};
+        if(std::any_of(graph.nodes.begin(),graph.nodes.end(),[](const Node& node){return node.id==8&&node.kind==K::MouseCalibration;}))graph.groups.back().nodes.insert(graph.groups.back().nodes.end()-1,8);
+        break;
     case GraphKind::Vision:
         graph.groups={{1,"01 Capture and depth",0,0,0,0,blue,{1,3,4}},
             {2,"02 Model inference",0,0,0,0,purple,{5,2}},
@@ -1121,12 +1297,388 @@ static bool compactOutputNodes(Graph& graph,bool separateGroups=false,int column
     if(changed)Layout::arrange(graph,columns);
     return changed;
 }
+static void processingStarterLayout(Graph& graph);
+bool expandProcessingNodes(Graph& graph)
+{
+    bool changed=false;
+    const bool standardGroups=std::any_of(graph.groups.begin(),graph.groups.end(),[&](const Group& group){return
+        (graph.kind==GraphKind::Aim&&group.title=="03 Prediction and speed")||(graph.kind==GraphKind::AutoShoot&&group.title=="03 Target and scope");});
+    const bool starter=standardGroups&&graph.nodes.size()==previousStarterGraphs().graphs[static_cast<std::size_t>(graph.kind)].nodes.size();
+    const auto find=[&](int id)->Node*{for(auto& node:graph.nodes)if(node.id==id)return &node;return nullptr;};
+    const auto pinFor=[](K kind,const std::string& key)->int{const auto& d=definition(kind);for(std::size_t p=0;p<d.inputs.size();++p)if(d.inputs[p].defaultParameter&&key==d.inputs[p].defaultParameter)return static_cast<int>(p);return -1;};
+    for(const auto& link:graph.links){const auto* source=find(link.fromNode);const auto* target=find(link.toNode);if(!source||!target||link.fromPort<0||link.toPort<0||static_cast<std::size_t>(link.fromPort)>=definition(source->kind).outputs.size()||static_cast<std::size_t>(link.toPort)>=definition(target->kind).inputs.size())return false;}
+    std::vector<int> ids;for(const auto& node:graph.nodes)ids.push_back(node.id);
+    for(int id:ids)
+    {
+        const Node old=*find(id);if(old.bypassed)continue;
+        const auto& def=definition(old.kind);
+        if(old.kind==K::Target||old.kind==K::TargetNearest||old.kind==K::TargetTracker)
+        {
+            bool simple=true;
+            for(const char* key:{"legacy_offsets","filter_classes","prefer_head","merge_head_body","disable_headshot","legacy_camera_compensation"})simple&=parameter(old,key)==0;
+            for(const auto& link:graph.links)if(link.toNode==id&&link.toPort>=2)
+            {
+                const std::string key=def.inputs[link.toPort].defaultParameter?def.inputs[link.toPort].defaultParameter:"";
+                simple&=key=="class_player"||key=="class_head"||key=="max_missed_frames";
+            }
+            if(!simple)continue;
+            const K kind=parameter(old,"mode")==2?K::TrackDetections:K::ChooseTarget;
+            Node replacement=defaultNode(kind,id,old.x,old.y);replacement.disabled=old.disabled;replacement.collapsed=old.collapsed;
+            for(const auto& spec:definition(kind).parameters)replacement.parameters[spec.key]=parameter(old,spec.key);
+            for(auto it=graph.links.begin();it!=graph.links.end();)
+            {
+                if(it->toNode!=id){++it;continue;}
+                if(it->toPort==0||(it->toPort==1&&kind==K::TrackDetections)){++it;continue;}
+                const auto* key=def.inputs[it->toPort].defaultParameter;const int port=key?pinFor(kind,key):-1;
+                if(port>=0){it->toPort=port;++it;}else it=graph.links.erase(it);
+            }
+            if(kind==K::TrackDetections&&old.inputValues.count(1))replacement.inputValues[1]=old.inputValues.at(1);
+            *find(id)=std::move(replacement);changed=true;continue;
+        }
+    }
+    for(int id:ids)
+    {
+        const Node old=*find(id);if(old.bypassed)continue;
+        const auto& def=definition(old.kind);
+        std::vector<K> kinds;
+        int observedSource=0;
+        if(old.kind==K::Prediction)kinds={K::MotionEstimate,K::MotionPosition,K::MotionVelocity,K::MotionDamping,K::MotionReady,K::PredictionTime,K::ProjectPoint};
+        else if(old.kind==K::AimPoint)
+        {
+            const auto input=std::find_if(graph.links.begin(),graph.links.end(),[&](const Link& link){return link.toNode==id&&link.toPort==0;});
+            const auto* source=input==graph.links.end()?nullptr:find(input->fromNode);
+            if(!source||(source->kind!=K::TrackDetections&&source->kind!=K::ChooseTarget))continue;
+            kinds={K::TargetPosition,K::TargetSize,K::TargetClass,K::TargetAnchor};
+        }
+        else if(old.kind==K::ScopeCheck)
+        {
+            const auto source=std::find_if(graph.links.begin(),graph.links.end(),[&](const Link& link){return link.toNode==id&&link.toPort==0;});
+            if(source!=graph.links.end())for(const auto& candidate:graph.nodes)if(candidate.kind==K::TargetObserved&&!candidate.disabled&&!candidate.bypassed&&
+                std::any_of(graph.links.begin(),graph.links.end(),[&](const Link& link){return link.toNode==candidate.id&&link.toPort==0&&link.fromNode==source->fromNode&&link.fromPort==source->fromPort;})){observedSource=candidate.id;break;}
+            kinds={K::TargetPosition,K::TargetSize,K::BoxContainsPoint};if(!observedSource)kinds.push_back(K::TargetObserved);
+        }
+        else continue;
+        const std::size_t extraLinks=old.kind==K::Prediction?12:6;
+        if(graph.nodes.size()+kinds.size()>MaxNodes||graph.links.size()+extraLinks>MaxLinks)continue;
+        std::vector<Node> additions;
+        int next=1;
+        for(K kind:kinds)
+        {
+            while(find(next)||std::any_of(additions.begin(),additions.end(),[&](const Node& node){return node.id==next;}))++next;
+            auto node=defaultNode(kind,next++,old.x,old.y);
+            for(const auto& spec:definition(kind).parameters)if(std::any_of(def.parameters.begin(),def.parameters.end(),[&](const ParameterSpec& s){return std::strcmp(s.key,spec.key)==0;}))node.parameters[spec.key]=parameter(old,spec.key);
+            additions.push_back(std::move(node));
+        }
+        auto replacement=defaultNode(old.kind==K::Prediction?K::FutureTrail:old.kind==K::AimPoint?K::BoxPoint:K::SelectBoolean,id,old.x,old.y);
+        if(old.kind==K::ScopeCheck)replacement.inputValues[2]=0;
+        replacement.disabled=old.disabled;replacement.collapsed=old.collapsed;
+        if(old.kind==K::Prediction)for(const char* key:{"prediction_futurePositions","draw_futurePositions"})replacement.parameters[key]=parameter(old,key);
+        const auto destination=[&](int port)->std::pair<int,int>{
+            if(old.kind==K::Prediction)
+            {
+                if(port==0)return {additions[0].id,0};if(port==2)return {additions[0].id,1};
+                if(port==1)return {additions[5].id,0};
+                const auto* key=def.inputs[port].defaultParameter;
+                if(key)for(const auto& node:additions){const int pin=pinFor(node.kind,key);if(pin>=0)return {node.id,pin};}
+                if(key){const int pin=pinFor(replacement.kind,key);if(pin>=0)return {id,pin};}
+            }
+            else if(old.kind==K::AimPoint)
+            {
+                if(port==0)return {additions[0].id,0};
+                const auto* key=def.inputs[port].defaultParameter;if(key)return {additions[3].id,pinFor(K::TargetAnchor,key)};
+            }
+            else
+            {if(port==0)return {additions[0].id,0};return {additions[2].id,port==2?2:3};}
+            return {-1,-1};
+        };
+        bool supported=true;for(const auto& link:graph.links)if(link.toNode==id){const auto to=destination(link.toPort);supported&=to.first>=0&&to.second>=0;}
+        if(!supported)continue;
+        std::vector<Link> inputs;
+        for(auto& link:graph.links)if(link.toNode==id){inputs.push_back(link);const auto to=destination(link.toPort);link.toNode=to.first;link.toPort=to.second;}
+        for(const auto& local:old.inputValues)
+        {
+            const auto to=destination(local.first);for(auto& node:additions)if(node.id==to.first)node.inputValues[to.second]=local.second;
+        }
+        if(old.kind==K::Prediction)
+        {
+            for(int i=1;i<=4;++i)graph.links.push_back({additions[0].id,0,additions[i].id,0});
+            graph.links.insert(graph.links.end(),{{additions[1].id,0,additions[6].id,0},{additions[2].id,0,additions[6].id,1},
+                {additions[5].id,0,additions[6].id,2},{additions[3].id,0,additions[6].id,3},{additions[4].id,0,additions[6].id,4},
+                {additions[6].id,0,id,0},{additions[0].id,0,id,1},{additions[5].id,0,id,2}});
+        }
+        else
+        {
+            for(const auto& link:inputs)if(link.toPort==0)for(int i:old.kind==K::AimPoint?std::vector<int>{1,2}:std::vector<int>{1,3})
+                {if(static_cast<std::size_t>(i)>=additions.size())continue;auto copy=link;copy.toNode=additions[i].id;copy.toPort=0;graph.links.push_back(std::move(copy));}
+            if(old.kind==K::AimPoint)graph.links.insert(graph.links.end(),{{additions[2].id,0,additions[3].id,0},{additions[0].id,0,id,0},{additions[1].id,0,id,1},{additions[3].id,0,id,2}});
+            else graph.links.insert(graph.links.end(),{{additions[0].id,0,additions[2].id,0},{additions[1].id,0,additions[2].id,1},{observedSource?observedSource:additions[3].id,0,id,0},{additions[2].id,0,id,1}});
+        }
+        for(auto& group:graph.groups)if(std::find(group.nodes.begin(),group.nodes.end(),id)!=group.nodes.end())for(const auto& node:additions)group.nodes.push_back(node.id);
+        *find(id)=std::move(replacement);graph.nodes.insert(graph.nodes.end(),additions.begin(),additions.end());changed=true;
+    }
+    if(changed)
+    {
+        const auto* output=find(graph.kind==GraphKind::Aim?5:9);
+        const auto* geometry=find(8);
+        if(starter&&output&&geometry&&((graph.kind==GraphKind::Aim&&output->kind==K::FutureTrail&&geometry->kind==K::BoxPoint)||
+            (graph.kind==GraphKind::AutoShoot&&output->kind==K::SelectBoolean)))processingStarterLayout(graph);
+        else Layout::arrange(graph);
+    }
+    return changed;
+}
+static void processingStarterLayout(Graph& graph)
+{
+    constexpr std::uint32_t blue=0x40ffcd60u,purple=0x40ff93adu,green=0x40adde66u;
+    if(graph.kind==GraphKind::Aim)
+    {
+        graph.groups={{1,"01 Activation",0,0,0,0,blue,{1,12,13}},
+            {2,"02 Select a target",0,0,0,0,purple,{7,30,31,4,2}},
+            {3,"03 Aim geometry",0,0,0,0,blue,{8}},
+            {4,"04 Compensate and filter",0,0,0,0,green,{32}},
+            {5,"05 Position + velocity + time",0,0,0,0,purple,{}},
+            {6,"06 Speed and mouse output",0,0,0,0,blue,{9,35,34,3,10,33,11,6}}};
+        for(const auto& node:graph.nodes)
+        {
+            if(node.kind==K::TargetPosition||node.kind==K::TargetSize||node.kind==K::TargetClass||node.kind==K::TargetAnchor)graph.groups[2].nodes.push_back(node.id);
+            if(node.kind==K::MotionEstimate)graph.groups[3].nodes.push_back(node.id);
+            if((node.kind>=K::MotionPosition&&node.kind<=K::MotionReady)||node.kind==K::PredictionTime||node.kind==K::ProjectPoint||node.kind==K::FutureTrail)graph.groups[4].nodes.push_back(node.id);
+        }
+    }
+    else if(graph.kind==GraphKind::AutoShoot)
+    {
+        graph.groups={{1,"01 Activation",0,0,0,0,blue,{1,11,12,3}},
+            {2,"02 Detection filters",0,0,0,0,purple,{7,30,31}},
+            {3,"03 Select and observe",0,0,0,0,green,{8,2}},
+            {4,"04 Scope geometry",0,0,0,0,blue,{9}},
+            {5,"05 Fire gate and output",0,0,0,0,purple,{4,5,10,6}}};
+        for(const auto& node:graph.nodes)if(node.kind==K::TargetPosition||node.kind==K::TargetSize||node.kind==K::BoxContainsPoint||(node.kind==K::TargetObserved&&node.id!=2))graph.groups[3].nodes.push_back(node.id);
+    }
+    const auto bridge=[&](int source,std::size_t group,K kind){
+        std::vector<std::size_t> branches;
+        for(std::size_t link=0;link<graph.links.size();++link)if(graph.links[link].fromNode==source&&std::find(graph.groups[group].nodes.begin(),graph.groups[group].nodes.end(),graph.links[link].toNode)!=graph.groups[group].nodes.end())branches.push_back(link);
+        if(branches.size()<2||graph.nodes.size()>=MaxNodes||graph.links.size()>=MaxLinks)return;
+        int id=1;while(std::any_of(graph.nodes.begin(),graph.nodes.end(),[&](const Node& node){return node.id==id;}))++id;
+        graph.nodes.push_back(defaultNode(kind,id));graph.groups[group].nodes.push_back(id);
+        for(auto link:branches)graph.links[link].fromNode=id;
+        graph.links.push_back({source,0,id,0});
+    };
+    if(graph.kind==GraphKind::Aim)
+    {
+        int motion=0;for(const auto& node:graph.nodes)if(node.kind==K::MotionEstimate)motion=node.id;
+        bridge(4,2,K::RerouteTarget);bridge(motion,4,K::RerouteMotion);bridge(5,5,K::ReroutePoint);
+    }
+    else if(graph.kind==GraphKind::AutoShoot)bridge(8,3,K::RerouteTarget);
+    Layout::arrange(graph,4);graph.zoom=1;graph.panX=graph.panY=40;
+}
+bool shareMouseCalibration(Workspace& workspace)
+{
+    for(const auto& graph:workspace.graphs)for(const auto& node:graph.nodes)if(node.kind==K::MouseProfile)return false;
+    std::set<int> workflows;int nextWorkflow=1;
+    for(std::size_t g=0;g<workspace.graphs.size();++g){const int id=workflowId(workspace.graphs[g],g);workflows.insert(id);nextWorkflow=std::max(nextWorkflow,id+1);}
+    if(workflows.size()>=MaxWorkflows)return false;
+    const auto profileKey=[](const Node& node){std::ostringstream key;key<<std::setprecision(17)<<textParameter(node,"profile_name");for(const auto& spec:definition(K::MouseProfile).parameters)key<<'|'<<parameter(node,spec.key);return key.str();};
+    std::string active;std::vector<Node> profiles;
+    for(const auto& graph:workspace.graphs)for(const auto& node:graph.nodes)
+        if(node.kind==K::MouseDelta||node.kind==K::MouseCalibration||node.kind==K::RecoilProfileOutput)
+        {
+            const auto& def=definition(node.kind);
+            for(const auto& link:graph.links)if(link.toNode==node.id&&link.toPort>=0&&static_cast<std::size_t>(link.toPort)<def.inputs.size())
+                if(const char* key=def.inputs[link.toPort].defaultParameter)
+                    for(const auto& spec:definition(K::MouseProfile).parameters)if(std::strcmp(key,spec.key)==0)return false;
+            if(node.kind==K::MouseDelta&&graph.active&&active.empty())active=profileKey(node);
+            if(std::none_of(profiles.begin(),profiles.end(),[&](const Node& other){return profileKey(other)==profileKey(node);}))profiles.push_back(node);
+        }
+    if(profiles.empty()||workspace.graphs.size()+profiles.size()>MaxGraphs)return false;
+    if(active.empty())active=profileKey(profiles.front());
+    Workspace candidate=workspace;
+    const auto pin=[](K kind,const char* key){const auto& inputs=definition(kind).inputs;for(std::size_t p=0;p<inputs.size();++p)if(inputs[p].defaultParameter&&std::strcmp(inputs[p].defaultParameter,key)==0)return static_cast<int>(p);return -1;};
+    for(auto& graph:candidate.graphs)
+    {
+        std::vector<int> deltas,scales,recoils;
+        for(const auto& node:graph.nodes){if(node.kind==K::MouseDelta)deltas.push_back(node.id);if(node.kind==K::MouseCalibration)scales.push_back(node.id);if(node.kind==K::RecoilProfileOutput)recoils.push_back(node.id);}
+        const auto nextId=[&](){int id=1;while(std::any_of(graph.nodes.begin(),graph.nodes.end(),[&](const Node& node){return node.id==id;}))++id;return id;};
+        for(int id:deltas)
+        {
+            auto source=std::find_if(graph.nodes.begin(),graph.nodes.end(),[&](const Node& node){return node.id==id;});const Node old=*source;
+            bool fps=parameter(old,"legacy_fps")!=0;
+            for(const auto& link:graph.links)fps|=link.toNode==id&&link.toPort==pin(K::MouseDelta,"legacy_fps");
+            const std::size_t added=fps?5:3;
+            if(old.bypassed||graph.nodes.size()+added>MaxNodes||graph.links.size()+added>MaxLinks)
+            {
+                auto replacement=defaultNode(K::SharedMouseDelta,id,old.x,old.y);replacement.disabled=old.disabled;replacement.collapsed=old.collapsed;
+                replacement.parameters["legacy_center"]=parameter(old,"legacy_center");replacement.parameters["legacy_fps"]=parameter(old,"legacy_fps");replacement.inputValues=old.inputValues;
+                for(auto& link:graph.links)if(link.toNode==id&&link.toPort>=3)
+                {const auto* key=definition(K::MouseDelta).inputs[link.toPort].defaultParameter;link.toPort=pin(K::SharedMouseDelta,key);}
+                *source=std::move(replacement);continue;
+            }
+            const int delta=nextId();graph.nodes.push_back(defaultNode(K::PointDelta,delta));
+            const int convert=nextId();graph.nodes.push_back(defaultNode(K::PixelsToCounts,convert));
+            const int shared=nextId();graph.nodes.push_back(defaultNode(K::SharedCalibration,shared));
+            for(auto& node:graph.nodes)if(node.id==delta)node.parameters["implicit_center"]=parameter(old,"legacy_center");
+            int normalize=0,frameRate=0;
+            if(fps)
+            {
+                normalize=nextId();graph.nodes.push_back(defaultNode(K::NormalizeFps,normalize));
+                frameRate=nextId();graph.nodes.push_back(defaultNode(K::CaptureFps,frameRate));
+                for(auto& node:graph.nodes)if(node.id==normalize){node.parameters["enabled"]=parameter(old,"legacy_fps");node.parameters["preserve_fraction"]=1;}
+                for(auto& link:graph.links)if(link.fromNode==id)link.fromNode=normalize;
+            }
+            for(auto& link:graph.links)if(link.toNode==id)
+            {
+                if(link.toPort==0){link.toNode=delta;link.toPort=0;}
+                else if(link.toPort==2){link.toNode=delta;link.toPort=1;}
+                else if(link.toPort>=3)
+                {
+                    const auto* key=definition(K::MouseDelta).inputs[link.toPort].defaultParameter;
+                    if(std::strcmp(key,"legacy_center")==0){link.toNode=delta;link.toPort=pin(K::PointDelta,"implicit_center");}
+                    else{link.toNode=normalize;link.toPort=pin(K::NormalizeFps,"enabled");}
+                }
+            }
+            auto replacement=defaultNode(K::ApplyMouseSpeed,id,old.x,old.y);replacement.disabled=old.disabled;replacement.collapsed=old.collapsed;
+            replacement.inputValues[1]=old.inputValues.count(1)?old.inputValues.at(1):0;
+            for(auto& node:graph.nodes)if(node.id==id)node=std::move(replacement);
+            graph.links.insert(graph.links.end(),{{delta,0,convert,0},{shared,0,convert,1},{convert,0,id,0}});
+            if(fps)graph.links.insert(graph.links.end(),{{id,0,normalize,0},{frameRate,0,normalize,1}});
+            for(auto& group:graph.groups)if(std::find(group.nodes.begin(),group.nodes.end(),id)!=group.nodes.end())
+            {group.nodes.insert(group.nodes.end(),{delta,convert,shared});if(fps)group.nodes.insert(group.nodes.end(),{normalize,frameRate});}
+            if(graph.kind==GraphKind::Aim)
+            {
+                auto stage=std::find_if(graph.groups.begin(),graph.groups.end(),[](const Group& group){return group.title=="06 Speed and mouse output";});
+                if(stage!=graph.groups.end())
+                {
+                    std::vector<int> geometry{delta,convert,shared};
+                    for(int member:stage->nodes)for(const auto& node:graph.nodes)if(node.id==member&&(node.kind==K::Center||node.kind==K::ReroutePoint))geometry.push_back(member);
+                    for(int member:geometry)stage->nodes.erase(std::remove(stage->nodes.begin(),stage->nodes.end(),member),stage->nodes.end());
+                    stage->title="07 Speed, FPS and mouse output";
+                    int groupId=1;for(const auto& group:graph.groups)groupId=std::max(groupId,group.id+1);
+                    graph.groups.push_back({groupId,"06 Point to device counts",0,0,0,0,0x40ff93adu,std::move(geometry)});
+                }
+            }
+        }
+        for(int id:scales)
+        {
+            auto source=std::find_if(graph.nodes.begin(),graph.nodes.end(),[&](const Node& node){return node.id==id;});const Node old=*source;
+            auto replacement=defaultNode(graph.nodes.size()<MaxNodes&&graph.links.size()<MaxLinks?K::CalibrationScale:K::SharedCalibrationScale,id,old.x,old.y);
+            replacement.disabled=old.disabled;replacement.collapsed=old.collapsed;*source=replacement;
+            if(replacement.kind==K::CalibrationScale)
+            {
+                const int reader=nextId();graph.nodes.push_back(defaultNode(K::SharedCalibration,reader));graph.links.push_back({reader,0,id,0});
+                for(auto& group:graph.groups)if(std::find(group.nodes.begin(),group.nodes.end(),id)!=group.nodes.end())group.nodes.push_back(reader);
+            }
+        }
+        for(int id:recoils)for(auto& node:graph.nodes)if(node.id==id)
+        {auto replacement=defaultNode(K::SharedRecoilOutput,id,node.x,node.y);replacement.disabled=node.disabled;replacement.collapsed=node.collapsed;replacement.inputValues=node.inputValues;node=std::move(replacement);}
+        if(!deltas.empty()||!scales.empty()||!recoils.empty())Layout::arrange(graph);
+    }
+    std::set<std::string> titles;std::string workflowName="Profiles";
+    for(int suffix=2;std::any_of(candidate.graphs.begin(),candidate.graphs.end(),[&](const Graph& graph){return workflowTitle(graph)==workflowName;});++suffix)workflowName="Profiles "+std::to_string(suffix);
+    for(const auto& old:profiles)
+    {
+        Graph graph;graph.kind=GraphKind::Aim;graph.workflow=nextWorkflow;graph.workflowName=workflowName;graph.workflowIcon=8;graph.active=profileKey(old)==active;
+        const auto title=textParameter(old,"profile_name");std::size_t length=std::min<std::size_t>(90,title.size());while(length<title.size()&&length&&(static_cast<unsigned char>(title[length])&0xc0)==0x80)--length;
+        const auto label=title.empty()?"Profile":title.substr(0,length);graph.pageName=label;
+        for(int suffix=2;!titles.insert(graph.pageName).second;++suffix)graph.pageName=label+" "+std::to_string(suffix);
+        auto profile=defaultNode(K::MouseProfile,1);
+        for(const auto& spec:definition(K::MouseProfile).parameters)profile.parameters[spec.key]=parameter(old,spec.key);
+        profile.textParameters["profile_name"]=title;graph.nodes.push_back(std::move(profile));
+        graph.groups={{1,"Shared aiming and recoil calibration",0,0,0,0,0x40ffcd60u,{1}}};Layout::arrange(graph);candidate.graphs.push_back(std::move(graph));
+    }
+    migrateWorkflowPages(candidate);
+    std::string error;if(!validate(candidate,error))return false;
+    workspace=std::move(candidate);return true;
+}
+bool migrateWorkflowPages(Workspace& workspace)
+{
+    bool changed=false;
+    for(std::size_t i=0;i<workspace.graphs.size();++i)if(!workspace.graphs[i].workflow){workspace.graphs[i].workflow=static_cast<int>(i)+1;changed=true;}
+    // Only the generated container is folded away. User graphs with a similar
+    // title and no generated frame remain ordinary user-owned workflows.
+    const auto generated=[](const Graph& graph){
+        const auto title=workflowTitle(graph);
+        return (title=="Profiles"||title=="Mouse profiles"||title.rfind("Profiles ",0)==0)&&
+            std::any_of(graph.groups.begin(),graph.groups.end(),[](const Group& group){return group.title=="Shared aiming and recoil calibration";});
+    };
+    std::set<int> containers;
+    for(std::size_t i=0;i<workspace.graphs.size();++i)if(generated(workspace.graphs[i]))containers.insert(workflowId(workspace.graphs[i],i));
+    for(std::size_t source=workspace.graphs.size();source-->0;)
+    {
+        const auto& calibration=workspace.graphs[source];
+        if(!containers.count(workflowId(calibration,source))||!calibration.active)continue;
+        for(std::size_t target=0;target<workspace.graphs.size();++target)
+        {
+            const auto& host=workspace.graphs[target];
+            if(target==source||host.kind==GraphKind::Vision||!host.active||!host.enabled||containers.count(workflowId(host,target))||
+                host.nodes.size()+calibration.nodes.size()>MaxNodes||host.links.size()+calibration.links.size()>MaxLinks||
+                host.groups.size()+calibration.groups.size()>MaxGroups||host.ties.size()+calibration.ties.size()>MaxWireTies)continue;
+            Graph merged=host;
+            std::map<int,int> nodes,ties;
+            int nodeId=1,tieId=1,groupId=1;
+            for(const auto& node:host.nodes)nodeId=std::max(nodeId,node.id+1);
+            for(const auto& tie:host.ties)tieId=std::max(tieId,tie.id+1);
+            for(const auto& group:host.groups)groupId=std::max(groupId,group.id+1);
+            float right=0,left=0,top=0;
+            for(const auto& node:host.nodes)right=std::max(right,node.x+Layout::width(node));
+            for(const auto& node:calibration.nodes){left=std::min(left,node.x);top=std::min(top,node.y);}
+            const float dx=Layout::up(right+128)-left,dy=64-top;
+            std::set<std::string> localNames;std::map<std::string,std::string> renamed;
+            for(const auto& node:host.nodes)if(variableGet(node.kind)||variableSet(node.kind))localNames.insert(textParameter(node,"name"));
+            for(const auto& node:calibration.nodes)if(variableGet(node.kind)||variableSet(node.kind))
+            {
+                const auto original=textParameter(node,"name");if(renamed.count(original))continue;
+                auto name=original;for(int suffix=2;localNames.count(name);++suffix)name=original.substr(0,110)+" "+std::to_string(suffix);
+                localNames.insert(name);renamed[original]=name;
+            }
+            for(auto node:calibration.nodes)
+            {
+                nodes[node.id]=nodeId;node.id=nodeId++;node.x+=dx;node.y+=dy;node.disabled|=!calibration.enabled;
+                if(variableGet(node.kind)||variableSet(node.kind))node.textParameters["name"]=renamed.at(textParameter(node,"name"));
+                merged.nodes.push_back(std::move(node));
+            }
+            for(auto tie:calibration.ties){ties[tie.id]=tieId;tie.id=tieId++;tie.x+=dx;tie.y+=dy;merged.ties.push_back(tie);}
+            for(auto link:calibration.links)
+            {link.fromNode=nodes.at(link.fromNode);link.toNode=nodes.at(link.toNode);for(auto& tie:link.ties)tie=ties.at(tie);merged.links.push_back(std::move(link));}
+            for(auto group:calibration.groups)
+            {group.id=groupId++;group.x+=dx;group.y+=dy;for(auto& member:group.nodes)member=nodes.at(member);merged.groups.push_back(std::move(group));}
+            CompiledGraph check;std::string error;if(!compileGraph(merged,check,error))continue;
+            workspace.graphs[target]=std::move(merged);workspace.graphs.erase(workspace.graphs.begin()+source);changed=true;break;
+        }
+    }
+    std::map<int,int> active;int next=1;
+    for(std::size_t i=0;i<workspace.graphs.size();++i)
+    {const int id=workflowId(workspace.graphs[i],i);next=std::max(next,id+1);if(workspace.graphs[i].active)active[id]=static_cast<int>(i);}
+    std::set<int> usedIds;std::set<std::string> usedNames;
+    for(std::size_t i=0;i<workspace.graphs.size();++i)
+    {
+        auto& graph=workspace.graphs[i];const int old=workflowId(graph,i);const bool container=containers.count(old)!=0;
+        const bool additional=!graph.active||(active.count(old)&&active.at(old)!=static_cast<int>(i));
+        std::string title=container?"Calibration":workflowTitle(graph);
+        if(additional)title+=(container?" ":" / ")+pageTitle(graph);
+        if(title.size()>90){std::size_t length=90;while(length&&(static_cast<unsigned char>(title[length])&0xc0)==0x80)--length;title.resize(length);}
+        const auto base=title;for(int suffix=2;usedNames.count(title);++suffix)title=base+" "+std::to_string(suffix);
+        usedNames.insert(title);
+        const auto freeId=[&](){while(next>1000000||active.count(next)||usedIds.count(next)){if(next>1000000)next=1;else ++next;}return next++;};
+        int id=additional?freeId():old;if(!usedIds.insert(id).second){id=freeId();usedIds.insert(id);}
+        changed|=graph.workflow!=id||graph.workflowName!=title||!graph.pageName.empty()||!graph.active;
+        graph.workflow=id;graph.workflowName=title;graph.pageName.clear();graph.enabled=graph.enabled&&graph.active;graph.active=true;
+    }
+    return changed;
+}
 Workspace defaults()
 {
     auto workspace=previousStarterGraphs();
+    workspace.graphs[2].nodes.push_back(defaultNode(K::MouseCalibration,8));
+    workspace.graphs[2].links.push_back({8,0,7,2});
     for(auto& graph:workspace.graphs)readableStarterLayout(graph);
     compactOutputNodes(workspace.graphs[3],true);
     readableStarterLayout(workspace.graphs[3]);
+    for(int index:{0,1})expandProcessingNodes(workspace.graphs[index]);
+    shareMouseCalibration(workspace);
+    migrateWorkflowPages(workspace);
+    auto& aim=workspace.graphs[0];
+    const auto source=std::find_if(aim.groups.begin(),aim.groups.end(),[](const Group& group){return group.title=="Shared aiming and recoil calibration";});
+    const auto stage=std::find_if(aim.groups.begin(),aim.groups.end(),[](const Group& group){return group.title=="06 Point to device counts";});
+    if(source!=aim.groups.end()&&stage!=aim.groups.end()){stage->nodes.insert(stage->nodes.end(),source->nodes.begin(),source->nodes.end());aim.groups.erase(source);}
+    Layout::arrange(aim);
     return workspace;
 }
 bool migrateStarterLayout(Graph& graph)
@@ -1183,17 +1735,50 @@ bool migrateStarterLayout(Graph& graph)
     return false;
 }
 
+int workflowId(const Graph& graph,std::size_t index){return graph.workflow>0?graph.workflow:static_cast<int>(index)+1;}
+std::string workflowTitle(const Graph& graph){return graph.workflowName.empty()?(graph.kind==GraphKind::Aim?"Aim Graph":graph.kind==GraphKind::AutoShoot?"Auto Shoot":graph.kind==GraphKind::Recoil?"Recoil":"Vision"):graph.workflowName;}
+std::string pageTitle(const Graph& graph){return graph.pageName.empty()?"Default":graph.pageName;}
+int activePage(const Workspace& workspace,int workflow)
+{
+    for(std::size_t i=0;i<workspace.graphs.size();++i)if(workflowId(workspace.graphs[i],i)==workflow&&workspace.graphs[i].active)return static_cast<int>(i);
+    return -1;
+}
+int previewKey(int graph,int node){return graph==3?node:(graph+1)*NodeKeyStride+node;}
 bool validate(const Workspace& workspace, std::string& error)
 {
     error.clear();
-    for (std::size_t i = 0; i < GraphCount; ++i)
+    if(workspace.graphs.size()>MaxGraphs){error="Workspace supports at most "+std::to_string(MaxGraphs)+" workflows.";return false;}
+    struct WorkflowInfo{GraphKind kind;std::string name;int icon;bool enabled;int active=0;std::set<std::string> pages;};
+    std::map<int,WorkflowInfo> workflows;std::vector<CompiledNode> captures;bool sharedFrame=false;
+    for (std::size_t i = 0; i < workspace.graphs.size(); ++i)
     {
-        if (workspace.graphs[i].kind != static_cast<GraphKind>(i))
-        { error = "Workspace graph order is invalid."; return false; }
+        const auto& graph=workspace.graphs[i];
+        if(static_cast<int>(graph.kind)<0||static_cast<int>(graph.kind)>3)
+        {error="Invalid workflow domain.";return false;}
+        const auto validName=[](const std::string& name){return name.size()<=96&&name.find_first_of(std::string("\0\r\n",3))==std::string::npos;};
+        if(graph.workflow<0||graph.workflow>1000000||graph.workflowIcon< -1||graph.workflowIcon>15||!validName(graph.workflowName)||!validName(graph.pageName))
+        {error="Invalid workflow or page name.";return false;}
+        const auto id=workflowId(graph,i);auto found=workflows.try_emplace(id,WorkflowInfo{graph.kind,workflowTitle(graph),graph.workflowIcon,graph.enabled}).first;
+        auto& workflow=found->second;
+        if(workspace.sourceVersion>=20&&(!graph.active||!graph.pageName.empty()||!workflow.pages.empty()))
+        {error="Each workflow must contain one graph. Import a legacy file to migrate its pages.";return false;}
+        if(workflow.kind!=graph.kind||workflow.name!=workflowTitle(graph)||workflow.icon!=graph.workflowIcon||workflow.enabled!=graph.enabled||!workflow.pages.insert(pageTitle(graph)).second)
+        {error="Workflow pages require a shared type/name and unique page names.";return false;}
+        workflow.active+=graph.active;
         CompiledGraph compiled;
-        if (!compileGraph(workspace.graphs[i], compiled, error))
-        { error = std::string(graphName(static_cast<GraphKind>(i))) + ": " + error; return false; }
+        if(!compileGraph(graph,compiled,error)){error=workflowTitle(graph)+" / "+pageTitle(graph)+": "+error;return false;}
+        if(graph.active&&graph.enabled&&graph.kind==GraphKind::Vision)for(const auto& node:compiled.nodes)
+        {
+            sharedFrame|=node.potentiallyActive&&node.node.kind==K::CurrentFrame&&!node.node.disabled&&!node.node.bypassed;
+            if(node.node.kind==K::CaptureSource&&!node.node.disabled&&!node.node.bypassed)captures.push_back(node);
+        }
     }
+    if(workflows.size()>MaxWorkflows){error="Workspace supports at most "+std::to_string(MaxWorkflows)+" workflows.";return false;}
+    for(const auto& workflow:workflows)if(workflow.second.active!=1){error="Each workflow requires exactly one active page.";return false;}
+    const auto captureSources=std::count_if(captures.begin(),captures.end(),[&](const CompiledNode& node){
+        return (node.potentiallyActive||sharedFrame)&&providerMayBeEnabled(node);
+    });
+    if(captureSources>1){error="Only one reachable Capture source is supported across active workflows.";return false;}
     return true;
 }
 bool canConnect(const Graph& graph, const Link& link, std::string& error)
@@ -1211,7 +1796,8 @@ bool canConnect(const Graph& graph, const Link& link, std::string& error)
 struct Service::Program
 {
     Workspace workspace;
-    std::array<CompiledGraph, GraphCount> graphs;
+    std::vector<CompiledGraph> graphs;
+    bool sharedFrame=false,potentialFrame=false;
     std::uint64_t revision = 0;
 };
 struct Service::ConfigurationSnapshot
@@ -1228,14 +1814,48 @@ Service::Service()
     publish(defaults(), error);
 }
 Workspace Service::workspace() const { return std::atomic_load(&program_)->workspace; }
+Workspace Service::workspaceMetadata() const
+{
+    const auto program=std::atomic_load(&program_);Workspace result;result.graphs.clear();result.graphs.reserve(program->workspace.graphs.size());
+    for(const auto& graph:program->workspace.graphs)
+    {
+        Graph page;page.kind=graph.kind;page.workflow=graph.workflow;page.workflowName=graph.workflowName;
+        page.pageName=graph.pageName;page.workflowIcon=graph.workflowIcon;page.active=graph.active;page.enabled=graph.enabled;
+        result.graphs.push_back(std::move(page));
+    }
+    return result;
+}
 std::uint64_t Service::revision() const { return std::atomic_load(&program_)->revision; }
 bool Service::publish(const Workspace& workspace, std::string& error)
 {
     if (!validate(workspace, error)) return false;
     auto next = std::make_shared<Program>();
     next->workspace = workspace;
-    for (std::size_t i = 0; i < GraphCount; ++i)
-        if (!compileGraph(workspace.graphs[i], next->graphs[i], error)) return false;
+    for(std::size_t i=0;i<next->workspace.graphs.size();++i)if(!next->workspace.graphs[i].workflow)next->workspace.graphs[i].workflow=static_cast<int>(i)+1;
+    next->graphs.resize(workspace.graphs.size());
+    for(std::size_t i=0;i<workspace.graphs.size();++i)
+    {
+        if(!compileGraph(workspace.graphs[i],next->graphs[i],error))return false;
+        for(auto& entry:next->graphs[i].nodes)
+        {
+            entry.node.runtimeKey=static_cast<int>(i)*NodeKeyStride+entry.node.id;
+            if(workspace.graphs[i].active&&workspace.graphs[i].enabled&&workspace.graphs[i].kind==GraphKind::Vision)
+            {
+                next->sharedFrame|=entry.active&&entry.node.kind==K::CurrentFrame&&!entry.node.disabled&&!entry.node.bypassed;
+                next->potentialFrame|=entry.potentiallyActive&&entry.node.kind==K::CurrentFrame&&!entry.node.disabled&&!entry.node.bypassed;
+            }
+        }
+    }
+    std::map<std::string,std::pair<int,int>> calibrations;
+    for(std::size_t g=0;g<next->graphs.size();++g)if(workspace.graphs[g].active&&workspace.graphs[g].enabled&&workspace.graphs[g].kind!=GraphKind::Vision)
+        for(std::size_t i=0;i<next->graphs[g].nodes.size();++i)if(next->graphs[g].nodes[i].node.kind==K::MouseProfile&&!next->graphs[g].nodes[i].node.disabled&&!next->graphs[g].nodes[i].node.bypassed)
+        {
+            const auto name=textParameter(next->graphs[g].nodes[i].node,"name");
+            if(!calibrations.emplace(name,std::pair{static_cast<int>(g),static_cast<int>(i)}).second)calibrations[name]={-2,-2};
+        }
+    for(auto& graph:next->graphs)for(auto& node:graph.nodes)
+        if(calibrationIdentifier(node.node.kind)&&node.node.kind!=K::MouseProfile)
+        {const auto source=calibrations.find(textParameter(node.node,"name"));if(source!=calibrations.end()){node.sharedGraph=source->second.first;node.sharedIndex=source->second.second;}}
     std::lock_guard<std::mutex> lock(publishMutex_);
     auto previous = std::atomic_load(&program_);
     next->revision = previous ? previous->revision + (sameExecution(previous->workspace,workspace) ? 0 : 1) : 1;
@@ -1255,13 +1875,16 @@ Actions Service::evaluateVision(const Context& context)
 }
 std::vector<Node> Service::providerNodes(NodeKind kind) const
 {
-    const auto program=std::atomic_load(&program_);std::vector<Node> nodes;
-    for(const auto& entry:program->graphs[3].nodes)
+    const auto program=std::atomic_load(&program_);std::vector<Node> nodes;const auto previews=previewNodes();
+    const bool sharedFrame=program->sharedFrame||(program->potentialFrame&&previews&&!previews->empty());
+    for(std::size_t graph=0;graph<program->graphs.size();++graph)
+    if(program->workspace.graphs[graph].active&&program->workspace.graphs[graph].enabled&&program->workspace.graphs[graph].kind==GraphKind::Vision)
+    for(const auto& entry:program->graphs[graph].nodes)
     {
-        if(!entry.active||entry.node.kind!=kind||entry.node.bypassed||entry.node.disabled)continue;
+        if((!entry.active&&!(sharedFrame&&kind==K::CaptureSource))||entry.node.kind!=kind||entry.node.bypassed||entry.node.disabled)continue;
         const auto& specs=definition(entry.node.kind).parameters;
         const bool enabledParameter=std::any_of(specs.begin(),specs.end(),[](const ParameterSpec& p){return std::string(p.key)=="enabled";});
-        if(enabledParameter&&parameter(entry.node,"enabled")==0&&(!isSink(kind)||entry.inputs[0]<0))continue;
+        if(enabledParameter&&!providerMayBeEnabled(entry))continue;
         nodes.push_back(entry.node);
     }
     return nodes;
@@ -1269,8 +1892,13 @@ std::vector<Node> Service::providerNodes(NodeKind kind) const
 bool Service::hasDynamicProviders() const
 {
     const auto program=std::atomic_load(&program_);
-    for(const auto& entry:program->graphs[3].nodes)if(entry.node.kind==K::ImagePreview&&!entry.node.disabled&&!entry.node.bypassed)return true;
-    for(const auto& entry:program->graphs[3].nodes)if(entry.active&&(entry.node.kind==K::CaptureSource||entry.node.kind==K::Inference)&&!entry.bindings.empty())return true;
+    for(std::size_t graph=0;graph<program->graphs.size();++graph)
+    if(program->workspace.graphs[graph].active&&program->workspace.graphs[graph].enabled&&program->workspace.graphs[graph].kind==GraphKind::Vision)
+    for(const auto& entry:program->graphs[graph].nodes)
+    {
+        if(entry.node.kind==K::ImagePreview&&!entry.node.disabled&&!entry.node.bypassed)return true;
+        if((entry.active||(program->sharedFrame&&entry.node.kind==K::CaptureSource))&&(entry.node.kind==K::CaptureSource||entry.node.kind==K::Inference)&&!entry.bindings.empty())return true;
+    }
     return false;
 }
 std::vector<Node> Service::evaluateConfiguration(const Context& context)
@@ -1281,6 +1909,7 @@ Actions Service::evaluateDomain(const Context& context,bool vision,bool configur
 {
     const auto program = std::atomic_load(&program_);
     const auto previews=vision?previewNodes():nullptr;
+    const bool sharedFrame=program->sharedFrame||(program->potentialFrame&&previews&&!previews->empty());
     const auto previewWanted=[&](int id){return previews&&std::binary_search(previews->begin(),previews->end(),id);};
     // One control worker and one Vision worker own separate mutable state.
     // Neither holds a mutex while running provider callbacks.
@@ -1291,7 +1920,7 @@ Actions Service::evaluateDomain(const Context& context,bool vision,bool configur
     if(nextConfiguration)nextConfiguration->revision=program->revision;
     if(domain.revision!=program->revision)
     {
-        domain.events.clear();domain.filters.clear();domain.configurations.clear();domain.settings.clear();domain.previews.clear();domain.revision=program->revision;domain.sampledAt={};
+        domain.events.clear();domain.filters.clear();domain.configurations.clear();domain.settings.clear();domain.calibrations.clear();domain.previews.clear();domain.revision=program->revision;domain.sampledAt={};
         for(auto& signals:domain.signals)signals.clear();domain.signalProgram.reset();
     }
     if(monitorSignals&&!domain.telemetryWasEnabled)
@@ -1301,13 +1930,14 @@ Actions Service::evaluateDomain(const Context& context,bool vision,bool configur
     domain.telemetryWasEnabled=monitorSignals;
     if(vision)for(auto it=domain.previews.begin();it!=domain.previews.end();)
         if(!previewWanted(it->first))it=domain.previews.erase(it);else++it;
+    const auto inDomain=[&](int graph){const auto& page=program->workspace.graphs[graph];return page.active&&page.enabled&&((page.kind==GraphKind::Vision)==vision);};
     bool captureObserved=false;
     const auto inputIsCaptured=[&]{
         const bool captured=context.inputCaptured||(context.inputCapturedNow&&context.inputCapturedNow());
         if(captured&&!captureObserved)
         {
             captureObserved=true;
-            for(int graph=vision?3:0;graph<(vision?static_cast<int>(GraphCount):3);++graph)
+            for(int graph=0;graph<static_cast<int>(program->graphs.size());++graph)if(inDomain(graph))
                 for(const auto& compiled:program->graphs[graph].nodes)
                     if(compiled.node.kind==K::KeyHeld||compiled.node.kind==K::KeyPressed||
                        compiled.node.kind==K::KeyReleased||compiled.node.kind==K::Toggle)
@@ -1322,18 +1952,19 @@ Actions Service::evaluateDomain(const Context& context,bool vision,bool configur
     bool sample = monitorSignals && now - domain.sampledAt >= std::chrono::milliseconds(33);
     auto completedAt=now;
     Telemetry telemetry;
-    for (int g = vision?3:0; g < (vision?static_cast<int>(GraphCount):3); ++g)
+    for (int g=0;g<static_cast<int>(program->graphs.size());++g)
     {
-        std::array<Value, MaxNodes> values{};
-        std::array<bool, MaxNodes> evaluated{};
-        std::array<std::uint64_t, MaxNodes> readInputs{};
+        auto& frame=domain.evaluations[g];
+        if(!inDomain(g)){frame.values.clear();frame.evaluated.clear();frame.visiting.clear();frame.readInputs.clear();continue;}
+        auto& values=frame.values;auto& evaluated=frame.evaluated;auto& readInputs=frame.readInputs;
         const auto& nodes = program->graphs[g].nodes;
         domain.inputStorage[g].resize(nodes.size());
+        values.resize(nodes.size());evaluated.assign(nodes.size(),0);frame.visiting.assign(nodes.size(),0);readInputs.assign(nodes.size(),0);
         if(configuration&&configuration->revision==program->revision&&vision)
             for(std::size_t i=0;i<nodes.size();++i)
             {
-                const auto found=configuration->values.find(nodes[i].node.id);if(found==configuration->values.end())continue;
-                values[i]=found->second;evaluated[i]=true;const auto read=configuration->readInputs.find(nodes[i].node.id);if(read!=configuration->readInputs.end())readInputs[i]=read->second;
+                const auto found=configuration->values.find(g*NodeKeyStride+nodes[i].node.id);if(found==configuration->values.end())continue;
+                values[i]=found->second;evaluated[i]=true;const auto read=configuration->readInputs.find(g*NodeKeyStride+nodes[i].node.id);if(read!=configuration->readInputs.end())readInputs[i]=read->second;
             }
         if(monitorSignals&&domain.signalProgram!=program)
         {
@@ -1346,15 +1977,20 @@ Actions Service::evaluateDomain(const Context& context,bool vision,bool configur
             }
             domain.signals[g]=std::move(remapped);
         }
-        int requiredDependency=-1;
-        auto evaluateNode = [&](int index) -> const Value&
-        {
+    }
+    std::size_t activeNodes=0;for(const auto& frame:domain.evaluations)activeNodes+=frame.values.size();domain.pending.resize(activeNodes);
+    std::pair<int,int> requiredDependency{-1,-1};
+    auto evaluateNode = [&](int g,int index) -> const Value&
+    {
+        const auto& nodes=program->graphs[g].nodes;
+        auto& values=domain.evaluations[g].values;auto& evaluated=domain.evaluations[g].evaluated;auto& readInputs=domain.evaluations[g].readInputs;
+
             const std::size_t i = static_cast<std::size_t>(index);
             if (evaluated[i]) return values[i];
             evaluated[i] = true;
-            const auto ready=[&](int dependency){if(evaluated[dependency])return true;evaluated[i]=false;requiredDependency=dependency;return false;};
+            const auto ready=[&](int dependency){if(evaluated[dependency])return true;evaluated[i]=false;requiredDependency={g,dependency};return false;};
             const auto& n = nodes[i];
-            if(n.node.kind==K::ImagePreview&&!previewWanted(n.node.id))
+            if(n.node.kind==K::ImagePreview&&!previewWanted(previewKey(g,n.node.id)))
             {values[i]=boolean(false);values[i].valid=false;return values[i];}
             const Node* resolved=&n.node;
             const auto& rawDefinition=definition(n.node.kind);
@@ -1384,10 +2020,10 @@ Actions Service::evaluateDomain(const Context& context,bool vision,bool configur
             }
             if(configuration&&configuration->revision==program->revision)
             {
-                const auto cached=configuration->values.find(n.node.id);
+                const auto cached=configuration->values.find(g*NodeKeyStride+n.node.id);
                 if(cached!=configuration->values.end())
-                {values[i]=cached->second;const auto read=configuration->readInputs.find(n.node.id);if(read!=configuration->readInputs.end())readInputs[i]=read->second;return values[i];}
-                const auto provider=configuration->providers.find(n.node.id);if(provider!=configuration->providers.end())resolved=&provider->second;
+                {values[i]=cached->second;const auto read=configuration->readInputs.find(g*NodeKeyStride+n.node.id);if(read!=configuration->readInputs.end())readInputs[i]=read->second;return values[i];}
+                const auto provider=configuration->providers.find(g*NodeKeyStride+n.node.id);if(provider!=configuration->providers.end())resolved=&provider->second;
             }
             if(resolved==&n.node&&!n.node.disabled&&!n.node.bypassed&&!n.bindings.empty())
             {
@@ -1451,28 +2087,41 @@ Actions Service::evaluateDomain(const Context& context,bool vision,bool configur
                 else{values[i].type=def.outputs[0].type;values[i].valid=false;values[i].error="No matching Set for "+textParameter(settings,"name");}
                 return values[i];
             }
+            const Value* shared=nullptr;
+            if(calibrationIdentifier(settings.kind)&&settings.kind!=K::MouseProfile)
+            {
+                auto& value=values[i];value.type=def.outputs.empty()?T::Boolean:def.outputs[0].type;value.valid=false;
+                if(vision||n.sharedGraph<0||!inDomain(n.sharedGraph))
+                {value.error=n.sharedGraph==-2?"Ambiguous shared calibration: "+textParameter(settings,"name"):"Missing shared calibration: "+textParameter(settings,"name");return value;}
+                const auto& source=domain.evaluations[n.sharedGraph];
+                if(!source.evaluated[n.sharedIndex]){evaluated[i]=false;requiredDependency={n.sharedGraph,n.sharedIndex};return value;}
+                shared=&source.values[n.sharedIndex];
+                if(!shared->valid||!shared->calibration){value.error=shared->error.empty()?"Shared calibration is unavailable.":shared->error;return value;}
+                if(settings.kind==K::SharedCalibration){value=*shared;return value;}
+                if(settings.kind==K::SharedCalibrationScale){value=point(shared->calibration->pixelsPerCount);return value;}
+            }
             if(settings.kind==K::ImagePreview)
             {
                 auto& out=values[i];out=boolean(false);out.valid=false;
                 int pin=static_cast<int>(parameter(settings,"mode"));
                 if(!pin)for(int p=1;p<=3;++p)if(n.inputs[p]>=0){pin=p;break;}
-                if(pin<1||pin>3||n.inputs[pin]<0){domain.previews.erase(settings.id);return out;}
+                if(pin<1||pin>3||n.inputs[pin]<0){domain.previews.erase(previewKey(g,settings.id));return out;}
                 const std::array<double,4> options={parameter(settings,"mode"),parameter(settings,"max_size"),parameter(settings,"colormap"),parameter(settings,"draw_boxes")};
-                const auto cached=domain.previews.find(settings.id);
+                const auto cached=domain.previews.find(previewKey(g,settings.id));
                 if(!configurationOnly&&cached!=domain.previews.end()&&cached->second.settings==options&&
                     (!context.frame||!cached->second.image||cached->second.image->generation==context.frame->generation)&&
                     now-cached->second.updatedAt<std::chrono::duration<double>(1.0/parameter(settings,"max_fps")))
                 {out.preview=cached->second.image;out.valid=static_cast<bool>(out.preview);out.boolean=out.valid;out.error=cached->second.error;return out;}
                 readInputs[i]|=std::uint64_t{1}<<pin;if(!ready(n.inputs[pin]))return out;
                 const auto& image=values[n.inputs[pin]];
-                if(!image.valid&&!configurationOnly){out.error=image.error;domain.previews.erase(settings.id);return out;}
+                if(!image.valid&&!configurationOnly){out.error=image.error;domain.previews.erase(previewKey(g,settings.id));return out;}
                 DetectionStream detections;
                 if(parameter(settings,"draw_boxes")!=0&&n.inputs[4]>=0)
                 {readInputs[i]|=std::uint64_t{1}<<4;if(!ready(n.inputs[4]))return out;if(values[n.inputs[4]].valid)detections=values[n.inputs[4]].detections;}
                 if(configurationOnly||!context.preview)return out;
                 const auto currentPreviews=previewNodes();
-                if(!currentPreviews||!std::binary_search(currentPreviews->begin(),currentPreviews->end(),settings.id))return out;
-                auto& state=domain.previews[settings.id];
+                if(!currentPreviews||!std::binary_search(currentPreviews->begin(),currentPreviews->end(),previewKey(g,settings.id)))return out;
+                auto& state=domain.previews[previewKey(g,settings.id)];
                 const auto generation=image.mask?image.mask->generation:image.frame->generation;
                 const auto version=image.mask?image.mask->version:image.frame->version;
                 const auto identity=image.mask?image.mask->storage.get():image.frame->storage.get();
@@ -1499,7 +2148,7 @@ Actions Service::evaluateDomain(const Context& context,bool vision,bool configur
             {
                 for(std::size_t pin=0;pin<def.dataInputs;++pin)if(n.inputs[pin]>=0)
                 {readInputs[i]|=std::uint64_t{1}<<pin;if(!ready(n.inputs[pin]))return values[i];}
-                if(parameter(settings,"enabled")!=0)actions.configuredProviders.push_back(settings);
+                if(parameter(settings,"enabled")!=0){auto provider=settings;provider.runtimeKey=g*NodeKeyStride+settings.id;actions.configuredProviders.push_back(std::move(provider));}
                 values[i].type=def.outputs[0].type;values[i].valid=false;return values[i];
             }
             if(settings.kind>=K::SelectBoolean&&settings.kind<=K::SelectMonitors)
@@ -1591,13 +2240,16 @@ Actions Service::evaluateDomain(const Context& context,bool vision,bool configur
                 {
                     inputs[p]=scalarInputDefault(settings,p,true);
                 }
-                else if((settings.kind==K::MouseDelta&&p==2&&parameter(settings,"legacy_center")!=0)||(settings.kind==K::FilterCircle&&p==1))inputs[p]=point(context.center);
+                else if(((settings.kind==K::MouseDelta||settings.kind==K::SharedMouseDelta)&&p==2&&parameter(settings,"legacy_center")!=0)||
+                    (settings.kind==K::PointDelta&&p==1&&parameter(settings,"implicit_center")!=0)||(settings.kind==K::FilterCircle&&p==1)||(settings.kind==K::SpeedCurve&&p==1)||((settings.kind==K::ScopeCheck||settings.kind==K::BoxContainsPoint)&&p==2))inputs[p]=point(context.center);
+                else if(settings.kind==K::RecoilOutput&&p==2)inputs[p]=point({1,1});
                 else if(isAuxiliarySink(settings.kind)&&p>=2){inputs[p].valid=true;}
                 // A point has no meaningful default; a disconnected branch is inactive.
                 else if(settings.kind==K::CaptureSource&&p==0)inputs[p].valid=true;
                 else if (isSink(settings.kind) || def.inputs[p].type == T::Point || def.inputs[p].type == T::Target ||
                     def.inputs[p].type == T::Detections || def.inputs[p].type == T::Movement||def.inputs[p].type==T::Frame||def.inputs[p].type==T::Depth||def.inputs[p].type==T::Mask) inputs[p].valid = false;
                 else if(def.inputs[p].type==T::Monitor||def.inputs[p].type==T::Monitors)inputs[p].valid=false;
+                else if(def.inputs[p].type==T::Motion||def.inputs[p].type==T::Calibration)inputs[p].valid=false;
                 else if(def.inputs[p].type==T::OverlayStyle||def.inputs[p].type==T::LabelOptions)inputs[p].valid=isStyleNode(settings.kind)&&p==0;
                 promoteInteger(inputs[p],def.inputs[p].type);
                 valid = valid && inputs[p].valid;
@@ -1642,6 +2294,8 @@ Actions Service::evaluateDomain(const Context& context,bool vision,bool configur
             case K::Target:
             case K::TargetNearest:
             case K::TargetTracker:
+            case K::ChooseTarget:
+            case K::TrackDetections:
                 out = target({});
                 out.valid=false;
                 if (valid && context.selectTarget)
@@ -1721,18 +2375,69 @@ Actions Service::evaluateDomain(const Context& context,bool vision,bool configur
                 if (valid && context.predict)
                 {actions.activePredictionKeys.push_back(nodeKey);out=point(context.predict(nodeKey,inputs[0].point,settings,inputs[1].number,inputs[2].boolean));}
                 break;
+            case K::MotionEstimate:
+                out.type=T::Motion;out.valid=false;
+                if(valid&&context.estimateMotion){actions.activePredictionKeys.push_back(nodeKey);out=motionValue(context.estimateMotion(nodeKey,inputs[0].point,settings,inputs[1].boolean));}
+                break;
+            case K::MotionPosition:out=point(inputs[0].motion.position);break;
+            case K::MotionVelocity:out=point(inputs[0].motion.velocity);break;
+            case K::MotionDamping:out=number(inputs[0].motion.damping);break;
+            case K::MotionReady:out=boolean(inputs[0].motion.ready);break;
+            case K::PredictionTime:
+                out=number(std::clamp(inputs[0].number+(parameter(settings,"kalman_compensate_detection_delay")!=0?std::clamp(context.observationDelaySeconds,0.0,0.35):0)+parameter(settings,"kalman_additional_prediction_ms")*0.001,0.0,1.5));break;
+            case K::ProjectPoint:
+                out=point(projectPoint(inputs[0].point,inputs[1].point,inputs[2].number,inputs[3].number,inputs[4].boolean));break;
+            case K::FutureTrail:
+                out=point(inputs[0].point);actions.aimPoint=inputs[0].point;
+                if(valid&&parameter(settings,"draw_futurePositions")!=0&&context.futureTrail)context.futureTrail(inputs[1].motion,inputs[2].number,settings);
+                break;
+            case K::BoxPoint:
+                out=point({inputs[0].point.x+inputs[1].point.x*inputs[2].point.x,inputs[0].point.y+inputs[1].point.y*inputs[2].point.y});break;
+            case K::TargetAnchor:
+                out=point({0.5,inputs[0].integer==static_cast<int>(parameter(settings,"class_head"))?inputs[2].number:inputs[1].number});break;
+            case K::BoxContainsPoint:
+                out=boolean(std::abs(inputs[0].point.x+inputs[1].point.x*0.5-inputs[2].point.x)<inputs[1].point.x*inputs[3].number*0.5&&
+                    std::abs(inputs[0].point.y+inputs[1].point.y*0.5-inputs[2].point.y)<inputs[1].point.y*inputs[3].number*0.5);break;
             case K::AimOutput:
-                actions.aim = valid && inputs[0].boolean;
-                if (actions.aim) actions.movement = inputs[1].movement;
-                out = boolean(actions.aim); break;
+                out=boolean(valid&&inputs[0].boolean);
+                if(out.boolean){actions.aim=true;actions.movement=inputs[1].movement;actions.movements.push_back(inputs[1].movement);}
+                break;
             case K::AutoShootOutput:
-                actions.autoShoot = valid && inputs[0].boolean && inputs[1].target.valid;
-                if (actions.autoShoot) actions.shootTarget = inputs[1].target;
-                out = boolean(actions.autoShoot); break;
+                out=boolean(valid&&inputs[0].boolean&&inputs[1].target.valid);
+                if(out.boolean){actions.autoShoot=true;if(!actions.shootTarget.valid||inputs[1].target.observed)actions.shootTarget=inputs[1].target;}
+                break;
             case K::RecoilOutput:
-                actions.recoil = valid && inputs[0].boolean;
-                if (actions.recoil) actions.recoilStrength = inputs[1].number;
-                out = boolean(actions.recoil); break;
+            case K::RecoilProfileOutput:
+            case K::SharedRecoilOutput:
+                out=boolean(valid&&inputs[0].boolean);
+                if(out.boolean)
+                {
+                    const auto calibration=settings.kind==K::SharedRecoilOutput?shared->calibration->pixelsPerCount:settings.kind==K::RecoilProfileOutput?mousePixelCalibration(settings,{context.center.x*2,context.center.y*2}):inputs[2].point;
+                    actions.recoil=true;actions.recoilStrength+=inputs[1].number;actions.recoilPixelDeltaY+=inputs[1].number*calibration.y;
+                }
+                break;
+            case K::MouseCalibration:
+                out=point(mousePixelCalibration(settings,{context.center.x*2,context.center.y*2}));
+                break;
+            case K::MouseProfile:
+            {
+                auto& cache=domain.calibrations[nodeKey];const Point size{context.center.x*2,context.center.y*2};
+                if(!cache.value||cache.numbers!=settings.parameters||cache.texts!=settings.textParameters||cache.size.x!=size.x||cache.size.y!=size.y)
+                {cache.value=std::make_shared<const CalibrationData>(mouseCalibration(settings,size));cache.numbers=settings.parameters;cache.texts=settings.textParameters;cache.size=size;}
+                out.type=T::Calibration;out.calibration=cache.value;break;
+            }
+            case K::CalibrationScale:
+                out.type=T::Point;out.valid=false;if(valid&&inputs[0].calibration)out=point(inputs[0].calibration->pixelsPerCount);break;
+            case K::PointDelta:out=point({inputs[0].point.x-inputs[1].point.x,inputs[0].point.y-inputs[1].point.y});actions.aimPoint=inputs[0].point;break;
+            case K::PixelsToCounts:
+                out.type=T::Movement;out.valid=false;if(valid&&inputs[1].calibration)out=movement(pixelsToCounts(inputs[0].point,*inputs[1].calibration));break;
+            case K::ApplyMouseSpeed:out=movement(applyMouseSpeed(inputs[0].movement,inputs[1].number));break;
+            case K::SharedMouseDelta:
+            {
+                auto converted=applyMouseSpeed(pixelsToCounts({inputs[0].point.x-inputs[2].point.x,inputs[0].point.y-inputs[2].point.y},*shared->calibration),inputs[1].number);
+                if(parameter(settings,"legacy_fps")!=0&&context.captureFps>30)converted=applyMouseSpeed(converted,30/context.captureFps);
+                out=movement(std::move(converted));actions.aimPoint=inputs[0].point;break;
+            }
             case K::Detections:
                 out=streamValue(context.detections);
                 break;
@@ -1743,12 +2448,12 @@ Actions Service::evaluateDomain(const Context& context,bool vision,bool configur
                 out.valid = out.valid && inputs[0].target.valid;
                 break;
             case K::ScopeCheck:
-                out = boolean(valid && inputs[0].target.valid && context.inScope && context.inScope(inputs[0].target,inputs[1].number));
+                out = boolean(valid && inputs[0].target.valid && context.inScope && context.inScope(inputs[0].target,inputs[1].number,inputs[2].point));
                 break;
             case K::SpeedCurve:
                 out = number(0);
                 out.valid = false;
-                if (valid && context.speedCurve) out = number(context.speedCurve(inputs[0].point,settings));
+                if (valid && context.speedCurve) out = number(context.speedCurve(inputs[0].point,inputs[1].point,parameter(settings,"max_distance")>0?parameter(settings,"max_distance"):std::hypot(context.center.x,context.center.y),settings));
                 break;
             case K::MouseDelta:
                 out = movement({});
@@ -1835,7 +2540,11 @@ Actions Service::evaluateDomain(const Context& context,bool vision,bool configur
             case K::FilterSize:
                 out=filtered({b,inputs[2].number,0,0},[&]{return filterStream(inputs[0].detections,[&](const Detection& d){return d.width*d.height>=b&&d.width*d.height<=inputs[2].number;});});break;
             case K::FilterCircle:
-                out=filtered({inputs[1].point.x,inputs[1].point.y,inputs[2].number,parameter(settings,"enabled")},[&]{return parameter(settings,"enabled")==0?inputs[0].detections:filterStream(inputs[0].detections,[&](const Detection& d){return std::hypot(d.x+d.width*0.5-inputs[1].point.x,d.y+d.height*0.5-inputs[1].point.y)<=std::max(0.0,inputs[2].number);});});break;
+            {
+                const double percent=parameter(settings,"radius_percent");
+                const double radius=percent>0?std::min(inputs[0].detections->width,inputs[0].detections->height)*0.5*percent/100.0:std::max(0.0,inputs[2].number);
+                out=filtered({inputs[1].point.x,inputs[1].point.y,radius,parameter(settings,"enabled")},[&]{return parameter(settings,"enabled")==0?inputs[0].detections:filterStream(inputs[0].detections,[&](const Detection& d){return std::hypot(d.x+d.width*0.5-inputs[1].point.x,d.y+d.height*0.5-inputs[1].point.y)<=radius;});});break;
+            }
             case K::PreferClass:
                 out=filtered({parameter(settings,"class_id"),parameter(settings,"enabled"),0,0},[&]{
                     const int cls=static_cast<int>(parameter(settings,"class_id"));
@@ -1857,6 +2566,7 @@ Actions Service::evaluateDomain(const Context& context,bool vision,bool configur
                 break;
             case K::NormalizeFps:
             {
+                if(parameter(settings,"enabled")==0){out=movement(inputs[0].movement);break;}
                 Movement scaled=inputs[0].movement;
                 const double base=parameter(settings,"base_fps"),factor=b>base?base/b:1;
                 if(scaled.hasPreciseCounts)
@@ -1864,6 +2574,7 @@ Actions Service::evaluateDomain(const Context& context,bool vision,bool configur
                     const int dx=static_cast<int>(std::trunc(std::clamp(scaled.preciseCounts.x*factor,-32767.0,32767.0)));
                     const int dy=static_cast<int>(std::trunc(std::clamp(scaled.preciseCounts.y*factor,-32767.0,32767.0)));
                     scaled.steps.clear();if(dx||dy)scaled.steps.push_back({dx,dy});scaled.hasPreciseCounts=false;
+                    if(parameter(settings,"preserve_fraction")!=0){scaled.hasPreciseCounts=true;scaled.preciseCounts.x*=factor;scaled.preciseCounts.y*=factor;}
                 }
                 else for(auto& step:scaled.steps){step.dx=static_cast<int>(std::trunc(step.dx*factor));step.dy=static_cast<int>(std::trunc(step.dy*factor));}
                 out=movement(std::move(scaled));break;
@@ -1887,6 +2598,7 @@ Actions Service::evaluateDomain(const Context& context,bool vision,bool configur
                 if(!state.reseed&&valid&&inputs[0].boolean&&!state.previous)state.toggled=!state.toggled;
                 state.previous=valid&&inputs[0].boolean;state.reseed=false;out=boolean(state.toggled);break;
             }
+            case K::CurrentFrame:out=frameValue(context.frame);break;
             case K::CaptureSource:
                 actions.activeProviderKeys.push_back(nodeKey);
                 out=frameValue(context.captureFrame?context.captureFrame(nodeKey,settings):context.frame);
@@ -1957,8 +2669,18 @@ Actions Service::evaluateDomain(const Context& context,bool vision,bool configur
                 if(valid&&context.screenshot){actions.activeScreenshotKeys.push_back(nodeKey);out=boolean(context.screenshot(nodeKey,inputs[1].frame,settings));}
                 break;
             case K::VisionOutput:
-                if(valid&&inputs[0].boolean)actions.visionDetections=inputs[1].detections;
-                out=boolean(static_cast<bool>(actions.visionDetections));break;
+                if(valid&&inputs[0].boolean)
+                {
+                    if(!actions.visionDetections)actions.visionDetections=inputs[1].detections;
+                    else if(inputs[1].detections&&actions.visionDetections!=inputs[1].detections)
+                    {
+                        auto combined=std::make_shared<DetectionFrame>(*actions.visionDetections);
+                        if(combined->version==inputs[1].detections->version&&combined->generation==inputs[1].detections->generation)
+                            for(const auto& detection:inputs[1].detections->objects){if(combined->objects.size()>=100000)break;combined->objects.push_back(detection);}
+                        actions.visionDetections=std::move(combined);
+                    }
+                }
+                out=boolean(valid&&inputs[0].boolean);break;
             case K::ControlActive:out=boolean(context.controlActive);break;
             case K::RerouteBoolean:
             case K::RerouteNumber:
@@ -1975,6 +2697,8 @@ Actions Service::evaluateDomain(const Context& context,bool vision,bool configur
             case K::RerouteMask:
             case K::RerouteOverlay:
             case K::RerouteLabels:
+            case K::RerouteMotion:
+            case K::RerouteCalibration:
                 out = std::move(inputs[0]);
                 break;
             default: if(variableSet(settings.kind))out=std::move(inputs[0]);else out.valid = false; break;
@@ -1984,42 +2708,62 @@ Actions Service::evaluateDomain(const Context& context,bool vision,bool configur
             catch(...){out.valid=false;out.error="Node provider failed.";}
             out.valid = out.valid && valid;
             if(context.nodeError){const auto error=context.nodeError(nodeKey);if(!error.empty()){out.error=error;out.valid=false;}}
-            if(!out.valid)
+            if(!out.valid&&out.boolean)
             {
                 if(settings.kind==K::VisionOutput)actions.visionDetections.reset();
                 if(settings.kind==K::AimOutput)actions.aim=false;
                 if(settings.kind==K::AutoShootOutput)actions.autoShoot=false;
-                if(settings.kind==K::RecoilOutput)actions.recoil=false;
+                if(settings.kind==K::RecoilOutput||settings.kind==K::RecoilProfileOutput||settings.kind==K::SharedRecoilOutput)actions.recoil=false;
             }
             values[i] = std::move(out);
             return values[i];
         };
-        const auto evaluateRequested=[&](int requested){
-            std::array<int,MaxNodes> pending{};std::size_t depth=1;pending[0]=requested;
-            while(depth)
+    const auto evaluateRequested=[&](int graph,int requested){
+        auto& pending=domain.pending;std::size_t depth=1;pending[0]={graph,requested};
+        domain.evaluations[graph].visiting[requested]=1;
+        while(depth)
+        {
+            const auto current=pending[depth-1];auto& frame=domain.evaluations[current.first];
+            if(frame.evaluated[current.second]){frame.visiting[current.second]=0;--depth;continue;}
+            requiredDependency={-1,-1};evaluateNode(current.first,current.second);
+            if(requiredDependency.first>=0)
             {
-                const int current=pending[depth-1];if(evaluated[current]){--depth;continue;}
-                requiredDependency=-1;evaluateNode(current);
-                if(requiredDependency>=0)pending[depth++]=requiredDependency;else --depth;
+                auto& dependency=domain.evaluations[requiredDependency.first];
+                if(dependency.visiting[requiredDependency.second]||depth==pending.size())
+                {
+                    auto& value=frame.values[current.second];value.valid=false;value.error="Shared calibration dependency cycle.";
+                    const auto& def=definition(program->graphs[current.first].nodes[current.second].node.kind);if(!def.outputs.empty())value.type=def.outputs[0].type;
+                    frame.evaluated[current.second]=1;
+                }
+                else{dependency.visiting[requiredDependency.second]=1;pending[depth++]=requiredDependency;}
             }
-        };
-        for (std::size_t i = 0; i < nodes.size(); ++i)
-            if(configurationOnly?(nodes[i].active&&(nodes[i].node.kind==K::CaptureSource||nodes[i].node.kind==K::Inference))||nodes[i].node.kind==K::ImagePreview:isSink(nodes[i].node.kind)) evaluateRequested(static_cast<int>(i));
+            else{frame.visiting[current.second]=0;--depth;}
+        }
+    };
+    for(int g=0;g<static_cast<int>(program->graphs.size());++g)if(inDomain(g))
+    {
+        const auto& nodes=program->graphs[g].nodes;
+        for(std::size_t i=0;i<nodes.size();++i)
+            if(configurationOnly?((nodes[i].active||(sharedFrame&&nodes[i].node.kind==K::CaptureSource))&&(nodes[i].node.kind==K::CaptureSource||nodes[i].node.kind==K::Inference))||nodes[i].node.kind==K::ImagePreview:isSink(nodes[i].node.kind))evaluateRequested(g,static_cast<int>(i));
+    }
+    for(int g=0;g<static_cast<int>(program->graphs.size());++g)if(inDomain(g))
+    {
+        const auto& nodes=program->graphs[g].nodes;auto& values=domain.evaluations[g].values;auto& evaluated=domain.evaluations[g].evaluated;auto& readInputs=domain.evaluations[g].readInputs;
         if(configurationOnly)
         {
             for(std::size_t i=0;i<nodes.size();++i)if(evaluated[i])
             {
                 const auto type=values[i].type;
                 if(values[i].valid&&(type==T::Boolean||type==T::Float||type==T::Integer||type==T::String||type==T::Point||type==T::Monitor||type==T::Monitors))
-                {nextConfiguration->values.emplace(nodes[i].node.id,values[i]);nextConfiguration->readInputs.emplace(nodes[i].node.id,readInputs[i]);}
-                if(nodes[i].node.kind==K::CaptureSource&&!values[i].error.empty())nextConfiguration->errors[nodes[i].node.id]=values[i].error;
+                {nextConfiguration->values.emplace(g*NodeKeyStride+nodes[i].node.id,values[i]);nextConfiguration->readInputs.emplace(g*NodeKeyStride+nodes[i].node.id,readInputs[i]);}
+                if(nodes[i].node.kind==K::CaptureSource&&!values[i].error.empty())nextConfiguration->errors[g*NodeKeyStride+nodes[i].node.id]=values[i].error;
             }
-            for(const auto& provider:actions.configuredProviders)nextConfiguration->providers.emplace(provider.id,provider);
+            for(const auto& provider:actions.configuredProviders)nextConfiguration->providers.emplace(provider.runtimeKey,provider);
         }
         if(monitorSignals)
         {
             completedAt=std::chrono::steady_clock::now();
-            // Vision owns one graph and can finish a slow provider after the
+            // A Vision provider can finish after the
             // sampling interval has elapsed. Publish that completed result now.
             if(vision&&completedAt-domain.sampledAt>=std::chrono::milliseconds(33))sample=true;
             if(sample){telemetry.graphs[g].reserve(nodes.size());telemetry.graphSampledAt[g]=completedAt;}
@@ -2034,7 +2778,7 @@ Actions Service::evaluateDomain(const Context& context,bool vision,bool configur
                 {
                     auto stamp=signalStamp(values[i]);const auto kind=nodes[i].node.kind;
                     const bool action=signal.active&&((kind==K::AimOutput&&std::any_of(actions.movement.steps.begin(),actions.movement.steps.end(),[](const MoveStep& step){return step.dx||step.dy;}))||
-                        (kind==K::RecoilOutput&&actions.recoilStrength!=0)||kind==K::CollectDataset||kind==K::DatasetOutput||kind==K::ScreenshotOutput);
+                        ((kind==K::RecoilOutput||kind==K::RecoilProfileOutput||kind==K::SharedRecoilOutput)&&actions.recoilStrength!=0)||kind==K::CollectDataset||kind==K::DatasetOutput||kind==K::ScreenshotOutput);
                     // Compiled nodes are in dependency order. Propagate new
                     // input events even when a transform returns the same
                     // number or point for a newly acquired frame.
@@ -2059,11 +2803,12 @@ Actions Service::evaluateDomain(const Context& context,bool vision,bool configur
                 }
             }
     }
+    for(auto& frame:domain.evaluations)for(auto& value:frame.values)value=Value{};
     if(monitorSignals)domain.signalProgram=program;
     if (sample)
     {
         std::lock_guard<std::mutex> lock(telemetryMutex_);
-        for(int graph=vision?3:0;graph<(vision?static_cast<int>(GraphCount):3);++graph)
+        for(int graph=0;graph<static_cast<int>(program->graphs.size());++graph)if(inDomain(graph))
         {telemetry_.graphs[graph]=std::move(telemetry.graphs[graph]);telemetry_.graphSampledAt[graph]=telemetry.graphSampledAt[graph];telemetry_.graphRevisions[graph]=program->revision;}
         if(vision)
         {
@@ -2079,6 +2824,7 @@ Actions Service::evaluateDomain(const Context& context,bool vision,bool configur
         {
             telemetry_.actions.aim=actions.aim;telemetry_.actions.autoShoot=actions.autoShoot;telemetry_.actions.recoil=actions.recoil;
             telemetry_.actions.aimPoint=actions.aimPoint;telemetry_.actions.recoilStrength=actions.recoilStrength;
+            telemetry_.actions.recoilPixelDeltaY=actions.recoilPixelDeltaY;
             telemetry_.actions.shootTarget=actions.shootTarget;telemetry_.actions.movement=actions.movement;
             telemetry_.actions.activePredictionKeys=actions.activePredictionKeys;telemetry_.actions.activeWindKeys=actions.activeWindKeys;telemetry_.actions.activeSelectionKeys=actions.activeSelectionKeys;
         }
@@ -2113,10 +2859,11 @@ Telemetry Service::telemetry() const
     auto result=telemetry_;
     for(const auto& issue:configurationErrors_)
     {
-        auto& samples=result.graphs[3];auto found=std::find_if(samples.begin(),samples.end(),[&](const NodeValue& value){return value.nodeId==issue.first;});
-        if(found==samples.end()){samples.push_back({});found=std::prev(samples.end());found->nodeId=issue.first;}
+        const int graph=issue.first/NodeKeyStride,nodeId=issue.first%NodeKeyStride;if(graph<0||graph>=static_cast<int>(MaxGraphs))continue;
+        auto& samples=result.graphs[graph];auto found=std::find_if(samples.begin(),samples.end(),[&](const NodeValue& value){return value.nodeId==nodeId;});
+        if(found==samples.end()){samples.push_back({});found=std::prev(samples.end());found->nodeId=nodeId;}
         found->value.valid=false;found->value.error=issue.second;found->active=found->signalActive=false;
-        result.graphSampledAt[3]=std::chrono::steady_clock::now();result.graphRevisions[3]=revision();
+        result.graphSampledAt[graph]=std::chrono::steady_clock::now();result.graphRevisions[graph]=revision();
     }
     return result;
 }
@@ -2135,7 +2882,7 @@ void Service::setPreviewNodes(std::vector<int> nodes)
     {
         std::atomic_store(&previewNodes_,std::make_shared<const std::vector<int>>(std::move(nodes)));
         const auto current=std::atomic_load(&previewNodes_);std::lock_guard<std::mutex> lock(telemetryMutex_);
-        for(auto& node:telemetry_.graphs[3])if(!std::binary_search(current->begin(),current->end(),node.nodeId))node.value.preview.reset();
+        for(std::size_t graph=0;graph<MaxGraphs;++graph)for(auto& node:telemetry_.graphs[graph])if(!std::binary_search(current->begin(),current->end(),previewKey(static_cast<int>(graph),node.nodeId)))node.value.preview.reset();
     }
 }
 std::shared_ptr<const std::vector<int>> Service::previewNodes() const
@@ -2150,11 +2897,12 @@ bool serialize(const Workspace& workspace, std::string& text, std::string& error
 {
     if (!validate(workspace, error)) return false;
     std::ostringstream out;
-    out << std::setprecision(17) << "SUNONE_NODE_GRAPH " << CurrentFormatVersion << '\n';
+    out << std::setprecision(17) << "SUNONE_NODE_GRAPH " << CurrentFormatVersion << '\n' << "PAGES " << workspace.graphs.size() << '\n';
     for (const Graph& graph : workspace.graphs)
     {
         out << "GRAPH " << static_cast<int>(graph.kind) << ' ' << graph.panX << ' ' << graph.panY << ' '
             << graph.zoom << ' ' << graph.nodes.size() << ' ' << graph.links.size() << ' ' << graph.groups.size() << ' ' << graph.ties.size() << '\n';
+        out << "PAGE " << graph.workflow << ' ' << graph.active << ' ' << graph.enabled << ' ' << std::quoted(graph.workflowName) << ' ' << std::quoted(graph.pageName) << ' ' << graph.workflowIcon << '\n';
         for (const Node& n : graph.nodes)
         {
             out << "NODE " << n.id << ' ' << static_cast<int>(n.kind) << ' ' << n.x << ' ' << n.y << ' ' << n.value
@@ -2197,16 +2945,23 @@ bool deserialize(const std::string& text, Workspace& workspace, std::string& err
     if (!(in >> token >> version) || token != "SUNONE_NODE_GRAPH" || version<1 || version>CurrentFormatVersion) return malformed();
     Workspace candidate;
     candidate.sourceVersion=version;
-    for (std::size_t i = 0; i < (version>=4?GraphCount:3); ++i)
+    std::size_t pages=version>=4?GraphCount:3;
+    if(version>=14){if(!(in>>token>>pages)||token!="PAGES"||pages>MaxGraphs)return malformed();candidate.graphs.resize(pages);}
+    for (std::size_t i=0;i<pages;++i)
     {
         Graph& graph = candidate.graphs[i];
         int kind = -1;
         std::size_t nodeCount = 0, linkCount = 0, groupCount = 0, tieCount = 0;
         if (!(in >> token >> kind >> graph.panX >> graph.panY >> graph.zoom >> nodeCount >> linkCount) ||
-            token != "GRAPH" || kind != i || nodeCount > MaxNodes || linkCount > MaxLinks) return malformed();
+            token != "GRAPH" || kind<0 || kind>3 || (version<14&&kind!=i) || nodeCount > MaxNodes || linkCount > MaxLinks) return malformed();
         if (version >= 2 && (!(in >> groupCount) || groupCount > MaxGroups)) return malformed();
         if(version>=5&&(!(in>>tieCount)||tieCount>MaxWireTies))return malformed();
         graph.kind = static_cast<GraphKind>(kind);
+        if(version>=14)
+        {
+            int active=-1,enabled=-1;if(!(in>>token>>graph.workflow>>active>>enabled>>std::quoted(graph.workflowName)>>std::quoted(graph.pageName))||token!="PAGE"||active<0||active>1||enabled<0||enabled>1)return malformed();graph.active=active!=0;graph.enabled=enabled!=0;
+            if(version>=15&&!(in>>graph.workflowIcon))return malformed();
+        }
         for (std::size_t n = 0; n < nodeCount; ++n)
         {
             Node node;
@@ -2298,13 +3053,42 @@ bool deserialize(const std::string& text, Workspace& workspace, std::string& err
         }
     }
     if(version<4)candidate.graphs[3]=defaults().graphs[3];
+    for(std::size_t i=0;i<candidate.graphs.size();++i)if(!candidate.graphs[i].workflow)candidate.graphs[i].workflow=static_cast<int>(i)+1;
     if (!(in >> token) || token != "END" || (in >> token)) return malformed();
+    if(version<16)for(auto& graph:candidate.graphs)
+    {
+        for(auto& link:graph.links)if(link.toPort>=1)
+            for(const auto& node:graph.nodes)if(node.id==link.toNode&&node.kind==K::SpeedCurve){++link.toPort;break;}
+        for(auto& node:graph.nodes)
+        {
+            const int addedRows=node.kind==K::SpeedCurve?2:node.kind==K::ScopeCheck?1:0;
+            if(!addedRows||node.height<=0)continue;
+            const float minimum=Layout::minimumHeight(node);
+            if(node.height>=Layout::up(minimum-addedRows*Layout::PinSpacing)&&node.height<minimum)node.height=Layout::up(minimum);
+        }
+    }
+    if(version<17)
+    {
+        for(auto& graph:candidate.graphs)migrateStarterLayout(graph);
+        for(auto& graph:candidate.graphs)for(auto& node:graph.nodes)
+            if(node.kind==K::RecoilOutput&&node.height>0&&node.height<Layout::minimumHeight(node))node.height=Layout::up(Layout::minimumHeight(node));
+        migrateRecoilCalibration(candidate);
+    }
+    if(version<19)for(auto& graph:candidate.graphs)for(auto& node:graph.nodes)
+        if(node.kind==K::NormalizeFps&&node.height>0&&node.height<Layout::minimumHeight(node))node.height=Layout::up(Layout::minimumHeight(node));
     if (!validate(candidate, error)) return false;
+    if(version<18)
+    {
+        for(auto& graph:candidate.graphs)expandProcessingNodes(graph);
+        if(!validate(candidate,error))return false;
+    }
+    if(version>=3&&version<19){shareMouseCalibration(candidate);if(!validate(candidate,error))return false;}
     if(version<12)
     {
         compactOutputNodes(candidate.graphs[3]);
         if(!validate(candidate,error))return false;
     }
+    if(version<20){migrateWorkflowPages(candidate);if(!validate(candidate,error))return false;}
     workspace = std::move(candidate);
     return true;
 }

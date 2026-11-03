@@ -387,7 +387,13 @@ BenchmarkResult RunCudaBenchmark(const CliOptions& options, const std::filesyste
     auto loadStart = Clock::now();
     try
     {
-        trt_detector.initialize(modelPath.string());
+        auto settings=NodeGraph::defaultNode(NodeGraph::NodeKind::Inference,1);
+        settings.parameters["fixed_input_size"]=config.fixed_input_size?1:0;
+        settings.parameters["confidence_threshold"]=config.confidence_threshold;settings.parameters["nms_threshold"]=config.nms_threshold;
+        settings.parameters["max_detections"]=config.max_detections;settings.parameters["use_cuda_graph"]=config.use_cuda_graph?1:0;
+        settings.parameters["use_pinned_memory"]=config.use_pinned_memory?1:0;
+        settings.parameters["export_enable_fp16"]=config.export_enable_fp16?1:0;settings.parameters["export_enable_fp8"]=config.export_enable_fp8?1:0;
+        trt_detector.initialize(modelPath.string(),settings,frame.cols,frame.rows);
         result.loadSeconds = std::chrono::duration<double>(Clock::now() - loadStart).count();
         if (!trt_detector.isInitialized())
             throw std::runtime_error("TensorRT detector did not initialize.");
@@ -395,7 +401,7 @@ BenchmarkResult RunCudaBenchmark(const CliOptions& options, const std::filesyste
         auto warmupStart = Clock::now();
         for (int i = 0; i < options.warmupRuns; ++i)
         {
-            auto detections = trt_detector.detect(frame);
+            auto detections = trt_detector.detect(frame,settings);
             result.lastDetections = detections.size();
         }
         result.warmupSeconds = std::chrono::duration<double>(Clock::now() - warmupStart).count();
@@ -403,7 +409,7 @@ BenchmarkResult RunCudaBenchmark(const CliOptions& options, const std::filesyste
         auto totalStart = Clock::now();
         for (int i = 0; i < options.runs; ++i)
         {
-            auto detections = trt_detector.detect(frame);
+            auto detections = trt_detector.detect(frame,settings);
             result.lastDetections = detections.size();
             result.preprocessSeconds += trt_detector.lastPreprocessTime.count() / 1000.0;
             result.inferenceSeconds +=

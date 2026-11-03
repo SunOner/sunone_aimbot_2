@@ -30,6 +30,7 @@ bool IsDataCollectionEnabled(const Config& cfg);
 DataCollectionUiState GetDataCollectionUiState(const std::string& root_dir, const char* model_name, const Config& cfg);
 DataCollectionUiState GetDataCollectionNodeUiState(int nodeKey);
 void ResetDataCollectionRuntime();
+void ResetDataCollectionNodeCounters(int nodeKey);
 void RetainDataCollectionNodes(const std::vector<int>& activeKeys);
 bool CollectDataSampleForNode(int nodeKey, const std::string& root_dir, const char* model_name,
     const cv::Mat& frame, const std::vector<cv::Rect>& boxes, const std::vector<int>& classes,

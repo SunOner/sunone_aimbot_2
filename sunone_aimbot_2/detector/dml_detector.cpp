@@ -225,7 +225,7 @@ DirectMLDetector::DirectMLDetector(const std::string& model_path, int deviceId, 
     env(getDmlOrtLogLevel(), "DML_Detector"),
     memory_info(Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault))
 {
-    device_id=deviceId>=0?deviceId:config.dml_device_id;
+    device_id=std::max(0,deviceId);
     cpu_only=cpuOnly;
     if (!model_path.empty()&&!initializeModel(model_path))
     {
@@ -523,31 +523,6 @@ void DirectMLDetector::preprocessFrameToTensor(const cv::Mat& frame, float* dst,
     cv::split(preprocessFloatBuffer, bgrToRgbPlanes);
 }
 
-std::vector<Detection> DirectMLDetector::detect(const cv::Mat& input_frame)
-{
-    std::vector<cv::Mat> batch = { input_frame };
-    auto batchResult = detectBatch(batch);
-    if (!batchResult.empty())
-        return batchResult[0];
-    else
-        return {};
-}
-
-std::vector<std::vector<Detection>> DirectMLDetector::detectBatch(const std::vector<cv::Mat>& frames)
-{
-    // Compatibility entry point for provider benchmarks. Production supplies
-    // the connected Inference node's immutable parameters instead.
-    NodeGraph::Node settings=NodeGraph::defaultNode(NodeGraph::NodeKind::Inference,1);
-    {
-        std::lock_guard<std::mutex> lock(configMutex);
-        settings.parameters["fixed_input_size"]=config.fixed_input_size?1:0;
-        settings.parameters["confidence_threshold"]=config.confidence_threshold;
-        settings.parameters["nms_threshold"]=config.nms_threshold;
-        settings.parameters["max_detections"]=config.max_detections;
-    }
-    return detectBatch(frames,settings);
-}
-
 std::vector<std::vector<Detection>> DirectMLDetector::detectBatch(const std::vector<cv::Mat>& frames, const NodeGraph::Node& settings)
 {
     std::vector<std::vector<Detection>> empty;
@@ -719,36 +694,6 @@ std::vector<std::vector<Detection>> DirectMLDetector::detectBatch(const std::vec
     return batchDetections;
 }
 
-int DirectMLDetector::getNumberOfClasses()
-{
-    if (!isReady())
-        return -1;
-
-    if (sunpoint_raw_output)
-        return 2;
-
-    Ort::TypeInfo output_type_info = session.GetOutputTypeInfo(0);
-    auto tensor_info = output_type_info.GetTensorTypeAndShapeInfo();
-    std::vector<int64_t> output_shape = tensor_info.GetShape();
-
-    if (output_shape.size() == 3)
-    {
-        int channels = 0;
-        if (!tryInt64ToInt(output_shape[1], &channels))
-        {
-            std::cerr << "[DirectMLDetector] Output tensor channel dimension is invalid." << std::endl;
-            return -1;
-        }
-        int num_classes = channels - 4;
-        return num_classes;
-    }
-    else
-    {
-        std::cerr << "[DirectMLDetector] Unexpected output tensor shape." << std::endl;
-        return -1;
-    }
-}
-
 void DirectMLDetector::processFrame(
     const cv::Mat& detection_frame,
     const cv::Mat& source_frame,
@@ -828,7 +773,7 @@ void DirectMLDetector::dmlInferenceThread()
                 for(auto it=models.begin();it!=models.end();)
                 {
                     const bool keep=std::any_of(active.begin(),active.end(),[&](const NodeGraph::Node& node){
-                        return static_cast<int>(NodeGraph::GraphKind::Vision)*1000001+node.id==it->first&&NodeGraph::parameter(node,"enabled")!=0;});
+                        return node.runtimeKey==it->first&&NodeGraph::parameter(node,"enabled")!=0;});
                     if(!keep)it=models.erase(it);else ++it;
                 }
                 providerRevision=revision;

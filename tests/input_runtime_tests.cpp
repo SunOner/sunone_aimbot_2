@@ -6,11 +6,14 @@
 #include "runtime/thread_loops.h"
 #include "nodes/node_graph.h"
 #include "nodes/node_config_bridge.h"
+#include "keyboard/graph_key_state.h"
 
 #include <algorithm>
 #include <cmath>
 #include <functional>
 #include <future>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <memory>
 #include <stdexcept>
@@ -20,6 +23,7 @@ Config config{};
 std::mutex configMutex;
 std::mutex inputDevicesMutex;
 MouseThread* globalMouseThread = nullptr;
+std::unique_ptr<IMouseInput> activeMouseInputOwner;
 std::atomic<bool> shouldExit{ false };
 std::atomic<bool> aiming{ false };
 std::atomic<bool> graphAimActive{ false };
@@ -176,7 +180,7 @@ void setNodeParameter(NodeGraph::NodeKind kind,const char* key,double value)
 
 std::unique_ptr<MouseThread> makeMouse(IMouseInput* input)
 {
-    return std::make_unique<MouseThread>(320, 90, 90, 1.0, 1.0, 0.0, input);
+    return std::make_unique<MouseThread>(320,input);
 }
 
 void publishTarget()
@@ -202,7 +206,7 @@ void idleStopAndDeviceLifetime()
     mouse->pressMouse();
     mouse->stop();
     device.reset();
-    mouse->moveRelative(1, 1);
+    mouse->dispatchGraphMovement(NodeGraph::Movement{{{1,1}}});
     require(state->downs == 1 && state->ups == 1 && state->moves == 0,
         "Stop must release and detach input before its owner is destroyed");
 }
@@ -241,26 +245,53 @@ void deviceSwitchReleasesOldButton()
     require(newState->downs == 1 && newState->ups == 1, "Press ownership must reset for the new device");
 }
 
-void configIsAppliedOnlyByMouseLoop()
+void splitMouseConversionMatchesCombined()
 {
-    resetFixture();
-    auto state = std::make_shared<FakeState>();
-    FakeInput device(state);
-    auto mouse = makeMouse(&device);
-    Config snapshot = config;
-    snapshot.detection_resolution = 640;
-    mouse->pressMouse();
-    std::thread ui([&] { mouse->updateConfig(snapshot); });
-    ui.join();
-    require(mouse->check_target_in_scope(140, 140, 40, 40, 1.0f),
-        "UI update must not mutate active geometry");
-    require(state->ups == 0, "UI update must not send input directly");
-    require(mouse->applyPendingConfig(), "Owner must apply queued settings");
-    require(!mouse->check_target_in_scope(140, 140, 40, 40, 1.0f) && state->ups == 0,
-        "Applying settings must update geometry without inventing a graph release policy");
-    mouse->releaseMouse();
-    require(state->ups == 1, "Explicit output release must still own the pressed button");
-    require(!mouse->applyPendingConfig(), "Settings must not be reapplied every iteration");
+    resetFixture();auto mouse=makeMouse(nullptr);
+    for(int size:{160,320,640})for(double sensitivity:{0.0,0.12,1.75})for(double speed:{-1.0,0.0,0.05,1.7,20.0})for(bool scaled:{false,true})for(int fps:{20,60,144})
+    {
+        auto node=NodeGraph::defaultNode(NodeGraph::NodeKind::MouseDelta,1);
+        node.parameters["fov_x"]=110;node.parameters["fov_y"]=75;node.parameters["sens"]=sensitivity;
+        node.parameters["yaw"]=0.031;node.parameters["pitch"]=0.027;node.parameters["fov_scaled"]=scaled;node.parameters["base_fov"]=100;node.parameters["legacy_fps"]=1;
+        mouse->setCaptureResolution(size);captureFps=fps;
+        const NodeGraph::Point center{size*0.5,size*0.5},point{center.x+0.173*size,center.y-0.119*size};
+        const auto original=mouse->graphMouseDelta(point.x,point.y,speed,center,node);
+        auto split=NodeGraph::applyMouseSpeed(NodeGraph::pixelsToCounts({point.x-center.x,point.y-center.y},NodeGraph::mouseCalibration(node,{static_cast<double>(size),static_cast<double>(size)})),speed);
+        if(fps>30)split=NodeGraph::applyMouseSpeed(split,30.0/fps);
+        require(split.hasPreciseCounts==original.hasPreciseCounts&&split.steps.size()==original.steps.size(),"Split conversion changed zero sensitivity or quantization");
+        require(split.preciseCounts.x==original.preciseCounts.x&&split.preciseCounts.y==original.preciseCounts.y&&split.pixelScaleX==original.pixelScaleX&&split.pixelScaleY==original.pixelScaleY,"Split conversion changed precise counts or calibration metadata");
+        for(std::size_t i=0;i<split.steps.size();++i)require(split.steps[i].dx==original.steps[i].dx&&split.steps[i].dy==original.steps[i].dy,"Split conversion rounded counts before applying speed");
+    }
+    captureFps=60;
+}
+void captureGeometryUsesOnlyNodeTuning()
+{
+    resetFixture();auto mouse=makeMouse(nullptr);auto node=NodeGraph::defaultNode(NodeGraph::NodeKind::MouseDelta,1);
+    node.parameters["sens"]=1;node.parameters["yaw"]=node.parameters["pitch"]=1;
+    const auto before=mouse->graphMouseDelta(240,160,1,{160,160},node);
+    config.fovX=1;config.game_profiles.at("TEST").sens=100;
+    mouse->setCaptureResolution(640);
+    const auto after=mouse->graphMouseDelta(240,160,1,{160,160},node);
+    require(before.hasPreciseCounts&&after.hasPreciseCounts&&std::abs(after.preciseCounts.x*2-before.preciseCounts.x)<1e-9,
+        "Capture geometry did not scale the explicit node conversion");
+    require(after.pixelScaleX==before.pixelScaleX*2,"Movement calibration did not follow capture geometry");
+}
+void motionFeedbackUsesOnlyGraphCalibration()
+{
+    resetFixture();auto state=std::make_shared<FakeState>();FakeInput input(state);auto mouse=makeMouse(&input);
+    auto profile=NodeGraph::defaultNode(NodeGraph::NodeKind::MouseCalibration,1);
+    profile.parameters["fov_x"]=110;profile.parameters["fov_y"]=75;profile.parameters["sens"]=1.75;
+    profile.parameters["yaw"]=0.031;profile.parameters["pitch"]=0.027;
+    profile.parameters["fov_scaled"]=1;profile.parameters["base_fov"]=100;
+    const auto calibration=NodeGraph::mousePixelCalibration(profile,{320,320});
+    const auto since=Clock::now();mouse->dispatchGraphRecoil(5,calibration.y);
+    require(std::abs(mouse->getMotionCompensationSince(since).second-5*1.75*0.027*1.1*320/75)<1e-9,
+        "Recoil motion feedback no longer matches the legacy profile conversion");
+    NodeGraph::Movement calibrated;calibrated.steps={{4,2}};calibrated.pixelScaleX=2;calibrated.pixelScaleY=3;
+    config.game_profiles.at("TEST").sens=1000;mouse->dispatchGraphMovement(calibrated);
+    waitFor(state,[&]{return state->moves==2;},"Graph movement did not dispatch");
+    mouse->stop();const auto motion=mouse->getMotionCompensationSince(since);
+    require(motion.first==8&&std::abs(motion.second-(6+5*calibration.y))<1e-9,"Motion feedback ignored graph calibration or read global tuning");
 }
 
 void autoShootHoldsThenReleasesWhenDisabled()
@@ -295,7 +326,7 @@ void loopExitReleasesButton()
         waitFor(state, [&] { return state->downs == 1; }, "Auto-shoot did not press before exit");
     }
     require(state->ups == 1, "Leaving the mouse loop must release its press");
-    mouse->moveRelative(1, 1);
+    mouse->dispatchGraphMovement(NodeGraph::Movement{{{1,1}}});
     require(state->moves == 0, "Stopped mouse loop must not dispatch more input");
 }
 
@@ -341,17 +372,17 @@ void pauseResumeInvalidatesQueuedMoves()
     waitFor(state, [&] { return state->moves == 1; }, "Worker did not start a move");
     for (int i = 0; i < 4; ++i)
         mouse->dispatchGraphMovement(NodeGraph::Movement{ { { 12, 0 } } });
-    {
-        // Block the worker in post-send compensation, outside the pause gate,
-        // so all queued moves deterministically survive until after resume.
-        std::lock_guard<std::mutex> lock(configMutex);
-        unblock(state);
-        detectionBuffer.togglePaused();
-        detectionBuffer.togglePaused();
-    }
+    unblock(state);
+    detectionBuffer.togglePaused();
+    int movesAtPause=0;
+    {std::lock_guard<std::mutex> lock(state->mutex);movesAtPause=state->moves;}
+    // Commands still carry the previous observation generation, including
+    // commands submitted while paused. They must remain invalid after resume.
+    for(int i=0;i<4;++i)mouse->dispatchGraphMovement(NodeGraph::Movement{{{12,0}}});
+    detectionBuffer.togglePaused();
     {
         std::unique_lock<std::mutex> lock(state->mutex);
-        require(!state->cv.wait_for(lock, 10ms, [&] { return state->moves > 1; }),
+        require(!state->cv.wait_for(lock, 10ms, [&] { return state->moves > movesAtPause; }),
             "Queued moves from before pause must not execute after resume");
     }
     mouse->stop();
@@ -569,14 +600,25 @@ void recoilGraphWorksWithoutTarget()
     config.easynorecoilstrength = 3.0f;
     setNodeParameter(NodeGraph::NodeKind::RecoilEnabled,"enabled",1);
     setNodeParameter(NodeGraph::NodeKind::RecoilStrength,"strength",3);
+    setNodeParameter(NodeGraph::NodeKind::MouseProfile,"sens",2);
+    setNodeParameter(NodeGraph::NodeKind::MouseProfile,"pitch",0.03);
+    setNodeParameter(NodeGraph::NodeKind::MouseProfile,"fov_y",80);
+    config.game_profiles.at("TEST").sens=1000;
     auto state = std::make_shared<FakeState>();
+    state->blockMoves=true;
     FakeInput device(state);
     auto mouse = makeMouse(&device);
-    MouseLoop loop(*mouse);
-    waitFor(state, [&] { return state->moves > 0; }, "Recoil graph must run without an aim target");
-    std::lock_guard<std::mutex> lock(state->mutex);
+    const auto since=Clock::now();bool moved=false;
+    {
+        MouseLoop loop(*mouse);
+        {std::unique_lock<std::mutex> lock(state->mutex);moved=state->cv.wait_for(lock,2s,[&]{return state->moves>0;});}
+        shouldExit=true;unblock(state);
+    }
+    require(moved,"Recoil graph must run without an aim target");
     require(state->lastDx == 0 && state->lastDy == 3,
         "Recoil graph must use configured strength independently of inactive aim");
+    require(std::abs(mouse->getMotionCompensationSince(since).second-3*2*0.03*320/80)<1e-9,
+        "The control loop failed to send node calibration to recoil feedback");
 }
 void editorCaptureReleasesAndBlocksInput()
 {
@@ -605,7 +647,7 @@ void explicitScopeNodeControlsShooting()
     int scopeId = 0;
     for (auto& node : graph.nodes)
     {
-        if (node.kind == NodeGraph::NodeKind::ScopeCheck)
+        if (node.kind == NodeGraph::NodeKind::BoxContainsPoint)
         {
             scopeId = node.id;
             node.kind = NodeGraph::NodeKind::Boolean;
@@ -646,6 +688,56 @@ void graphApplyDoesNotResurrectExpiredTarget()
         "Reapplying graph must not relabel old detections as current targets");
 }
 
+void modularPredictionMatchesOriginalFilter()
+{
+    using namespace NodeGraph;
+    for(bool enabled:{false,true})for(int warmup:{0,2,20})for(double damping:{0.0,0.08,3.0})
+    {
+        resetFixture();captureFps=60;auto mouse=makeMouse(nullptr);
+        Workspace original;for(std::size_t g=0;g<GraphCount;++g)original.graphs[g].kind=static_cast<GraphKind>(g);
+        auto& graph=original.graphs[0];
+        for(auto entry:std::vector<std::pair<int,NodeKind>>{{1,NodeKind::Boolean},{2,NodeKind::Center},{3,NodeKind::Prediction},{4,NodeKind::PointX},{5,NodeKind::RecoilOutput},{6,NodeKind::ZoomHeld}})
+            graph.nodes.push_back(defaultNode(entry.second,entry.first));
+        auto& prediction=graph.nodes[2];prediction.parameters["lookahead"]=0.1;prediction.parameters["kalman_enabled"]=enabled;
+        prediction.parameters["kalman_velocity_damping"]=damping;prediction.parameters["kalman_warmup_frames"]=warmup;
+        prediction.parameters["kalman_additional_prediction_ms"]=-80;prediction.parameters["draw_futurePositions"]=1;
+        graph.links={{2,0,3,0},{6,0,3,2},{3,0,4,0},{1,0,5,0},{4,0,5,1}};
+        const auto pin=[](const char* key){const auto& inputs=definition(NodeKind::Prediction).inputs;for(std::size_t i=0;i<inputs.size();++i)if(inputs[i].defaultParameter&&std::string(inputs[i].defaultParameter)==key)return static_cast<int>(i);throw std::runtime_error("Missing prediction binding");};
+        auto lead=defaultNode(NodeKind::Number,7);lead.value=0.1;auto decay=defaultNode(NodeKind::Number,8);decay.value=damping;
+        graph.nodes.push_back(lead);graph.nodes.push_back(decay);
+        graph.links.push_back({7,0,3,1});graph.links.push_back({8,0,3,pin("kalman_velocity_damping")});graph.links.push_back({1,0,3,pin("draw_futurePositions")});
+        std::string text,error;require(serialize(original,text,error),"Cannot serialize the combined prediction fixture");
+        text.replace(0,text.find('\n'),"SUNONE_NODE_GRAPH 17");Workspace expanded;
+        require(deserialize(text,expanded,error),"An old prediction graph did not expand");
+        auto& split=expanded.graphs[0];int estimator=0,position=0;
+        for(const auto& node:split.nodes){if(node.kind==NodeKind::MotionEstimate)estimator=node.id;if(node.kind==NodeKind::MotionPosition)position=node.id;}
+        split.nodes.push_back(defaultNode(NodeKind::SetMotion,90));split.nodes.push_back(defaultNode(NodeKind::GetMotion,91));split.nodes.push_back(defaultNode(NodeKind::RerouteMotion,92));
+        for(auto& link:split.links)if(link.toNode==position&&link.toPort==0)link.fromNode=92;
+        split.links.push_back({estimator,0,90,0});split.links.push_back({91,0,92,0});
+        Service service;require(service.publish(expanded,error),"Expanded prediction graph did not compile");
+        Context context;context.captureFps=60;context.observationDelaySeconds=0.035;
+        auto observed=Clock::now();int updates=0;std::vector<Point> trail;
+        context.estimateMotion=[&](int key,Point point,const Node& node,bool reset){++updates;return mouse->graphEstimateMotion(key,point,observed,node,reset);};
+        context.futureTrail=[&](const MotionData& motion,double seconds,const Node& node){trail.clear();for(int i=1;i<=parameter(node,"prediction_futurePositions");++i)trail.push_back(projectPoint(motion.position,motion.velocity,seconds+i/60.0,motion.damping,motion.futureReady));};
+        aim::AimKalman2D reference;aim::AimKalmanSettings settings;
+        settings.enabled=enabled;settings.velocity_damping=damping;settings.warmup_frames=warmup;
+        for(int frame=0;frame<24;++frame)
+        {
+            const double gap=frame==0?0:frame==14?0.7:frame==19?-0.016:0.016;
+            observed+=std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>(gap));
+            context.center={120+frame*1.7,140+std::sin(frame*0.3)*8};context.zoomHeld=frame==8;updates=0;
+            reference.setSettings(settings);if(context.zoomHeld||gap<0||gap>0.5)reference.reset();
+            const double seconds=0.1+0.035-0.08;
+            const auto expected=reference.update(context.center.x,context.center.y,gap>0?std::clamp(gap,1.0/500,0.25):1.0/60,seconds);
+            const auto actual=service.evaluate(context);
+            require(actual.recoil&&updates==1,"Position, velocity and trail advanced the filter more than once per observation");
+            require(std::abs(actual.recoilStrength-expected.predicted_x)<1e-8,"Modular projection changed Kalman, damping, warmup, delay or reset behavior");
+            require(trail.size()==20,"Modular prediction lost future positions");
+            for(std::size_t i=0;i<trail.size();++i)
+            {const auto point=reference.predict(seconds+(i+1)/60.0);require(std::abs(point.first-trail[i].x)<1e-8&&std::abs(point.second-trail[i].y)<1e-8,"Modular prediction changed the future trail");}
+        }
+    }
+}
 void predictionNodesKeepIndependentState()
 {
     resetFixture();
@@ -659,10 +751,6 @@ void predictionNodesKeepIndependentState()
     config.predictionInterval = 0.1f;
     auto interleaved = makeMouse(nullptr);
     auto isolated = makeMouse(nullptr);
-    interleaved->updateConfig(config);
-    isolated->updateConfig(config);
-    interleaved->applyPendingConfig();
-    isolated->applyPendingConfig();
     const auto time = Clock::now();
     auto prediction=NodeGraph::defaultNode(NodeGraph::NodeKind::Prediction,1);
     prediction.parameters["kalman_warmup_frames"]=0;
@@ -796,15 +884,46 @@ void selectionNodesUseTheirOwnFilteredStreams()
     }
     require(matched,"Each selection node must consume its own filtered list, class and confidence");
 }
+void applicationReloadPreservesGraphSettings()
+{
+    resetFixture();Config current=config;current.capture_method="duplication_api";current.ai_model="graph.onnx";current.capture_fps=91;current.arduino_port="COM4";
+    const auto path=std::filesystem::temp_directory_path()/("sunone_app_reload_"+std::to_string(Clock::now().time_since_epoch().count())+".ini");
+    struct Cleanup{std::filesystem::path path;~Cleanup(){std::error_code error;std::filesystem::remove(path,error);}} cleanup{path};
+    {std::ofstream file(path);file<<"capture_method = udp_capture\ndetection_resolution = 640\ncapture_fps = 30\nai_model = unrelated.onnx\nfovX = 120\narduino_port = COM99\ninput_method = ARDUINO\nbutton_exit = F10\n[Games]\nOTHER = 10,0.05,0.05\n";}
+    const auto previous=current;require(current.reloadApplicationSettings(path.string()),"Application reload failed");
+    require(current.capture_method=="duplication_api"&&current.detection_resolution==320&&current.capture_fps==91&&current.ai_model=="graph.onnx"&&current.fovX==previous.fovX,"Reload imported old INI values into graph-owned runtime settings");
+    require(current.arduino_port=="COM99"&&current.button_exit==std::vector<std::string>{"F10"}&&!current.sameInputDeviceSettings(previous),"Application reload lost device/hotkey changes");
+    auto uiOnly=current;uiOnly.overlay_opacity=252;require(uiOnly.sameInputDeviceSettings(current),"An appearance change requires a device reconnect");
+}
+void physicalKeyNodesRejectInjectedMouseButtons()
+{
+    struct Physical final:IMouseInput
+    {
+        bool left=false,f6=false;const char* name()const override{return "FAKE";}bool isOpen()const override{return true;}
+        bool move(int,int)override{return true;}bool leftDown()override{return true;}bool leftUp()override{return true;}
+        bool hasPhysicalButtonState()const override{return true;}
+        bool keyPressed(const std::string& name)override{return name=="LeftMouseButton"?left:name=="F6"&&f6;}
+    } input;
+    require(!GraphInput::resolveKey(VK_LBUTTON,&input,true),"An injected mouse press feeds back into a physical key node");
+    input.left=true;require(GraphInput::resolveKey(VK_LBUTTON,&input,false),"Key nodes do not read physical device buttons");
+    input.f6=true;require(GraphInput::resolveKey(VK_F6,&input,false)&&GraphInput::resolveKey(VK_F7,&input,true),"Device keyboard input or Win32 fallback was lost");
+    require(!GraphInput::resolveKey(0,&input,true)&&!GraphInput::resolveKey(256,&input,true),"Invalid virtual keys were accepted");
+    editorInputCaptured=true;require(!GraphInput::keyDown(VK_LBUTTON),"Key nodes bypass menu input capture");editorInputCaptured=false;
+}
+
 }
 
 int main()
 {
     const std::pair<const char*, std::function<void()>> tests[] = {
+        { "application reload preserves graph settings", applicationReloadPreservesGraphSettings },
+        { "physical key nodes reject synthetic feedback", physicalKeyNodesRejectInjectedMouseButtons },
         { "idle stop and device lifetime", idleStopAndDeviceLifetime },
         { "stop discards backlog", stopDiscardsBacklog },
         { "device switch releases button", deviceSwitchReleasesOldButton },
-        { "config owner applies snapshot", configIsAppliedOnlyByMouseLoop },
+        { "capture geometry uses node tuning", captureGeometryUsesOnlyNodeTuning },
+        { "split mouse conversion preserves precision", splitMouseConversionMatchesCombined },
+        { "motion feedback uses graph calibration", motionFeedbackUsesOnlyGraphCalibration },
         { "auto-shoot hold and disable", autoShootHoldsThenReleasesWhenDisabled },
         { "loop exit releases button", loopExitReleasesButton },
         { "pause rejects late inference", pauseRejectsLateResultsAndReleasesButton },
@@ -821,6 +940,7 @@ int main()
         { "explicit scope node controls shooting", explicitScopeNodeControlsShooting },
         { "graph apply keeps expired target invalid", graphApplyDoesNotResurrectExpiredTarget },
         { "prediction nodes keep independent state", predictionNodesKeepIndependentState }
+        ,{ "modular prediction preserves original filter", modularPredictionMatchesOriginalFilter }
         ,{ "node profiles ignore global tuning", nodeProfilesIgnoreGlobalTuning }
         ,{ "queue cancel keeps other wind state", cancelingAimQueueKeepsOtherWindState }
         ,{ "shoot prediction survives inactive aim", predictionInShootBranchSurvivesInactiveAim }

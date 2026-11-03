@@ -32,7 +32,7 @@ struct Fixture
     DetectionStream lastSelected;
     Fixture()
     {
-        context.aimHeld=true;context.captureFps=30;context.center={0,0};setDetections({{10,20,20,40,0,0.9}});
+        context.aimHeld=true;context.captureFps=30;context.center={20,40};setDetections({{10,20,20,40,0,0.9}});
         context.selectTarget=[this](int key,const DetectionStream& input,bool,const Node& settings) {
             ++selections;if(key<1000001)lastSelected=input;TargetData selected;if(input->objects.empty())return selected;
             const auto& d=*std::min_element(input->objects.begin(),input->objects.end(),[](const Detection& a,const Detection& b){return std::hypot(a.x+a.width*0.5,a.y+a.height*0.5)<std::hypot(b.x+b.width*0.5,b.y+b.height*0.5);});
@@ -40,10 +40,11 @@ struct Fixture
             selected.valid=true;selected.observed=observed;selected.fresh=input->fresh;selected.trackId=settings.kind==NodeKind::TargetNearest?-1:42;selected.velocityX=12;selected.velocityY=-3;selected.missedFrames=observed?0:1;selected.ageSeconds=0.01;return selected;
         };
         context.predict=[this](int,Point p,const Node&,double lookahead,bool reset){++predictions;return Point{p.x+(reset?0:lookahead*10),p.y};};
+        context.estimateMotion=[this](int,Point p,const Node&,bool reset){++predictions;return MotionData{p,{10,0},0,!reset,!reset};};
         context.windMotion=[this](int,const Movement& m,const Node&){++winds;return m;};
-        context.speedCurve=[](Point,const Node& n){return parameter(n,"min_speed");};
+        context.speedCurve=[](Point,Point,double,const Node& n){return parameter(n,"min_speed");};
         context.mouseDelta=[](Point p,double speed,Point center,const Node&){Movement m;m.steps.push_back({static_cast<int>((p.x-center.x)*speed),static_cast<int>((p.y-center.y)*speed)});m.pixelScaleX=2;m.pixelScaleY=3;return m;};
-        context.motionCompensation=[](Point p){return p;};context.inScope=[this](const TargetData&,double){return inScope;};context.keyDown=[this](int key){return keys[key];};
+        context.motionCompensation=[](Point p){return p;};context.inScope=[this](const TargetData&,double,Point){return inScope;};context.keyDown=[this](int key){return keys[key];};
     }
     void setDetections(std::vector<Detection> objects){auto frame=std::make_shared<DetectionFrame>();frame->objects=std::move(objects);frame->version=1;frame->generation=7;frame->fresh=true;frame->width=320;frame->height=320;context.detections=frame;}
 };
@@ -53,9 +54,9 @@ void testDefaultExecution()
     f.context.shootHeld=f.context.zoomHeld=true;auto a=s.evaluate(f.context);
     require(a.aim&&a.autoShoot&&a.recoil,"Default graph did not drive all three outputs");require(a.aimPoint.x==20&&a.aimPoint.y==26,"Aim point must be calculated from node offsets");require(a.recoilStrength==4,"Recoil strength must belong to its source node");
     require(a.activePredictionKeys.size()==1&&a.activeWindKeys.size()==1,"Stateful nodes must report identities");
-    f.context.aimHeld=false;f.context.autoAimEnabled=true;a=s.evaluate(f.context);require(!a.aim&&!a.autoShoot&&a.recoil,"Legacy global Auto Aim must not override node parameters");
+    f.context.aimHeld=false;a=s.evaluate(f.context);require(!a.aim&&!a.autoShoot&&a.recoil,"Inactive activation nodes must stop aim and shooting");
     settings(w,NodeKind::AutoAimEnabled,"enabled",1);publish(s,w);require(s.evaluate(f.context).aim,"Node-owned Auto Aim must activate its graph");
-    f.inScope=false;require(!s.evaluate(f.context).autoShoot,"Scope node must control auto shoot");f.setDetections({});a=s.evaluate(f.context);require(!a.aim&&!a.autoShoot&&a.recoil,"Empty stream must update target loss without disabling recoil");
+    f.inScope=false;f.context.center={1000,1000};require(!s.evaluate(f.context).autoShoot,"Scope node must control auto shoot");f.setDetections({});a=s.evaluate(f.context);require(!a.aim&&!a.autoShoot&&a.recoil,"Empty stream must update target loss without disabling recoil");
 }
 void testPayloadAndFilters()
 {
@@ -68,10 +69,11 @@ void testPayloadAndFilters()
 }
 void testPerNodeSettingsAndPorts()
 {
-    Service s;Fixture f;auto w=defaults();node(w.graphs[0],5).parameters["lookahead"]=0.25;publish(s,w);require(s.evaluate(f.context).aimPoint.x==22.5,"Detached optional pin must use node parameter");
-    auto& g=w.graphs[0];constant(g,71,0.5);g.links.push_back({71,0,5,1});publish(s,w);require(s.evaluate(f.context).aimPoint.x==25,"Wired pin must override parameter");constant(g,72,1,true);g.links.push_back({72,0,5,2});publish(s,w);require(s.evaluate(f.context).aimPoint.x==20,"Reset pin must reach predictor");
-    auto revision=s.revision();node(g,5).parameters["kalman_measurement_noise"]=123;publish(s,w);require(s.revision()>revision,"Algorithm settings must change revision");revision=s.revision();node(g,5).x+=32;node(g,5).collapsed=true;g.groups[0].title="Renamed";publish(s,w);require(s.revision()==revision,"Layout must preserve execution revision");
-    f.context.targetValid=false;f.context.targetObserved=false;require(s.evaluate(f.context).aim,"Legacy target globals must not replace connected payload");
+    Service s;Fixture f;auto w=defaults();auto& g=w.graphs[0];int time=0,estimate=0;
+    for(auto& n:g.nodes){if(n.kind==NodeKind::PredictionTime){time=n.id;n.parameters["lookahead"]=0.25;}if(n.kind==NodeKind::MotionEstimate)estimate=n.id;}
+    publish(s,w);require(s.evaluate(f.context).aimPoint.x==22.5,"Detached optional pin must use node parameter");
+    constant(g,71,0.5);g.links.push_back({71,0,time,0});publish(s,w);require(s.evaluate(f.context).aimPoint.x==25,"Wired pin must override parameter");constant(g,72,1,true);g.links.push_back({72,0,estimate,1});publish(s,w);require(s.evaluate(f.context).aimPoint.x==20,"Reset pin must reach estimator");
+    auto revision=s.revision();node(g,estimate).parameters["kalman_measurement_noise"]=123;publish(s,w);require(s.revision()>revision,"Algorithm settings must change revision");revision=s.revision();node(g,estimate).x+=32;node(g,estimate).collapsed=true;g.groups[0].title="Renamed";publish(s,w);require(s.revision()==revision,"Layout must preserve execution revision");
 }
 void testBranchActivityAndBypass()
 {
@@ -343,12 +345,12 @@ std::string oldFormat(const Workspace& w,int version)
 }
 void testPersistence()
 {
-    auto w=defaults();node(w.graphs[0],5).parameters["lookahead"]=0.123456789;node(w.graphs[0],10).textParameters["profile_name"]="Custom \"precise\" profile";node(w.graphs[0],5).collapsed=true;node(w.graphs[0],11).bypassed=true;std::string text,error;Workspace restored;
-    require(serialize(w,text,error)&&text.find("SUNONE_NODE_GRAPH "+std::to_string(CurrentFormatVersion))==0&&deserialize(text,restored,error),"Current parameters did not roundtrip");require(parameter(node(restored.graphs[0],5),"lookahead")==0.123456789&&textParameter(node(restored.graphs[0],10),"profile_name")=="Custom \"precise\" profile","Export lost algorithm parameters");require(node(restored.graphs[0],5).collapsed&&node(restored.graphs[0],11).bypassed,"UI flags lost during export");require(restored.sourceVersion==CurrentFormatVersion&&restored.graphs[0].groups[0].nodes==w.graphs[0].groups[0].nodes,"Workspace metadata lost");
+    auto w=defaults();const int profiles=0;int calibration=0;for(const auto& n:w.graphs[0].nodes)if(n.kind==NodeKind::MouseProfile)calibration=n.id;int time=0;for(const auto& n:w.graphs[0].nodes)if(n.kind==NodeKind::PredictionTime)time=n.id;node(w.graphs[0],time).parameters["lookahead"]=0.123456789;node(w.graphs[profiles],calibration).textParameters["profile_name"]="Custom \"precise\" profile";node(w.graphs[0],5).collapsed=true;node(w.graphs[0],11).bypassed=true;std::string text,error;Workspace restored;
+    require(serialize(w,text,error)&&text.find("SUNONE_NODE_GRAPH "+std::to_string(CurrentFormatVersion))==0&&deserialize(text,restored,error),"Current parameters did not roundtrip");require(parameter(node(restored.graphs[0],time),"lookahead")==0.123456789&&textParameter(node(restored.graphs[profiles],calibration),"profile_name")=="Custom \"precise\" profile","Export lost algorithm parameters");require(node(restored.graphs[0],5).collapsed&&node(restored.graphs[0],11).bypassed,"UI flags lost during export");require(restored.sourceVersion==CurrentFormatVersion&&restored.graphs[0].groups[0].nodes==w.graphs[0].groups[0].nodes,"Workspace metadata lost");
     for(int version:{1,2}){require(deserialize(oldFormat(w,version),restored,error),"Legacy workspace must remain readable");require(restored.sourceVersion==version&&node(restored.graphs[0],5).parameters.empty(),"Legacy graph must remain identifiable for migration");}require(!deserialize(text.substr(0,text.size()/2),restored,error),"Truncation must be rejected");require(!deserialize(text+"UNEXPECTED",restored,error),"Trailing data must be rejected");
     const auto version3=oldFormat(w,3);
     require(deserialize(version3,restored,error)&&restored.sourceVersion==3&&restored.graphs[3].kind==GraphKind::Vision,"Version 3 must gain a Vision graph without losing control settings");
-    require(parameter(node(restored.graphs[0],5),"lookahead")==0.123456789,"Version 3 import must preserve node-owned tuning");
+    require(parameter(node(restored.graphs[0],time),"lookahead")==0.123456789,"Version 3 import must preserve node-owned tuning");
     require(deserialize(oldFormat(w,4),restored,error)&&restored.sourceVersion==4&&restored.graphs[3].ties.empty(),"Version 4 files must remain readable without wire ties");
     for(int version:{5,6,7,8,9,10})require(deserialize(oldFormat(w,version),restored,error)&&restored.sourceVersion==version&&
         node(restored.graphs[0],5).width==0&&node(restored.graphs[0],5).height==0,"Older workspaces did not load with automatic dimensions");
@@ -445,9 +447,11 @@ void testWireBendsArePersistentVisualMetadata()
         require(!validate(invalid,error),"An out-of-range or non-finite wire bend was accepted");
     }
     // Version 12 already has all node settings but no wire curvature fields.
+    auto version12=workspace;version12.graphs.resize(GraphCount);require(serialize(version12,text,error),"Cannot build the four-workflow legacy fixture");
     std::istringstream input(text);std::ostringstream legacy;std::string line;
     while(std::getline(input,line))
     {
+        if(line.rfind("PAGES ",0)==0||line.rfind("PAGE ",0)==0)continue;
         if(line.rfind("SUNONE_NODE_GRAPH ",0)==0)line="SUNONE_NODE_GRAPH 12";
         else if(line.rfind("LINK ",0)==0)
         {
@@ -513,6 +517,8 @@ void testLayoutFitsExpandedNodesAndNestedGroups()
 void testHistoricalStarterLayoutMigrationPreservesWiring()
 {
     auto workspace=defaults();auto& legacy=workspace.graphs[2];
+    legacy.nodes.erase(std::remove_if(legacy.nodes.begin(),legacy.nodes.end(),[](const Node& node){return node.id>7;}),legacy.nodes.end());
+    legacy.links.erase(std::remove_if(legacy.links.begin(),legacy.links.end(),[](const Link& link){return link.fromNode>7;}),legacy.links.end());
     for(auto& entry:legacy.nodes)
     {
         if(entry.id<=4){entry.x=(entry.id-1)*256.0f;entry.y=0;}
@@ -594,10 +600,16 @@ void testDisableIsDistinctFromBypassAndPersists()
 }
 #include "node_graph_binding_tests.h"
 #include "node_output_layers_tests.h"
+#include "node_workflow_tests.h"
+#include "node_migration_audit_tests.h"
+#include "node_shared_calibration_tests.h"
 int main()
 {
-    try{testLayoutFitsExpandedNodesAndNestedGroups();testHistoricalStarterLayoutMigrationPreservesWiring();testSplitStarterWorkflowMigratesWithoutChangingLogic();testManualDimensionsAreDurablePresentationOnly();testIntegerArithmeticAndConversions();testIntegerTargetPropertiesKeepLegacyConnections();testNodeBindings();testOutputLayers();testWireBendsArePersistentVisualMetadata();}
+    const auto run=[](const char* name,auto test){try{test();}catch(const std::exception& error){throw std::runtime_error(std::string(name)+": "+error.what());}};
+    try{run("testSharedCalibrationAcrossWorkflows",testSharedCalibrationAcrossWorkflows);run("testProcessingMigrationPreservesScopeAndFullGraphs",testProcessingMigrationPreservesScopeAndFullGraphs);run("testRecoilCalibrationAndMigration",testRecoilCalibrationAndMigration);}
+    catch(const std::exception& error){std::cerr<<"Recoil calibration test failed: "<<error.what()<<'\n';return 1;}
+    try{run("testLayoutFitsExpandedNodesAndNestedGroups",testLayoutFitsExpandedNodesAndNestedGroups);run("testHistoricalStarterLayoutMigrationPreservesWiring",testHistoricalStarterLayoutMigrationPreservesWiring);run("testSplitStarterWorkflowMigratesWithoutChangingLogic",testSplitStarterWorkflowMigratesWithoutChangingLogic);run("testManualDimensionsAreDurablePresentationOnly",testManualDimensionsAreDurablePresentationOnly);run("testIntegerArithmeticAndConversions",testIntegerArithmeticAndConversions);run("testIntegerTargetPropertiesKeepLegacyConnections",testIntegerTargetPropertiesKeepLegacyConnections);run("testNodeBindings",testNodeBindings);run("testOutputLayers",testOutputLayers);run("testWireBendsArePersistentVisualMetadata",testWireBendsArePersistentVisualMetadata);}
     catch(const std::exception& error){std::cerr<<"Node layout test failed: "<<error.what()<<'\n';return 1;}
-    try{testDefaultExecution();testPayloadAndFilters();testPerNodeSettingsAndPorts();testBranchActivityAndBypass();testKeyEvents();testCapturedInputDoesNotCreateEdges();testIncompleteAndValidation();testMovementMetadataAndTiming();testPersistence();testWireTiesArePersistentVisualMetadata();testDisableIsDistinctFromBypassAndPersists();testRealSignalTelemetryAndBriefEdges();testFrameSignalsIgnoreRepaintsAndMonitoringCanSleep();testNewInputEventsPropagateThroughUnchangedValues();testVisionExecutionAndLaziness();testVisionDepthOrderingAndOptionalOutputs();testVisionOptionalDepthFailure();testMultipleInferenceAndCaptureConstraint();testVisionProviderFailureIsolation();testConcurrentVisionAndControl();testScreenshotOutput();std::cout<<"Node graph tests passed\n";return 0;}
+    try{run("testGeometryInputsAndLegacyPortMigration",testGeometryInputsAndLegacyPortMigration);run("testWorkflowRegressions",testWorkflowRegressions);run("testDefaultExecution",testDefaultExecution);run("testPayloadAndFilters",testPayloadAndFilters);run("testPerNodeSettingsAndPorts",testPerNodeSettingsAndPorts);run("testBranchActivityAndBypass",testBranchActivityAndBypass);run("testKeyEvents",testKeyEvents);run("testCapturedInputDoesNotCreateEdges",testCapturedInputDoesNotCreateEdges);run("testIncompleteAndValidation",testIncompleteAndValidation);run("testMovementMetadataAndTiming",testMovementMetadataAndTiming);run("testPersistence",testPersistence);run("testWireTiesArePersistentVisualMetadata",testWireTiesArePersistentVisualMetadata);run("testDisableIsDistinctFromBypassAndPersists",testDisableIsDistinctFromBypassAndPersists);run("testRealSignalTelemetryAndBriefEdges",testRealSignalTelemetryAndBriefEdges);run("testFrameSignalsIgnoreRepaintsAndMonitoringCanSleep",testFrameSignalsIgnoreRepaintsAndMonitoringCanSleep);run("testNewInputEventsPropagateThroughUnchangedValues",testNewInputEventsPropagateThroughUnchangedValues);run("testVisionExecutionAndLaziness",testVisionExecutionAndLaziness);run("testVisionDepthOrderingAndOptionalOutputs",testVisionDepthOrderingAndOptionalOutputs);run("testVisionOptionalDepthFailure",testVisionOptionalDepthFailure);run("testMultipleInferenceAndCaptureConstraint",testMultipleInferenceAndCaptureConstraint);run("testVisionProviderFailureIsolation",testVisionProviderFailureIsolation);run("testConcurrentVisionAndControl",testConcurrentVisionAndControl);run("testScreenshotOutput",testScreenshotOutput);std::cout<<"Node graph tests passed\n";return 0;}
     catch(const std::exception& error){std::cerr<<"Node graph test failed: "<<error.what()<<'\n';return 1;}
 }

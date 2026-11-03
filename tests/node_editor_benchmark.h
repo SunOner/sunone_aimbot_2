@@ -119,7 +119,7 @@ int benchmarkNodeEditor(const std::string& filename,const std::string& filter={}
     if(!exists)csv<<header<<'\n';
     std::cout<<"Adapter: "<<gpu.adapter<<"\n"<<std::fixed<<std::setprecision(3);
     for(const auto resolution:{std::pair{1920,1080},std::pair{2560,1440}})
-        for(const std::string mode:{"idle","30hz","1000hz","pan1000hz","zoom1000hz","drag1000hz","placement1000hz","resize1000hz","far1000hz","overviewzoom1000hz","routing1000hz","bend1000hz","settings1000hz","options1000hz","previews15hz"})
+        for(const std::string mode:{"idle","30hz","1000hz","pan1000hz","zoom1000hz","drag1000hz","placement1000hz","wire1000hz","resize1000hz","far1000hz","groups1000hz","overviewzoom1000hz","routing1000hz","bend1000hz","settings1000hz","options1000hz","previews15hz"})
         {
             if(!filter.empty()&&mode!=filter)continue;
             const bool previews=mode=="previews15hz";const int graphIndex=previews?3:0;
@@ -151,6 +151,12 @@ int benchmarkNodeEditor(const std::string& filename,const std::string& filter={}
                 for(auto& link:editor.draft.graphs[graphIndex].links)if(link.toPort==2){link.toPort=pin;link.fromNode=1;}
                 edited();editor.live.graphRevisions[graphIndex]=editor.observedRevision;for(auto& value:editor.live.graphs[graphIndex])value.readInputs|=std::uint64_t{1}<<pin;
             }
+            if(mode=="groups1000hz")
+            {
+                editor.viewMode=2;auto& graph=editor.draft.graphs[0];graph.zoom=0.3f;graph.groups.clear();
+                for(int g=0;g<static_cast<int>(MaxGroups);++g)graph.groups.push_back({g+1,"Processing stage "+std::to_string(g+1),static_cast<float>((g%8)*384),static_cast<float>(128+(g/8)*384),384,384,0x40ffcd60u,{}});
+                std::string error;require(service().publish(editor.draft,error),error.c_str());editor.observedRevision=service().revision();editor.live.graphRevisions[0]=editor.observedRevision;
+            }
             if(mode=="far1000hz"){editor.viewMode=0;editor.draft.graphs[graphIndex].zoom=0.3f;}
             if(mode=="overviewzoom1000hz")editor.viewMode=0;
             if(mode=="resize1000hz"){editor.selection[graphIndex]={50};editor.selected[graphIndex]=50;}
@@ -181,6 +187,13 @@ int benchmarkNodeEditor(const std::string& filename,const std::string& filter={}
                 if(mode=="drag1000hz")editor.draft.graphs[graphIndex].nodes[49].x=static_cast<float>((49%(resolution.first>=2000?16:12))*224+(frame%2)*32);
                 if(mode=="bend1000hz")editor.draft.graphs[graphIndex].links[0].bend={static_cast<float>(0.58+std::sin(time)*0.35),static_cast<float>(std::cos(time)*0.8)};
                 if(mode=="placement1000hz")io.AddMousePosEvent(editor.dragStartMouse.x+static_cast<float>(std::sin(time)*43),editor.dragStartMouse.y+static_cast<float>(std::cos(time)*29));
+                if(mode=="wire1000hz")
+                {
+                    const auto& graph=editor.draft.graphs[0];
+                    if(frame==1)io.AddMousePosEvent(portPoint(graph,editor.canvasOrigin[0],graph.nodes[0],true,0).x,portPoint(graph,editor.canvasOrigin[0],graph.nodes[0],true,0).y);
+                    if(frame==2)io.AddMouseButtonEvent(ImGuiMouseButton_Left,true);
+                    if(frame>=3){const auto point=portPoint(graph,editor.canvasOrigin[0],graph.nodes[12],false,0);io.AddMousePosEvent(point.x+14,point.y);}
+                }
                 const auto started=std::chrono::steady_clock::now();
                 if(previews)
                 {
@@ -214,6 +227,8 @@ int benchmarkNodeEditor(const std::string& filename,const std::string& filter={}
                     pulses=std::max(pulses,editor.drawnSignalPulses);
                 }
             }
+            if(mode=="groups1000hz")require(editor.groupCaptions[0].size()==MaxGroups&&std::all_of(editor.groupCaptions[0].begin(),editor.groupCaptions[0].end(),[](const GroupCaption& caption){return caption.layout.layouts==1;}),"Maximum group overview captions are missing or rebuild at frame frequency");
+            if(mode=="wire1000hz")require(editor.wireNode==1&&editor.wireFeedback.target.node==13&&editor.wireFeedback.checks==1,"Large-graph wire capture was inactive or repeatedly recompiled its target");
             const auto links=editor.draft.graphs[graphIndex].links.size();
             const auto timestamp=std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());std::tm utc{};gmtime_s(&utc,&timestamp);
             const auto& cache=editor.canvasRoutes[graphIndex];std::uint64_t formats=0,flashes=0;for(const auto& display:cache.displays){formats+=display.formats;flashes+=display.flashes;}

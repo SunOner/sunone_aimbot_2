@@ -101,14 +101,17 @@ static WPARAM g_manualWindowDragHit = HTNOWHERE;
 static POINT g_manualWindowDragStartPoint{};
 static RECT g_manualWindowDragStartRect{};
 static int g_activeOverlayTab = 0;
+static int ActiveWorkflowId(){return g_activeOverlayTab<0?-g_activeOverlayTab:g_activeOverlayTab<static_cast<int>(NodeGraph::GraphCount)?g_activeOverlayTab+1:0;}
 static RECT g_sidebarToggleRect{};
 static bool g_pendingOverlayGeometryDirty = false;
+static OverlayWindowGeometry::Presentation g_windowPresentation;
+enum class WindowAction { None, Maximize, Fullscreen, Hide };
+static WindowAction g_windowAction = WindowAction::None;
+static bool g_applyingWindowMode = false;
 
-std::vector<std::string> availableModels;
 std::vector<std::string> key_names;
 std::vector<const char*> key_names_cstrs;
 
-ID3D11ShaderResourceView* body_texture = nullptr;
 
 static UINT GetDpiForWindowSafe(HWND hwnd);
 static RECT GetOverlayWorkArea(HWND hwnd);
@@ -117,10 +120,10 @@ static void EnsureOverlayInsideWorkArea(HWND hwnd, bool persistGeometry = false)
 static bool StoreOverlayWindowGeometry(HWND hwnd, bool markDirty);
 static bool ResizeOverlayBackBuffer(UINT width, UINT height);
 static HRESULT RenderOverlayFrame(bool allowAutoResize, bool allowConfigSave);
+static void ApplyOverlayPresentation(HWND hwnd);
+static void ApplyPendingWindowAction();
+static void SetOverlayVisible(bool visible);
 
-void load_body_texture();
-void release_body_texture();
-std::vector<std::string> getAvailableModels();
 
 static inline int ClampInt(int v, int lo, int hi)
 {
@@ -369,7 +372,8 @@ enum class SidebarIconKind
     Palette,
     Image,
     Bars,
-    Debug
+    Debug,
+    Plus
 };
 
 struct OverlayTabItem
@@ -387,12 +391,15 @@ static const OverlayTabItem kOverlayTabs[] = {
     { "Recoil",        "Nodes",   "Recoil conditions and compensation graph.",           draw_node_recoil,             SidebarIconKind::Curve },
     { "Vision",        "Nodes",   "Capture, inference, filtering, depth and visual outputs.",draw_node_vision,             SidebarIconKind::Camera },
 
-    { "Input Device",  "Control", "Mouse backend, device connection and reconnect data.",draw_mouse_input,             SidebarIconKind::Mouse },
+    { "Input Device",  "Control", "Mouse backend, device connection and reconnect data.",draw_input_device,             SidebarIconKind::Mouse },
     { "Hotkeys",       "Control", "Bindings for aiming, shooting and runtime actions.",  draw_buttons,                 SidebarIconKind::Keyboard },
     { "Overlay",       "Control", "Overlay appearance and privacy options.",             draw_overlay,                 SidebarIconKind::Sliders },
 
+    { "System",       "Control", "Startup CPU, memory and GPU reservations.",             draw_system,                  SidebarIconKind::Monitor },
+    { "Export",        "Tools",   "Build object and depth TensorRT engines.",              draw_model_export,            SidebarIconKind::Chip },
+
     { "Stats",         "Monitor", "Performance, capture source and timing graphs.",      draw_stats,                   SidebarIconKind::Bars },
-    { "Debug",         "Monitor", "Screenshots, data collection and diagnostics.",        draw_debug,                   SidebarIconKind::Debug },
+    { "Debug",         "Monitor", "Graph status and tracker diagnostics.",        draw_debug,                   SidebarIconKind::Debug },
 };
 
 static void DrawMainPanelBackground(const ImVec2& pos, const ImVec2& size)
@@ -428,6 +435,9 @@ static void DrawSidebarIcon(ImDrawList* draw, SidebarIconKind icon, const char* 
 
     switch (icon)
     {
+    case SidebarIconKind::Plus:
+        draw->AddLine(ImVec2(c.x-5,c.y),ImVec2(c.x+5,c.y),color,stroke);
+        draw->AddLine(ImVec2(c.x,c.y-5),ImVec2(c.x,c.y+5),color,stroke);break;
     case SidebarIconKind::Camera:
         draw->AddRect(ImVec2(x + 3.0f, y + 5.5f), ImVec2(x + 15.0f, y + 13.5f), color, 2.5f, 0, stroke);
         draw->AddRectFilled(ImVec2(x + 6.0f, y + 3.8f), ImVec2(x + 10.0f, y + 5.8f), color, 1.0f);
@@ -568,6 +578,24 @@ struct SidebarAnimation
 
     bool running() const { return expansion != (targetCollapsed ? 0.0 : 1.0); }
 };
+static bool WorkflowIconPicker(int& icon)
+{
+    static const char* names[]={"Camera","Chip","Layers","Crosshair","Movement","Curve","Spark","User","Mouse","Keyboard","Sliders","Monitor","Palette","Image","Bars","Debug"};
+    bool changed=false;
+    if(ImGui::BeginCombo("Icon",icon<0?"Automatic":names[std::clamp(icon,0,15)],ImGuiComboFlags_HeightLarge))
+    {
+        if(ImGui::Selectable("Automatic",icon<0)){icon=-1;changed=true;}
+        for(int i=0;i<16;++i)
+        {
+            ImGui::PushID(i);if(ImGui::Selectable((std::string("     ")+names[i]).c_str(),icon==i)){icon=i;changed=true;}
+            const auto pos=ImGui::GetItemRectMin();const float height=ImGui::GetItemRectSize().y;
+            DrawSidebarIcon(ImGui::GetWindowDrawList(),static_cast<SidebarIconKind>(i),"Nodes",ImVec2(pos.x+3,pos.y+(height-18)*0.5f),false);ImGui::PopID();
+        }
+        ImGui::EndCombo();
+    }
+    return changed;
+}
+
 static SidebarAnimation g_sidebarAnimation;
 
 static ImU32 SidebarFade(ImU32 color, float opacity)
@@ -775,6 +803,11 @@ static void PlaceOverlayAtStartup(int& x, int& y, int& w, int& h)
 
 static void ApplyOverlayWindowRect(HWND hwnd, const RECT& desired, UINT dpi)
 {
+    if (g_windowPresentation.mode != OverlayWindowGeometry::Mode::Windowed)
+    {
+        ApplyOverlayPresentation(hwnd);
+        return;
+    }
     int x = desired.left, y = desired.top, w = desired.right - desired.left, h = desired.bottom - desired.top;
     const auto monitor = ::MonitorFromRect(&desired, MONITOR_DEFAULTTONEAREST);
     FitOverlayToMonitor(monitor, dpi, x, y, w, h);
@@ -801,7 +834,7 @@ static void MarkOverlayGeometryDirty()
 
 static bool StoreOverlayWindowGeometry(HWND hwnd, bool markDirty)
 {
-    if (!hwnd)
+    if (!hwnd || g_windowPresentation.mode != OverlayWindowGeometry::Mode::Windowed)
         return false;
 
     RECT wndRect{};
@@ -841,6 +874,12 @@ static void EnsureOverlayInsideWorkArea(HWND hwnd, bool persistGeometry)
     if (!hwnd || ::IsIconic(hwnd))
         return;
 
+    if (g_windowPresentation.mode != OverlayWindowGeometry::Mode::Windowed)
+    {
+        ApplyOverlayPresentation(hwnd);
+        return;
+    }
+
     RECT wndRect{};
     if (!::GetWindowRect(hwnd, &wndRect)) return;
 
@@ -858,6 +897,66 @@ static void EnsureOverlayInsideWorkArea(HWND hwnd, bool persistGeometry)
 
     if (persistGeometry)
         StoreOverlayWindowGeometry(hwnd, true);
+}
+
+static void ApplyOverlayPresentation(HWND hwnd)
+{
+    const HMONITOR monitor = ::MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO info{}; info.cbSize = sizeof(info);
+    const RECT work = GetMonitorWorkArea(monitor);
+    const RECT screen = ::GetMonitorInfo(monitor, &info) ? info.rcMonitor : work;
+    const auto target = g_windowPresentation.bounds(GeometryRect(work), GeometryRect(screen), GetDpiForWindowSafe(hwnd));
+    RECT current{};
+    if (!::GetWindowRect(hwnd, &current)) return;
+    if (current.left == target.x && current.top == target.y &&
+        current.right - current.left == target.width && current.bottom - current.top == target.height) return;
+    const bool applying = g_applyingWindowMode;
+    g_applyingWindowMode = true;
+    ::SetWindowPos(hwnd, nullptr, target.x, target.y, target.width, target.height, SWP_NOZORDER | SWP_NOACTIVATE);
+    g_applyingWindowMode = applying;
+}
+
+static void ApplyPendingWindowAction()
+{
+    const auto action = g_windowAction; g_windowAction = WindowAction::None;
+    if (action == WindowAction::Hide) { SetOverlayVisible(false); return; }
+    RECT current{};
+    if (action == WindowAction::None || !g_hwnd || !::GetWindowRect(g_hwnd, &current)) return;
+    NodeEditor_EndInteraction(true);
+    if (g_windowPresentation.mode == OverlayWindowGeometry::Mode::Windowed)
+        StoreOverlayWindowGeometry(g_hwnd, true);
+    if (action == WindowAction::Maximize) g_windowPresentation.toggleMaximized(GeometryRect(current));
+    else g_windowPresentation.toggleFullscreen(GeometryRect(current));
+    g_autoResizeEnabled = false;
+    ApplyOverlayPresentation(g_hwnd);
+    StoreOverlayWindowGeometry(g_hwnd, true);
+}
+
+static void SetOverlayVisible(bool visible)
+{
+    if (!g_hwnd || g_overlayVisible == visible) return;
+    g_overlayVisible = visible;
+    NodeGraph::service().setTelemetryEnabled(visible);
+    if (visible)
+    {
+        g_autoResizeEnabled = true;
+        EnsureOverlayInsideWorkArea(g_hwnd, true);
+        ::ShowWindow(g_hwnd, SW_SHOW);
+        ::SetForegroundWindow(g_hwnd);
+    }
+    else
+    {
+        editorInputCaptured.store(false);
+        NodeEditor_EndInteraction();
+        NodeEditor_Flush();
+        StoreOverlayWindowGeometry(g_hwnd, true);
+        if (!g_overlayPreview)
+        {
+            std::lock_guard<std::mutex> lock(configMutex);
+            OverlayConfig_SaveNow();
+        }
+        ::ShowWindow(g_hwnd, SW_HIDE);
+    }
 }
 
 bool InitializeBlendState()
@@ -1174,8 +1273,23 @@ LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
         editorInputCaptured.store(false);
     switch (msg)
     {
+        case WM_CLOSE:
+            Overlay_Hide();
+            return 0;
+        case WM_SYSCOMMAND:
+            if ((wParam & 0xfff0) == SC_MINIMIZE || (wParam & 0xfff0) == SC_CLOSE)
+            {
+                Overlay_Hide();
+                return 0;
+            }
+            break;
         case WM_KEYDOWN:
         case WM_SYSKEYDOWN:
+            if (wParam == VK_F11 && !(lParam & (1LL << 30)))
+            {
+                Overlay_ToggleFullscreen();
+                return 0;
+            }
             if (g_overlayPreview)
             {
                 const auto snapshot = SnapshotOverlayThreadConfig();
@@ -1200,6 +1314,8 @@ LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
             RECT rc;
             ::GetClientRect(hWnd, &rc);
 
+            if (g_windowPresentation.mode != OverlayWindowGeometry::Mode::Windowed) return HTCLIENT;
+
             const UINT dpi = GetDpiForWindowSafe(hWnd);
             const int border = ::MulDiv(RESIZE_BORDER_PX, (int)dpi, 96);
             const bool left = pt.x < rc.left + border;
@@ -1219,7 +1335,7 @@ LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
             if (pt.y >= rc.top && pt.y < rc.top + DRAG_BAR_HEIGHT_PX)
             {
                 if (::PtInRect(&g_sidebarToggleRect, pt) ||
-                    (g_activeOverlayTab < static_cast<int>(NodeGraph::GraphCount) && NodeEditor_ToolbarContainsPoint(static_cast<float>(pt.x), static_cast<float>(pt.y))))
+                    (ActiveWorkflowId()!=0 && NodeEditor_ToolbarContainsPoint(static_cast<float>(pt.x), static_cast<float>(pt.y))))
                     return HTCLIENT;
                 return HTCAPTION;
             }
@@ -1234,6 +1350,15 @@ LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
             mmi->ptMinTrackSize.y = bounds.minHeight;
             mmi->ptMaxTrackSize.x = bounds.available.width;
             mmi->ptMaxTrackSize.y = bounds.available.height;
+            if (g_windowPresentation.mode != OverlayWindowGeometry::Mode::Windowed)
+            {
+                MONITORINFO info{}; info.cbSize = sizeof(info);
+                if (::GetMonitorInfo(::MonitorFromWindow(hWnd, MONITOR_DEFAULTTONEAREST), &info))
+                {
+                    mmi->ptMaxTrackSize.x = info.rcMonitor.right - info.rcMonitor.left;
+                    mmi->ptMaxTrackSize.y = info.rcMonitor.bottom - info.rcMonitor.top;
+                }
+            }
             return 0;
         }
         case WM_NCLBUTTONDOWN:
@@ -1305,7 +1430,7 @@ LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
             const UINT width = (UINT)LOWORD(lParam);
             const UINT height = (UINT)HIWORD(lParam);
 
-            if (ResizeOverlayBackBuffer(width, height) && g_overlayVisible)
+            if (ResizeOverlayBackBuffer(width, height) && g_overlayVisible && !g_applyingWindowMode)
                 RenderOverlayFrame(false, false);
         }
         return 0;
@@ -1348,7 +1473,6 @@ void SetupImGui()
     g_baseStyle = ImGui::GetStyle();
     g_baseStyleReady = true;
     g_runtimeUiScale = -1.0f;
-    load_body_texture();
 
     if (g_pendingOverlayGeometryDirty)
     {
@@ -1382,7 +1506,7 @@ bool CreateOverlayWindow()
     };
     ::RegisterClassEx(&wc);
 
-    const DWORD exStyle = WS_EX_TOPMOST | (g_overlayPreview ? WS_EX_APPWINDOW : WS_EX_TOOLWINDOW) | WS_EX_LAYERED;
+    const DWORD exStyle = WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED;
     const DWORD style = WS_POPUP;
 
     RECT wr = { overlayX, overlayY, overlayX + overlayWidth, overlayY + overlayHeight };
@@ -1548,15 +1672,18 @@ static HRESULT RenderOverlayFrame(bool allowAutoResize, bool allowConfigSave)
                 }
                 return target;
             };
-            preview.inScope=[](const NodeGraph::TargetData& target,double multiplier) {
-                return target.valid&&std::abs(target.x+target.width*0.5-160)<target.width*multiplier*0.5&&
-                       std::abs(target.y+target.height*0.5-160)<target.height*multiplier*0.5;
+            preview.inScope=[](const NodeGraph::TargetData& target,double multiplier,NodeGraph::Point center) {
+                return target.valid&&std::abs(target.x+target.width*0.5-center.x)<target.width*multiplier*0.5&&
+                       std::abs(target.y+target.height*0.5-center.y)<target.height*multiplier*0.5;
             };
             preview.predict=[t](int,NodeGraph::Point point,const NodeGraph::Node&,double lookahead,bool) {
                 return NodeGraph::Point{point.x+std::cos(t*0.8)*32*lookahead,point.y-std::sin(t*0.6)*14.4*lookahead};
             };
-            preview.speedCurve=[](NodeGraph::Point point,const NodeGraph::Node& node) {
-                const double distance=std::hypot(point.x-160,point.y-160);
+            preview.estimateMotion=[t](int,NodeGraph::Point point,const NodeGraph::Node& node,bool reset){
+                return NodeGraph::MotionData{point,{std::cos(t*0.8)*32,-std::sin(t*0.6)*14.4},NodeGraph::parameter(node,"kalman_velocity_damping"),!reset,!reset};
+            };
+            preview.speedCurve=[](NodeGraph::Point point,NodeGraph::Point center,double,const NodeGraph::Node& node) {
+                const double distance=std::hypot(point.x-center.x,point.y-center.y);
                 const double nearRadius=std::max(0.001,NodeGraph::parameter(node,"near_radius"));
                 const double amount=std::clamp(distance/nearRadius,0.0,1.0);
                 return NodeGraph::parameter(node,"min_speed")+(NodeGraph::parameter(node,"max_speed")-NodeGraph::parameter(node,"min_speed"))*amount;
@@ -1577,8 +1704,11 @@ static HRESULT RenderOverlayFrame(bool allowAutoResize, bool allowConfigSave)
         }
 
         const int tabCount = static_cast<int>(sizeof(kOverlayTabs) / sizeof(kOverlayTabs[0]));
-        if (g_activeOverlayTab < 0 || g_activeOverlayTab >= tabCount)
-            g_activeOverlayTab = 0;
+        auto workflows=NodeGraph::service().workspaceMetadata();
+        if(g_activeOverlayTab>=tabCount||(ActiveWorkflowId()!=0&&NodeGraph::activePage(workflows,ActiveWorkflowId())<0))
+            g_activeOverlayTab=workflows.graphs.empty()?0:-NodeGraph::workflowId(workflows.graphs.front(),0);
+        static char workflowName[129]{};static int workflowPreset=1,workflowIcon=-1,renameWorkflowId=0;static std::string workflowError;
+        bool openCreate=false,openRename=false;
 
         const bool sidebarCollapsed = config.overlay_sidebar_collapsed;
         if (g_sidebarAnimation.initialized && g_sidebarAnimation.targetCollapsed != sidebarCollapsed)
@@ -1593,7 +1723,7 @@ static HRESULT RenderOverlayFrame(bool allowAutoResize, bool allowConfigSave)
         ImGui::PushStyleColor(ImGuiCol_Border, IM_COL32(0, 0, 0, 0));
         ImGui::BeginChild("##options_nav", ImVec2(sidebarWidth, 0.0f),
             ImGuiChildFlags_AlwaysUseWindowPadding,
-            ImGuiWindowFlags_NoScrollbar);
+            ImGuiWindowFlags_None);
         ImGui::PopStyleVar();
 
         if (DrawSidebarHeader(sidebarCollapsed, sidebarExpansion))
@@ -1601,18 +1731,41 @@ static HRESULT RenderOverlayFrame(bool allowAutoResize, bool allowConfigSave)
             config.overlay_sidebar_collapsed = !sidebarCollapsed;
             OverlayConfig_MarkDirty();
         }
-        const char* lastGroup = nullptr;
-        for (int i = 0; i < tabCount; ++i)
-        {
-            const char* group = kOverlayTabs[i].group;
-            if (lastGroup && std::strcmp(lastGroup, group) != 0)
-                DrawSidebarGroup(group, sidebarExpansion);
-            if (DrawSidebarTabButton(kOverlayTabs[i], g_activeOverlayTab == i, sidebarExpansion))
+        const auto workflowButton=[&](int id,const OverlayTabItem& base){
+            auto item=base;const int graph=NodeGraph::activePage(workflows,id);if(graph<0)return;
+            const auto label=NodeGraph::workflowTitle(workflows.graphs[graph]);item.label=label.c_str();
+            if(workflows.graphs[graph].workflowIcon>=0)item.icon=static_cast<SidebarIconKind>(workflows.graphs[graph].workflowIcon);
+            ImGui::PushID(id);
+            if(!workflows.graphs[graph].enabled)ImGui::PushStyleVar(ImGuiStyleVar_Alpha,ImGui::GetStyle().Alpha*0.55f);
+            if(DrawSidebarTabButton(item,ActiveWorkflowId()==id,sidebarExpansion))
+            {if(ActiveWorkflowId()!=id)NodeEditor_EndInteraction();g_activeOverlayTab=-id;}
+            if(!workflows.graphs[graph].enabled)ImGui::PopStyleVar();
+            if(ImGui::BeginPopupContextItem("##workflow_menu"))
             {
-                if(g_activeOverlayTab!=i)NodeEditor_EndInteraction();
-                g_activeOverlayTab = i;
+                if(ImGui::MenuItem("Enabled",nullptr,workflows.graphs[graph].enabled))NodeEditor_SetWorkflowEnabled(id,!workflows.graphs[graph].enabled,workflowError);
+                if(ImGui::MenuItem("Name and icon")){workflowIcon=workflows.graphs[graph].workflowIcon;renameWorkflowId=id;std::snprintf(workflowName,sizeof(workflowName),"%s",label.c_str());openRename=true;workflowError.clear();}
+                if(ImGui::MenuItem("Remove workflow"))NodeEditor_RemoveWorkflow(id,workflowError);
+                ImGui::EndPopup();
             }
-            lastGroup = group;
+            ImGui::PopID();
+        };
+        std::vector<int> drawn;
+        for(std::size_t graph=0;graph<workflows.graphs.size();++graph)
+        {
+            const int id=NodeGraph::workflowId(workflows.graphs[graph],graph);
+            if(std::find(drawn.begin(),drawn.end(),id)!=drawn.end())continue;drawn.push_back(id);
+            auto item=kOverlayTabs[static_cast<int>(workflows.graphs[graph].kind)];workflowButton(id,item);
+        }
+        OverlayTabItem add={"Add","Nodes","Add an empty workflow or a template",nullptr,SidebarIconKind::Plus};
+        if(DrawSidebarTabButton(add,false,sidebarExpansion)){workflowName[0]=0;workflowPreset=1;workflowIcon=-1;workflowError.clear();openCreate=true;}
+        const char* lastGroup="Nodes";
+        for(int i=static_cast<int>(NodeGraph::GraphCount);i<tabCount;++i)
+        {
+            const char* group=kOverlayTabs[i].group;
+            if(std::strcmp(lastGroup,group)!=0)DrawSidebarGroup(group,sidebarExpansion);
+            if(DrawSidebarTabButton(kOverlayTabs[i],g_activeOverlayTab==i,sidebarExpansion))
+            {if(g_activeOverlayTab!=i)NodeEditor_EndInteraction();g_activeOverlayTab=i;}
+            lastGroup=group;
         }
         ImGui::EndChild();
         ImGui::PopStyleColor(2);
@@ -1621,7 +1774,7 @@ static HRESULT RenderOverlayFrame(bool allowAutoResize, bool allowConfigSave)
         ImGui::SameLine(0.0f, 8.0f * g_runtimeUiScale);
 
         float contentExtraW = 0.0f;
-        const bool graphTab = g_activeOverlayTab < static_cast<int>(NodeGraph::GraphCount);
+        const bool graphTab = ActiveWorkflowId()!=0;
         ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 8.0f);
         ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, graphTab ? ImVec2(0.0f, 0.0f) : ImGui::GetStyle().WindowPadding);
         ImGui::PushStyleColor(ImGuiCol_ChildBg, IM_COL32(0, 0, 0, 0));
@@ -1631,13 +1784,35 @@ static HRESULT RenderOverlayFrame(bool allowAutoResize, bool allowConfigSave)
             graphTab ? (ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse) : ImGuiWindowFlags_AlwaysVerticalScrollbar);
         ImGui::PopStyleVar();
 
-        kOverlayTabs[g_activeOverlayTab].draw();
+        if(g_activeOverlayTab<0)draw_node_workflow(-g_activeOverlayTab);else kOverlayTabs[g_activeOverlayTab].draw();
 
         contentExtraW = ImGui::GetScrollMaxX();
         ImGui::EndChild();
         ImGui::PopStyleColor(2);
         ImGui::PopStyleVar();
 
+        if(openCreate)ImGui::OpenPopup("New workflow");if(openRename)ImGui::OpenPopup("Workflow appearance");
+        if(ImGui::BeginPopup("New workflow"))
+        {
+            if(ImGui::IsWindowAppearing())ImGui::SetKeyboardFocusHere();
+            const bool enter=ImGui::InputTextWithHint("##name","Workflow name",workflowName,sizeof(workflowName),ImGuiInputTextFlags_EnterReturnsTrue);
+            const char* presets[]={"Empty logic","Empty vision","Aim template","Auto Shoot template","Recoil template","Vision template"};
+            ImGui::Combo("Start with",&workflowPreset,presets,6);WorkflowIconPicker(workflowIcon);
+            const int kind=workflowPreset==1?3:workflowPreset>=2?workflowPreset-2:0;
+            if(ImGui::Button("Create")||enter){const int id=NodeEditor_CreateWorkflow(workflowName,kind,workflowError,workflowIcon,workflowPreset>=2);if(id>0){g_activeOverlayTab=-id;ImGui::CloseCurrentPopup();}}
+            if(!workflowError.empty())ImGui::TextWrapped("%s",workflowError.c_str());ImGui::EndPopup();
+        }
+        if(ImGui::BeginPopup("Workflow appearance"))
+        {
+            if(ImGui::IsWindowAppearing())ImGui::SetKeyboardFocusHere();
+            const bool enter=ImGui::InputText("##name",workflowName,sizeof(workflowName),ImGuiInputTextFlags_EnterReturnsTrue);
+            const bool nameEdited=ImGui::IsItemDeactivatedAfterEdit();
+            const bool iconEdited=WorkflowIconPicker(workflowIcon);
+            if(enter||nameEdited||iconEdited)NodeEditor_ConfigureWorkflow(renameWorkflowId,workflowName,workflowIcon,workflowError);
+            if(enter&&workflowError.empty())ImGui::CloseCurrentPopup();
+            if(ImGui::Button("Done"))ImGui::CloseCurrentPopup();
+            if(!workflowError.empty())ImGui::TextWrapped("%s",workflowError.c_str());ImGui::EndPopup();
+        }
         if (allowAutoResize)
             TryAutoResizeOverlay(contentExtraW);
 
@@ -1661,6 +1836,7 @@ static HRESULT RenderOverlayFrame(bool allowAutoResize, bool allowConfigSave)
     const HRESULT result = g_pSwapChain->Present(0, 0);
     g_renderingOverlayFrame = false;
     NodeEditor_RunFileActions();
+    ApplyPendingWindowAction();
     return result;
 }
 
@@ -1675,13 +1851,7 @@ void OverlayThread()
 
     SetupImGui();
 
-    bool show_overlay = g_overlayPreview;
-    if (g_overlayPreview)
-    {
-        g_overlayVisible = true;
-        ShowWindow(g_hwnd, SW_SHOW);
-        SetForegroundWindow(g_hwnd);
-    }
+    SetOverlayVisible(g_overlayPreview);
 
     for (const auto& pair : KeyCodes::key_code_map)
         key_names.push_back(pair.first);
@@ -1691,7 +1861,6 @@ void OverlayThread()
     for (const auto& name : key_names)
         key_names_cstrs.push_back(name.c_str());
 
-    availableModels = getAvailableModels();
 
     MSG msg;
     ZeroMemory(&msg, sizeof(msg));
@@ -1714,6 +1883,7 @@ void OverlayThread()
         }
         if (shouldExit) break;
 
+        {std::lock_guard<std::mutex> lock(configMutex);NodeEditor_ProcessPendingActions();}
         overlayCfg = SnapshotOverlayThreadConfig();
 
         // Preview has no keyboard listener. Keep its configured exit hotkey
@@ -1733,33 +1903,12 @@ void OverlayThread()
         const bool overlayHotkeyDown = isAnyKeyPressedWin32Only(overlayCfg.buttonOpenOverlay);
         if (overlayHotkeyDown && !overlayHotkeyWasDown)
         {
-            show_overlay = !show_overlay;
-            g_overlayVisible = show_overlay;
-            NodeGraph::service().setTelemetryEnabled(show_overlay);
-
-            if (show_overlay)
-            {
-                g_autoResizeEnabled = true;
-                EnsureOverlayInsideWorkArea(g_hwnd, true);
-                ShowWindow(g_hwnd, SW_SHOW);
-                SetForegroundWindow(g_hwnd);
-            }
-            else
-            {
-                NodeEditor_EndInteraction();
-                NodeEditor_Flush();
-                StoreOverlayWindowGeometry(g_hwnd, true);
-                {
-                    std::lock_guard<std::mutex> lock(configMutex);
-                    OverlayConfig_SaveNow();
-                }
-                ShowWindow(g_hwnd, SW_HIDE);
-            }
+            SetOverlayVisible(!g_overlayVisible);
         }
         overlayHotkeyWasDown = overlayHotkeyDown;
-        editorInputCaptured.store(show_overlay&&OverlayOwnsForegroundInput());
+        editorInputCaptured.store(g_overlayVisible&&OverlayOwnsForegroundInput());
 
-        if (!show_overlay)
+        if (!g_overlayVisible)
         {
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
             continue;
@@ -1782,7 +1931,7 @@ void OverlayThread()
     }
 
     NodeEditor_Flush();
-    release_body_texture();
+    ModelExport_Shutdown();
 
     ImGui_ImplDX11_Shutdown();
     ImGui_ImplWin32_Shutdown();
@@ -1801,15 +1950,10 @@ void OverlayPreview()
     OverlayThread();
 }
 
-void Overlay_ExpandForNodes()
-{
-    RECT current{};
-    if (!g_hwnd || !GetWindowRect(g_hwnd, &current)) return;
-    int x = current.left, y = current.top;
-    int width = std::max(1180, overlayWidth), height = std::max(740, overlayHeight);
-    ClampOverlayToWorkArea(g_hwnd, x, y, width, height);
-    SetWindowPos(g_hwnd, nullptr, x, y, width, height, SWP_NOZORDER | SWP_NOACTIVATE);
-}
+OverlayWindowGeometry::Mode Overlay_GetWindowMode() { return g_windowPresentation.mode; }
+void Overlay_ToggleMaximized() { g_windowAction = WindowAction::Maximize; }
+void Overlay_ToggleFullscreen() { g_windowAction = WindowAction::Fullscreen; }
+void Overlay_Hide() { g_windowAction = WindowAction::Hide; }
 
 int APIENTRY _tWinMain(_In_ HINSTANCE hInstance,
     _In_opt_ HINSTANCE hPrevInstance,
@@ -1821,3 +1965,10 @@ int APIENTRY _tWinMain(_In_ HINSTANCE hInstance,
     return 0;
 }
 
+
+void Overlay_OpenGraphNode(int graph,int node)
+{
+    const auto workspace=NodeGraph::service().workspace();if(graph<0||graph>=static_cast<int>(workspace.graphs.size()))return;
+    const int workflow=NodeGraph::workflowId(workspace.graphs[graph],graph);g_activeOverlayTab=workflow<=4?workflow-1:-workflow;
+    if(node>0)NodeEditor_FocusNode(graph,node);
+}

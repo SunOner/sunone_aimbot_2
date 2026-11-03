@@ -42,18 +42,20 @@ const Node& first(const Workspace& workspace,NodeKind kind)
 void testFreshAndPortable()
 {
     auto c=settings();auto workspace=defaults();migrateLegacySettings(workspace,c,true);
-    require(parameter(first(workspace,NodeKind::Prediction),"kalman_velocity_damping")==3,"Original damping range was narrowed");
-    require(parameter(first(workspace,NodeKind::Prediction),"kalman_additional_prediction_ms")==-80,"Negative prediction was lost");
+    require(parameter(first(workspace,NodeKind::MotionEstimate),"kalman_velocity_damping")==3,"Original damping range was narrowed");
+    require(parameter(first(workspace,NodeKind::PredictionTime),"kalman_additional_prediction_ms")==-80,"Negative prediction was lost");
     require(parameter(first(workspace,NodeKind::RecoilStrength),"strength")==500,"Original recoil range was narrowed");
     require(parameter(first(workspace,NodeKind::SpeedCurve),"exponent")==10,"Original speed range was narrowed");
-    require(parameter(first(workspace,NodeKind::MouseDelta),"sens")==1.75,"Profile sensitivity was not captured");
-    require(textParameter(first(workspace,NodeKind::MouseDelta),"profile_name")=="CUSTOM","Profile name was not captured");
+    require(parameter(first(workspace,NodeKind::MouseProfile),"sens")==1.75,"Profile sensitivity was not captured");
+    require(textParameter(first(workspace,NodeKind::MouseProfile),"profile_name")=="CUSTOM","Profile name was not captured");
+    require(parameter(first(workspace,NodeKind::MouseProfile),"pitch")==0.027&&parameter(first(workspace,NodeKind::MouseProfile),"sens")==1.75,
+        "Recoil did not inherit the legacy mouse calibration");
     std::string text,error;require(serialize(workspace,text,error),error.c_str());
     Workspace imported;require(deserialize(text,imported,error),error.c_str());
     c.wind_G=80;c.game_profiles["CUSTOM"].sens=25;
     migrateLegacySettings(imported,c);
     require(parameter(first(imported,NodeKind::WindMotion),"wind_G")==12,"Version 3 import read unrelated global settings");
-    require(parameter(first(imported,NodeKind::MouseDelta),"sens")==1.75,"Import did not preserve independent profile");
+    require(parameter(first(imported,NodeKind::MouseProfile),"sens")==1.75,"Import did not preserve independent profile");
 }
 Workspace legacyWorkspace()
 {
@@ -70,7 +72,7 @@ void testLegacyDependencies()
     require(parameter(first(w,NodeKind::Target),"legacy_camera_compensation")==1,"Legacy camera correction lost");
     require(first(w,NodeKind::NormalizeFps).kind==NodeKind::NormalizeFps,"Legacy FPS normalization missing");
     bool centerConnected=false;
-    for(const auto& link:w.graphs[0].links)if(link.toNode==2&&link.toPort==2)centerConnected=true;
+    for(const auto& link:w.graphs[0].links)for(const auto& node:w.graphs[0].nodes)if(node.kind==NodeKind::PointDelta&&link.toNode==node.id&&link.toPort==1)centerConnected=true;
     require(centerConnected,"Legacy Mouse Delta lost center dependency");
     std::string error;require(validate(w,error),error.c_str());
 }
@@ -80,17 +82,17 @@ void testFullLegacyGraphAndZeroProfile()
     auto w=legacyWorkspace();
     for(int id=3;id<=static_cast<int>(MaxNodes);++id)w.graphs[0].nodes.push_back({id,NodeKind::Boolean});
     migrateLegacySettings(w,c);
-    const auto& delta=first(w,NodeKind::MouseDelta);
+    const auto& delta=first(w,NodeKind::SharedMouseDelta);
     require(parameter(delta,"legacy_center")==1&&parameter(delta,"legacy_fps")==1,"Full legacy graph cannot preserve old dependencies");
-    require(parameter(delta,"sens")==0,"Zero sensitivity must stay zero, not generate movement");
+    require(parameter(first(w,NodeKind::MouseProfile),"sens")==0,"Zero sensitivity must stay zero, not generate movement");
     std::string error;require(validate(w,error),error.c_str());
 }
 void testVersionThreeAddsVisionWithoutResettingControls()
 {
     auto c=settings();auto w=defaults();w.sourceVersion=3;
-    for(auto& node:w.graphs[0].nodes)if(node.kind==NodeKind::Prediction)node.parameters["lookahead"]=0.42;
+    for(auto& node:w.graphs[0].nodes)if(node.kind==NodeKind::PredictionTime)node.parameters["lookahead"]=0.42;
     migrateLegacySettings(w,c);
-    require(parameter(first(w,NodeKind::Prediction),"lookahead")==0.42,"Vision migration reset node-owned control settings");
+    require(parameter(first(w,NodeKind::PredictionTime),"lookahead")==0.42,"Vision migration reset node-owned control settings");
     require(parameter(first(w,NodeKind::DepthToMask),"depth_mask_fps")==7,"Legacy mask cadence was lost");
     require(parameter(first(w,NodeKind::FilterNms),"max_candidates")==3500,"NMS input limit was narrowed");
     require(parameter(first(w,NodeKind::Inference),"export_enable_fp16")==1,"Model build precision was not captured");
@@ -174,9 +176,22 @@ void testDepthModelsResolveSharedLegacyAndCustomLocations()
     require(depth_anything::resolveModelPath((files.path/"custom/chosen.engine").u8string(),resolved,error)&&std::filesystem::u8path(resolved)==files.path/"custom/chosen.engine","The depth file picker cannot use an explicit custom path");
     require(!depth_anything::resolveModelPath("models/missing.onnx",resolved,error)&&resolved.empty()&&!error.empty(),"A missing depth model retains a stale resolved path");
 }
+void testLegacyMouseProfilesBecomeDisabledCalibrationNodes()
+{
+    auto config=settings();config.circle_fov_enabled=true;config.circle_fov_radius_percent=37;
+    config.game_profiles.emplace("SECOND",Config::GameProfile{"SECOND",2.5,0.05,0.04,false,90});
+    auto workspace=defaults();migrateLegacySettings(workspace,config,true);const auto count=workspace.graphs.size();const auto nodes=workspace.graphs[0].nodes.size();
+    require(importLegacyCalibrations(workspace,config)&&workspace.graphs.size()==count&&workspace.graphs[0].nodes.size()==nodes+1,"Legacy calibration created a profile workflow or lost the alternative settings");
+    const auto& calibration=workspace.graphs[0].nodes.back();
+    require(calibration.kind==NodeKind::MouseProfile&&calibration.disabled&&parameter(calibration,"sens")==2.5&&textParameter(calibration,"profile_name")=="SECOND","Legacy tuning was not retained in a disabled calibration node");
+    require(activePage(workspace,1)==0&&parameter(first(workspace,NodeKind::MouseProfile),"sens")==1.75,"Calibration migration replaced the working settings");
+    require(!importLegacyCalibrations(workspace,config),"Calibration migration duplicated an existing node");
+    require(parameter(first(workspace,NodeKind::FilterCircle),"radius_percent")==37,"FOV migration lost its relative radius");
+}
+
 }
 int main()
 {
-    try{testFreshAndPortable();testLegacyDependencies();testFullLegacyGraphAndZeroProfile();testVersionThreeAddsVisionWithoutResettingControls();testExistingGraphsGetExplicitModelsWithoutOverridingInputs();testModelInitializationRespectsBackendAndAmbiguity();testDepthModelsResolveSharedLegacyAndCustomLocations();std::cout<<"Node config migration tests passed\n";return 0;}
+    try{testLegacyMouseProfilesBecomeDisabledCalibrationNodes();testFreshAndPortable();testLegacyDependencies();testFullLegacyGraphAndZeroProfile();testVersionThreeAddsVisionWithoutResettingControls();testExistingGraphsGetExplicitModelsWithoutOverridingInputs();testModelInitializationRespectsBackendAndAmbiguity();testDepthModelsResolveSharedLegacyAndCustomLocations();std::cout<<"Node config migration tests passed\n";return 0;}
     catch(const std::exception& error){std::cerr<<error.what()<<'\n';return 1;}
 }

@@ -7,12 +7,65 @@
 
 namespace NodeGraph
 {
+bool adjustActiveDefaults(Workspace& workspace,int offsetDirection,int recoilDirection,bool head)
+{
+    bool changed=false;
+    for(auto& graph:workspace.graphs)if(graph.active&&graph.enabled)for(auto& node:graph.nodes)
+    {
+        if(node.disabled||node.bypassed)continue;
+        const auto adjust=[&](const char* key,double step){
+            const auto& def=definition(node.kind);
+            for(std::size_t pin=0;pin<def.inputs.size();++pin)
+                if(def.inputs[pin].defaultParameter&&std::string(def.inputs[pin].defaultParameter)==key&&
+                    std::any_of(graph.links.begin(),graph.links.end(),[&](const Link& link){return link.toNode==node.id&&link.toPort==pin;}))return;
+            for(const auto& spec:def.parameters)if(std::string(spec.key)==key)
+            {
+                const double before=parameter(node,key),after=std::clamp(before+step,spec.minValue,spec.maxValue);
+                if(before!=after){node.parameters[key]=after;changed=true;}return;
+            }
+        };
+        if(offsetDirection&&(node.kind==NodeKind::AimPoint||node.kind==NodeKind::TargetAnchor||(node.kind==NodeKind::Target&&parameter(node,"legacy_offsets")!=0)))
+            adjust(head?"head_y_offset":"body_y_offset",offsetDirection*0.01);
+        if(recoilDirection&&node.kind==NodeKind::RecoilStrength)adjust("strength",recoilDirection*5.0);
+    }
+    return changed;
+}
+bool importLegacyCalibrations(Workspace& workspace,const Config& config)
+{
+    if(config.game_profiles.empty())return false;
+    int owner=-1;Node original;
+    for(std::size_t g=0;g<workspace.graphs.size()&&owner<0;++g)for(const auto& node:workspace.graphs[g].nodes)
+        if(node.kind==NodeKind::MouseProfile&&!node.disabled){owner=static_cast<int>(g);original=node;break;}
+    if(owner<0)return false;
+    bool changed=false;std::vector<std::string> names;
+    for(const auto& item:config.game_profiles)names.push_back(item.first);std::sort(names.begin(),names.end());
+    for(const auto& name:names)
+    {
+        if(name.empty()||name.size()>128)continue;
+        bool exists=false;for(const auto& graph:workspace.graphs)for(const auto& node:graph.nodes)
+            if(node.kind==NodeKind::MouseProfile)exists|=textParameter(node,"profile_name")==name;
+        if(exists)continue;
+        auto& graph=workspace.graphs[owner];if(graph.nodes.size()>=MaxNodes)break;
+        const auto& profile=config.game_profiles.at(name);auto calibration=original;
+        calibration.id=1;for(const auto& node:graph.nodes)calibration.id=std::max(calibration.id,node.id+1);
+        if(calibration.id>1000000)break;
+        calibration.disabled=true;calibration.textParameters["profile_name"]=name;
+        calibration.parameters["sens"]=profile.sens;calibration.parameters["yaw"]=profile.yaw;calibration.parameters["pitch"]=profile.pitch;
+        calibration.parameters["fov_scaled"]=profile.fovScaled;calibration.parameters["base_fov"]=profile.baseFOV;
+        calibration.x=original.x;calibration.y=original.y+512;
+        for(const auto& node:graph.nodes)calibration.y=std::max(calibration.y,node.y+512);
+        if(calibration.y>1000000)break;
+        auto candidate=workspace;candidate.graphs[owner].nodes.push_back(std::move(calibration));std::string error;
+        if(validate(candidate,error)){workspace=std::move(candidate);changed=true;}
+    }
+    return changed;
+}
 bool initializeMissingModels(Workspace& workspace,const std::string& preferredModel,const std::string& nativeBackend)
 {
     namespace fs=std::filesystem;
-    auto& graph=workspace.graphs[static_cast<std::size_t>(GraphKind::Vision)];
+
     const auto& def=definition(NodeKind::Inference);
-    const auto wired=[&](const Node& node,const char* key){
+    const auto wired=[&](const Graph& graph,const Node& node,const char* key){
         for(std::size_t p=0;p<def.inputs.size();++p)if(def.inputs[p].defaultParameter&&std::string(def.inputs[p].defaultParameter)==key)
             return std::any_of(graph.links.begin(),graph.links.end(),[&](const Link& link){return link.toNode==node.id&&link.toPort==static_cast<int>(p);});
         return false;
@@ -46,9 +99,9 @@ bool initializeMissingModels(Workspace& workspace,const std::string& preferredMo
         }
         catch(const std::exception&){candidate.clear();}
     };
-    for(auto& node:graph.nodes)
+    for(auto& graph:workspace.graphs)for(auto& node:graph.nodes)
     {
-        if(node.kind!=NodeKind::Inference||!textParameter(node,"model_path").empty()||wired(node,"model_path")||wired(node,"backend"))continue;
+        if(node.kind!=NodeKind::Inference||!textParameter(node,"model_path").empty()||wired(graph,node,"model_path")||wired(graph,node,"backend"))continue;
         const auto backend=textParameter(node,"backend");
         if(nativeBackend=="TRT"?backend!="TRT":(backend!="DML"&&backend!="CPU"))continue;
         if(!searched){findCandidate();searched=true;}
@@ -94,6 +147,13 @@ void migrateLegacySettings(Workspace& workspace, const Config& config, bool seed
             case NodeKind::Target:
             case NodeKind::TargetNearest:
             case NodeKind::TargetTracker:
+            case NodeKind::TrackDetections:
+            case NodeKind::ChooseTarget:
+                if(seedDefaults&&node.kind==NodeKind::TrackDetections&&!config.tracker_enabled)
+                {
+                    graph.links.erase(std::remove_if(graph.links.begin(),graph.links.end(),[&](const Link& link){return link.toNode==node.id&&link.toPort==1;}),graph.links.end());
+                    node.kind=NodeKind::ChooseTarget;node.parameters.clear();initializeParameters(node);
+                }
                 if (seedDefaults && node.kind == NodeKind::TargetTracker && !config.tracker_enabled)
                 {
                     node.kind = NodeKind::TargetNearest;
@@ -115,10 +175,14 @@ void migrateLegacySettings(Workspace& workspace, const Config& config, bool seed
                 set("class_id", config.class_head); set("enabled", !config.disable_headshot);
                 break;
             case NodeKind::AimPoint:
+            case NodeKind::TargetAnchor:
                 set("class_head", config.class_head);
                 set("body_y_offset", config.body_y_offset); set("head_y_offset", config.head_y_offset);
                 break;
             case NodeKind::Prediction:
+            case NodeKind::MotionEstimate:
+            case NodeKind::PredictionTime:
+            case NodeKind::FutureTrail:
                 set("lookahead", config.predictionInterval); set("kalman_enabled", config.kalman_enabled);
                 set("kalman_process_noise_position", config.kalman_process_noise_position);
                 set("kalman_process_noise_velocity", config.kalman_process_noise_velocity);
@@ -137,7 +201,10 @@ void migrateLegacySettings(Workspace& workspace, const Config& config, bool seed
                 set("snap_radius", config.snapRadius); set("near_radius", config.nearRadius);
                 set("exponent", config.speedCurveExponent); set("snap_boost", config.snapBoostFactor);
                 break;
+            case NodeKind::MouseCalibration:
+            case NodeKind::RecoilProfileOutput:
             case NodeKind::MouseDelta:
+            case NodeKind::MouseProfile:
                 set("fov_x", config.fovX); set("fov_y", config.fovY);
                 set("sens", profile ? profile->sens : 1); set("yaw", profile ? profile->yaw : 0.022);
                 set("pitch", profile ? profile->pitch : 0.022); set("fov_scaled", profile && profile->fovScaled);
@@ -149,10 +216,11 @@ void migrateLegacySettings(Workspace& workspace, const Config& config, bool seed
                 set("wind_G", config.wind_G); set("wind_W", config.wind_W);
                 set("wind_M", config.wind_M); set("wind_D", config.wind_D);
                 break;
-            case NodeKind::ScopeCheck: set("multiplier", config.bScope_multiplier); break;
+            case NodeKind::ScopeCheck:case NodeKind::BoxContainsPoint: set("multiplier", config.bScope_multiplier); break;
             case NodeKind::FilterConfidence: set("threshold", config.confidence_threshold); break;
             case NodeKind::FilterCircle:
                 set("enabled", config.circle_fov_enabled);
+                set("radius_percent",config.circle_fov_radius_percent);
                 set("radius", config.circle_fov_enabled ? config.detection_resolution * 0.5 * config.circle_fov_radius_percent / 100.0 : 1000000);
                 break;
             case NodeKind::CaptureSource:
@@ -303,6 +371,8 @@ void migrateLegacySettings(Workspace& workspace, const Config& config, bool seed
             }
         }
     }
+    if(legacy)shareMouseCalibration(workspace);
+    migrateWorkflowPages(workspace);
     workspace.sourceVersion = CurrentFormatVersion;
 }
 }

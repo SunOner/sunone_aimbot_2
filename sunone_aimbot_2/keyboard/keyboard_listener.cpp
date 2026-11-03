@@ -19,6 +19,7 @@
 #include "runtime/input_state.h"
 #include "nodes/node_graph.h"
 #include "nodes/vision_runtime.h"
+#include "overlay/node_editor.h"
 
 extern std::atomic<bool> shouldExit;
 extern std::atomic<bool> aiming;
@@ -27,9 +28,6 @@ extern std::atomic<bool> zooming;
 extern std::atomic<bool> detector_model_changed;
 
 extern MouseThread* globalMouseThread;
-
-const float OFFSET_STEP = 0.01f;
-const float NORECOIL_STEP = 5.0f;
 
 // Arrow key vectors
 const std::vector<std::string> upArrowKeys = { "UpArrow" };
@@ -195,68 +193,13 @@ void keyboardListener()
         {
             if (!reloadPressed)
             {
+                bool applicationLoaded=false;
                 {
                     std::lock_guard<std::mutex> lock(configMutex);
-                    const int oldDetectionResolution = config.detection_resolution;
-                    const int oldCaptureFps = config.capture_fps;
-                    const std::string oldCaptureMethod = config.capture_method;
-                    const std::string oldCaptureTarget = config.capture_target;
-                    const std::string oldCaptureWindowTitle = config.capture_window_title;
-                    const int oldMonitorIdx = config.monitor_idx;
-                    const bool oldCaptureBorders = config.capture_borders;
-                    const bool oldCaptureCursor = config.capture_cursor;
-                    const std::string oldVirtualCameraName = config.virtual_camera_name;
-                    const int oldVirtualCameraWidth = config.virtual_camera_width;
-                    const int oldVirtualCameraHeight = config.virtual_camera_heigth;
-                    const std::string oldUdpIp = config.udp_ip;
-                    const int oldUdpPort = config.udp_port;
-                    const std::string oldBackend = config.backend;
-                    const std::string oldAiModel = config.ai_model;
-                    const std::string oldInputMethod = config.input_method;
-
-                    config.loadConfig();
-
-                    if (config.detection_resolution != oldDetectionResolution)
-                    {
-                        detection_resolution_changed.store(true);
-                        detector_model_changed.store(true);
-                    }
-
-                    if (config.capture_fps != oldCaptureFps)
-                        capture_fps_changed.store(true);
-
-                    if (config.capture_method != oldCaptureMethod ||
-                        config.capture_target != oldCaptureTarget ||
-                        config.capture_window_title != oldCaptureWindowTitle ||
-                        config.monitor_idx != oldMonitorIdx ||
-                        config.virtual_camera_name != oldVirtualCameraName ||
-                        config.virtual_camera_width != oldVirtualCameraWidth ||
-                        config.virtual_camera_heigth != oldVirtualCameraHeight ||
-                        config.udp_ip != oldUdpIp ||
-                        config.udp_port != oldUdpPort)
-                    {
-                        capture_method_changed.store(true);
-                        capture_window_changed.store(true);
-                    }
-
-                    if (config.capture_borders != oldCaptureBorders)
-                        capture_borders_changed.store(true);
-
-                    if (config.capture_cursor != oldCaptureCursor)
-                        capture_cursor_changed.store(true);
-
-                    if (config.backend != oldBackend || config.ai_model != oldAiModel)
-                        detector_model_changed.store(true);
-
-                    if (config.input_method != oldInputMethod)
-                        input_method_changed.store(true);
-
-                    if (globalMouseThread)
-                    {
-                        globalMouseThread->updateConfig(config);
-                    }
+                    const Config previous=config;applicationLoaded=config.reloadApplicationSettings();
+                    if(applicationLoaded&&!config.sameInputDeviceSettings(previous))input_method_changed=true;
                 }
-                NodeVision::syncCaptureConfiguration(true);
+                NodeEditor_RequestReload(applicationLoaded?"":"Could not reload application settings from config.ini.");
                 reloadPressed = true;
             }
         }
@@ -291,23 +234,7 @@ void keyboardListener()
         {
             const int offsetDirection=(downArrow&&!prevDownArrow)-(upArrow&&!prevUpArrow);
             const int recoilDirection=(rightArrow&&!prevRightArrow)-(leftArrow&&!prevLeftArrow);
-            if(offsetDirection||recoilDirection)
-            {
-                auto workspace=NodeGraph::service().workspace();
-                for(auto& graph:workspace.graphs)for(auto& node:graph.nodes)
-                {
-                    if(offsetDirection&&(node.kind==NodeGraph::NodeKind::AimPoint||
-                        (node.kind==NodeGraph::NodeKind::Target&&NodeGraph::parameter(node,"legacy_offsets")!=0)))
-                    {
-                        const char* key=shiftKey?"head_y_offset":"body_y_offset";
-                        node.parameters[key]=std::clamp(NodeGraph::parameter(node,key)+offsetDirection*OFFSET_STEP,0.0,1.0);
-                    }
-                    if(recoilDirection&&node.kind==NodeGraph::NodeKind::RecoilStrength)
-                        node.parameters["strength"]=std::clamp(NodeGraph::parameter(node,"strength")+recoilDirection*NORECOIL_STEP,0.0,1000.0);
-                }
-                std::string error;
-                if(NodeGraph::service().publish(workspace,error))NodeGraph::service().save("node_graphs.ini",error);
-            }
+            if(offsetDirection||recoilDirection)NodeEditor_RequestTuning(offsetDirection,recoilDirection,shiftKey);
         }
         
         // Update previous key states

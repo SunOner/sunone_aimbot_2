@@ -23,11 +23,14 @@ constexpr std::size_t MaxPins = 64;
 constexpr std::size_t MaxDataPins = 8;
 constexpr std::size_t MaxLivePreviews = 4;
 constexpr std::size_t GraphCount = 4;
+constexpr std::size_t MaxGraphs = 64;
+constexpr std::size_t MaxWorkflows = MaxGraphs;
+constexpr int NodeKeyStride = 1000001;
 constexpr std::size_t MaxWorkspaceBytes = 4 * 1024 * 1024;
-constexpr int CurrentFormatVersion = 13;
+constexpr int CurrentFormatVersion = 20;
 constexpr std::int32_t MinInteger = -2147483647 - 1, MaxInteger = 2147483647;
 enum class GraphKind { Aim, AutoShoot, Recoil, Vision };
-enum class ValueType { Boolean, Float, Point, Detections, Target, Movement, Frame, Depth, Mask, Integer, String, Monitor, Monitors, OverlayStyle, LabelOptions, Number = Float };
+enum class ValueType { Boolean, Float, Point, Detections, Target, Movement, Frame, Depth, Mask, Integer, String, Monitor, Monitors, OverlayStyle, LabelOptions, Motion, Calibration, Number = Float };
 enum class NodeKind
 {
     AimHeld, ShootHeld, ZoomHeld, TargetValid, TargetObserved,
@@ -57,10 +60,32 @@ enum class NodeKind
     GetDetections, SetDetections, GetTarget, SetTarget, GetMovement, SetMovement,
     GetFrame, SetFrame, GetDepth, SetDepth, GetMask, SetMask, ImagePreview,
     OverlayBoxes, OverlayFrame, OverlayMotion, OverlayIcon, OverlayDepth, OverlayCorrection, OverlayOutput,
-    DatasetLabels, DatasetOutput, RerouteOverlay, RerouteLabels, GetOverlay, SetOverlay, GetLabels, SetLabels, Count,
+    DatasetLabels, DatasetOutput, RerouteOverlay, RerouteLabels, GetOverlay, SetOverlay, GetLabels, SetLabels, CurrentFrame, MouseCalibration, RecoilProfileOutput,
+    ChooseTarget, TrackDetections, BoxPoint, TargetAnchor, BoxContainsPoint,
+    MotionEstimate, MotionPosition, MotionVelocity, MotionDamping, MotionReady, PredictionTime, ProjectPoint, FutureTrail,
+    RerouteMotion, GetMotion, SetMotion,
+    MouseProfile, SharedCalibration, CalibrationScale, PointDelta, PixelsToCounts, ApplyMouseSpeed,
+    SharedMouseDelta, SharedRecoilOutput, RerouteCalibration, GetCalibration, SetCalibration, SharedCalibrationScale, Count,
     Float = Number, RerouteFloat = RerouteNumber
 };
 struct Point { double x = 0.0; double y = 0.0; };
+struct CalibrationData
+{
+    Point degreesPerPixel,countsPerDegree,pixelsPerCount;
+    bool aimEnabled=false;
+    std::string profileName;
+};
+using Calibration=std::shared_ptr<const CalibrationData>;
+struct Node;
+bool calibrationIdentifier(NodeKind kind);
+CalibrationData mouseCalibration(const Node& node,Point frameSize);
+struct MotionData
+{
+    Point position,velocity;
+    double damping=0;
+    bool ready=false,futureReady=false;
+};
+Point projectPoint(Point position,Point velocity,double seconds,double damping,bool ready=true);
 struct MonitorInfo
 {
     int index=0,winrtIndex=0,x=0,y=0,width=0,height=0;
@@ -135,6 +160,8 @@ struct Movement
     Point preciseCounts;
     bool hasPreciseCounts = false;
 };
+Movement pixelsToCounts(Point delta,const CalibrationData& calibration);
+Movement applyMouseSpeed(const Movement& movement,double speed);
 struct PreviewImage;
 using Preview=std::shared_ptr<const PreviewImage>;
 struct SettingsData
@@ -162,6 +189,8 @@ struct Value
     MonitorList monitors;
     Preview preview;
     Settings settings;
+    MotionData motion;
+    Calibration calibration;
 };
 struct PreviewImage
 {
@@ -227,11 +256,13 @@ struct Node
     // Local literal fallbacks for scalar data inputs without a named setting.
     std::map<int,double> inputValues;
     std::map<int,std::string> inputTexts;
+    int runtimeKey = 0; // Assigned by the compiled workspace; never serialized.
 };
 double parameter(const Node& node, const std::string& key);
 std::string textParameter(const Node& node, const std::string& key);
 void initializeParameters(Node& node);
 Node defaultNode(NodeKind kind, int id, float x = 0, float y = 0);
+Point mousePixelCalibration(const Node& node, Point frameSize);
 struct WireBend
 {
     float roundness = 0.58f;
@@ -276,8 +307,23 @@ struct Graph
     float zoom = 1.0f;
     std::vector<Group> groups;
     std::vector<WireTie> ties;
+    int workflow = 0;
+    std::string workflowName,pageName;
+    int workflowIcon=-1; // -1 selects the icon of the original template; 0..15 are sidebar icons.
+    bool active = true;
+    bool enabled = true;
 };
-struct Workspace { std::array<Graph, GraphCount> graphs; int sourceVersion = CurrentFormatVersion; };
+struct Workspace { std::vector<Graph> graphs=std::vector<Graph>(GraphCount); int sourceVersion = CurrentFormatVersion; };
+void migrateRecoilCalibration(Workspace& workspace);
+bool expandProcessingNodes(Graph& graph);
+bool shareMouseCalibration(Workspace& workspace);
+// Flatten legacy pages and fold the generated calibration workflow into Logic.
+bool migrateWorkflowPages(Workspace& workspace);
+int workflowId(const Graph& graph,std::size_t index);
+std::string workflowTitle(const Graph& graph);
+std::string pageTitle(const Graph& graph);
+int activePage(const Workspace& workspace,int workflow);
+int previewKey(int graph,int node);
 Workspace defaults();
 // Recognize historical starter geometry without replacing settings or wiring.
 bool migrateStarterLayout(Graph& graph);
@@ -289,28 +335,23 @@ struct Context
     bool inputCaptured = false;
     std::function<bool()> inputCapturedNow;
     bool aimHeld = false;
-    bool autoAimEnabled = false;
     bool shootHeld = false;
     bool zoomHeld = false;
-    bool targetValid = false;
-    bool targetObserved = false;
-    bool autoShootEnabled = false;
-    bool recoilEnabled = false;
-    double recoilStrength = 0.0;
-    Point target;
     Point center;
-    double targetDistance = 0.0;
     double captureFps = 0.0;
     double elapsedSeconds = 0.0;
     bool detectionsAvailable = false;
     DetectionStream detections;
     std::function<TargetData(int nodeKey, const DetectionStream&, bool lock, const Node&)> selectTarget;
-    std::function<bool(const TargetData&, double multiplier)> inScope;
-    std::function<double(Point, const Node&)> speedCurve;
+    std::function<bool(const TargetData&, double multiplier, Point center)> inScope;
+    std::function<double(Point, Point center, double maximumDistance, const Node&)> speedCurve;
     std::function<Movement(Point, double, Point center, const Node&)> mouseDelta;
     std::function<Movement(int nodeKey, const Movement&, const Node&)> windMotion;
     std::function<Point(int nodeKey, Point, const Node&, double lookahead, bool reset)> predict;
     std::function<Point(Point)> motionCompensation;
+    std::function<MotionData(int nodeKey,Point,const Node&,bool reset)> estimateMotion;
+    std::function<void(const MotionData&,double seconds,const Node&)> futureTrail;
+    double observationDelaySeconds=0;
     std::function<bool(int virtualKey)> keyDown;
     std::function<MonitorList()> monitors;
     bool useConfigurationSnapshot=false;
@@ -336,8 +377,10 @@ struct Actions
     bool recoil = false;
     Point aimPoint;
     double recoilStrength = 0.0;
+    double recoilPixelDeltaY = 0.0;
     TargetData shootTarget;
     Movement movement;
+    std::vector<Movement> movements;
     std::vector<int> activePredictionKeys;
     std::vector<int> activeWindKeys;
     std::vector<int> activeSelectionKeys;
@@ -366,9 +409,9 @@ struct NodeValue
 struct Telemetry
 {
     Actions actions;
-    std::array<std::vector<NodeValue>, GraphCount> graphs;
-    std::array<std::chrono::steady_clock::time_point,GraphCount> graphSampledAt{};
-    std::array<std::uint64_t,GraphCount> graphRevisions{};
+    std::array<std::vector<NodeValue>, MaxGraphs> graphs;
+    std::array<std::chrono::steady_clock::time_point,MaxGraphs> graphSampledAt{};
+    std::array<std::uint64_t,MaxGraphs> graphRevisions{};
     std::chrono::steady_clock::time_point sampledAt{};
 };
 class Service
@@ -376,6 +419,7 @@ class Service
 public:
     Service();
     Workspace workspace() const;
+    Workspace workspaceMetadata() const;
     std::uint64_t revision() const;
     bool publish(const Workspace& workspace, std::string& error);
     Actions evaluate(const Context& context);
@@ -430,6 +474,22 @@ private:
             bool resolvedOnce=false;
         };
         std::map<int,SettingsState> settings;
+        struct CalibrationState
+        {
+            std::map<std::string,double> numbers;
+            std::map<std::string,std::string> texts;
+            Point size;
+            Calibration value;
+        };
+        std::map<int,CalibrationState> calibrations;
+        struct EvaluationFrame
+        {
+            std::vector<Value> values;
+            std::vector<std::uint8_t> evaluated,visiting;
+            std::vector<std::uint64_t> readInputs;
+        };
+        std::array<EvaluationFrame,MaxGraphs> evaluations;
+        std::vector<std::pair<int,int>> pending;
         struct PreviewState
         {
             Preview image;
@@ -439,8 +499,8 @@ private:
             std::string error;
         };
         std::map<int,PreviewState> previews;
-        std::array<std::vector<std::array<Value,MaxDataPins>>,GraphCount> inputStorage;
-        std::array<std::vector<SignalState>,GraphCount> signals;
+        std::array<std::vector<std::array<Value,MaxDataPins>>,MaxGraphs> inputStorage;
+        std::array<std::vector<SignalState>,MaxGraphs> signals;
         std::shared_ptr<const Program> signalProgram;
         bool telemetryWasEnabled = true;
         std::uint64_t revision = 0;

@@ -160,7 +160,7 @@ void testOptionsKeepChoicesAndFilePickingAtInputs()
     h.click(ImVec2(popup->WorkRect.Min.x+50,popup->DC.CursorPosPrevLine.y-ImGui::GetStyle().ItemSpacing.y-modelMenu.rowHeight*0.5f));requireNoFieldGesture();
     require(editor.fileAction==3&&editor.fileGraph==3&&editor.fileNode==1&&editor.fileParameter=="model_path","The file picker did not follow the path input");
     h.graph().nodes={defaultNode(NodeKind::SetFloat,1,32,32)};editor.fileAction=0;edited();h.frame();
-    replaceInlineText(h,inlineField(h,1,17),"shared_gain");
+    replaceInlineText(h,inlineField(h,1),"shared_gain");
     require(textParameter(*findNode(h.graph(),1),"name")=="shared_gain","Static Get/Set identifiers became inaccessible");
 }
 void testCompactLayerConnectionsAndInputs()
@@ -297,8 +297,47 @@ void testModelMenuKeepsCustomPathsAndBackendFiltering()
     require(!ImGui::IsPopupOpen(nullptr,ImGuiPopupFlags_AnyPopupId|ImGuiPopupFlags_AnyPopupLevel)&&textParameter(*findNode(h.graph(),1),"model_path")=="elsewhere/model.onnx",
         "The model selector can override a connected input");
 }
+void testLocalSettingsRowsStayAlignedAcrossTypes()
+{
+    for(float zoom:{0.25f,0.65f,1.0f,1.75f})for(float width:{160.0f,192.0f,384.0f})
+    {
+        gestureScenario="Uniform local settings at zoom "+std::to_string(zoom)+" width "+std::to_string(width);EditorHarness h;editor.viewMode=1;h.graph().zoom=zoom;
+        float content=-1,height=-1,valueX=-1;
+        for(auto kind:{NodeKind::Boolean,NodeKind::Integer,NodeKind::Float,NodeKind::GetFloat})
+        {
+            auto node=defaultNode(kind,1,32,32);node.width=width;h.graph().nodes={node};h.graph().links.clear();h.graph().groups.clear();edited();h.frame();
+            const auto row=localFieldRow(h,1);const auto panel=settingsRect(h.graph(),h.origin,*findNode(h.graph(),1));
+            require(std::abs(row.label.GetCenter().y-row.value.GetCenter().y)<0.01f&&row.value.Min.x>=row.label.Max.x&&panel.Contains(row.value.Min)&&panel.Contains(row.value.Max),"A local label/value wraps, overlaps, or escapes the card");
+            const auto& display=editor.canvasRoutes[0].displays[0];
+            require(display.settingsContent<=nodeSettingsHeight(*findNode(h.graph(),1))+0.1f,"A one-row field requires hidden extra settings space");
+            if(content>=0)require(std::abs(content-display.settingsContent)<0.1f&&std::abs(height-cardHeight(*findNode(h.graph(),1)))<0.1f&&std::abs(valueX-row.value.Min.x)<0.1f,"Bool, Int, Float and Name use different local row geometry");
+            content=display.settingsContent;height=cardHeight(*findNode(h.graph(),1));valueX=row.value.Min.x;
+        }
+        h.graph().nodes={defaultNode(NodeKind::Boolean,1,32,32)};h.graph().nodes[0].width=width;edited();h.frame();
+        const auto field=localFieldRow(h,1).value;const auto color=ImGui::GetColorU32(ImGuiCol_CheckboxSelectedBg)&0x00ffffff;
+        require(std::any_of(h.vertices.begin(),h.vertices.end(),[&](const ImDrawVert& vertex){return (vertex.col&0x00ffffff)==color&&vertex.pos.x>=field.Min.x-1&&vertex.pos.x<=field.Min.x+4*zoom&&vertex.pos.y>=field.Min.y&&vertex.pos.y<=field.Max.y;}),"The Bool toggle is detached from the common value column");
+        h.click(inlineField(h,1));requireNoFieldGesture();require(findNode(h.graph(),1)->value==0,"The scaled single-row switch missed its hit area");
+    }
+}
+void testLocalSettingsPreviewUsesTheSameRow()
+{
+    gestureScenario="Local fields in previews share their label/value row";EditorHarness h;
+    for(float width:{180.0f,380.0f})
+    {
+        float previous=-1;
+        for(auto kind:{NodeKind::Boolean,NodeKind::Integer,NodeKind::Float})
+        {
+            CatalogPreviewState preview;preview.kind=kind;preview.node=defaultNode(kind,1);layoutCatalogCard(preview,width);
+            const auto row=localSettingsRow(ImVec2(11,preview.settingsY+6),width-33,ImGui::GetFontSize(),1);
+            require(row.value.Min.y==preview.settingsY+6&&row.value.Max.y<=preview.cardHeight-12,"A local preview editor is on a second row or clipped");
+            if(previous>=0)require(std::abs(previous-preview.cardHeight)<0.01f,"Boolean and numeric previews reserve different local settings heights");
+            previous=preview.cardHeight;
+        }
+    }
+}
 void testOptionEditorBindings()
 {
+    testLocalSettingsRowsStayAlignedAcrossTypes();testLocalSettingsPreviewUsesTheSameRow();
     testAllInputsConnectAndUndoAcrossZoom();testHighInputsStayStableAndPortable();testNamedCopiesKeepTheirOwnGetSetPairs();testVersion9PortsAndSpacingMigrateOnce();
     testEditableInputDefaultsOwnMouseAndUndo();
     testOptionsKeepChoicesAndFilePickingAtInputs();

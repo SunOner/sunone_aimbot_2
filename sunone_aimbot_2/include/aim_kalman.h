@@ -23,6 +23,7 @@ struct AimKalmanTelemetry
     bool enabled = true;
     double dt = 0.0;
     int warmup_remaining = 0;
+    bool prediction_ready = false;
 
     double measurement_x = 0.0;
     double measurement_y = 0.0;
@@ -272,6 +273,7 @@ private:
             return telemetry;
         }
 
+        telemetry.prediction_ready = true;
         auto future = predict(lookaheadSec);
         telemetry.predicted_x = future.first;
         telemetry.predicted_y = future.second;

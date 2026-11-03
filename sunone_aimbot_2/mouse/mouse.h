@@ -31,7 +31,6 @@
 
 #include "MouseInput.h"
 #include "aim_kalman.h"
-#include "config.h"
 #include "nodes/node_graph.h"
 
 class MouseThread
@@ -39,20 +38,8 @@ class MouseThread
 private:
     double screen_width;
     double screen_height;
-    double prediction_interval;
-    double fov_x;
-    double fov_y;
-    double max_distance;
-    double min_speed_multiplier;
-    double max_speed_multiplier;
     double center_x;
     double center_y;
-
-    double prev_x, prev_y;
-    double prev_velocity_x, prev_velocity_y;
-    std::chrono::time_point<std::chrono::steady_clock> prev_time;
-    std::chrono::steady_clock::time_point last_target_time;
-    std::atomic<bool> target_detected{ false };
     std::atomic<bool> mouse_pressed{ false };
 
     IMouseInput* mouseInput;
@@ -79,28 +66,16 @@ private:
     std::mutex                    dispatchMutex;
     std::uint64_t                 queueGeneration = 0; // protected by queueMtx
     std::uint64_t                 detectionGeneration = 0; // mouse loop only
-    std::mutex                    pendingConfigMutex;
-    std::optional<Config>         pendingConfig;
 
     std::vector<std::pair<double, double>> futurePositions;
     std::mutex                    futurePositionsMutex;
-    aim::AimKalman2D              targetKalman;
-    aim::AimKalmanTelemetry       lastKalmanTelemetry;
-    double                        lastPredictionLookaheadSec = 0.0;
-    double                        lastDetectionDelaySec = 0.0;
-
     struct PredictionNodeState
     {
-        double x = 0.0, y = 0.0;
-        double velocityX = 0.0, velocityY = 0.0;
         std::chrono::steady_clock::time_point time{};
         aim::AimKalman2D kalman;
-        aim::AimKalmanTelemetry telemetry;
         double lookaheadSec = 0.0;
-        double detectionDelaySec = 0.0;
     };
     std::unordered_map<int, PredictionNodeState> graphPredictionStates;
-    void restorePredictionState(const PredictionNodeState& state);
 
     void moveWorkerLoop();
     void queueMove(int dx, int dy, double pixelScaleX = 0.0, double pixelScaleY = 0.0);
@@ -114,7 +89,6 @@ private:
     void   resetWindScalars();
     void   appendWindDebugStep(int dx, int dy, double pixelScaleX, double pixelScaleY);
     void   pruneWindDebugTrailLocked(const std::chrono::steady_clock::time_point& now);
-    std::pair<double, double> mouseCountsToScreenPixels(int dx, int dy) const;
 
     struct WindDebugPoint
     {
@@ -173,27 +147,16 @@ private:
     void pruneMotionCompensationTrailLocked(const std::chrono::steady_clock::time_point& now);
 
 public:
-    MouseThread(
-        int  resolution,
-        int  fovX,
-        int  fovY,
-        double minSpeedMultiplier,
-        double maxSpeedMultiplier,
-        double predictionInterval,
-        IMouseInput* mouseInputDevice = nullptr
-    );
+    explicit MouseThread(int resolution, IMouseInput* mouseInputDevice = nullptr);
     ~MouseThread();
-
-    // Caller holds configMutex while copying config. Active state is changed
-    // only by applyPendingConfig() on the mouse loop, never by UI callbacks.
-    void updateConfig(const Config& snapshot);
-    bool applyPendingConfig();
+    // Capture geometry is supplied by the control loop. Tuning belongs to nodes.
+    void setCaptureResolution(int resolution);
     void setDetectionGeneration(std::uint64_t generation) { detectionGeneration = generation; }
     void requestStop();
     void stop();
 
     // Explicit graph stages. Only dispatchGraphMovement queues device commands.
-    double graphSpeedCurve(double pointX, double pointY, const NodeGraph::Node& node);
+    double graphSpeedCurve(double pointX, double pointY, NodeGraph::Point center, double maximumDistance, const NodeGraph::Node& node);
     NodeGraph::Movement graphMouseDelta(double pointX, double pointY, double speed,
         NodeGraph::Point center, const NodeGraph::Node& node);
     NodeGraph::Movement graphWindMotion(int nodeKey, const NodeGraph::Movement& movement,
@@ -201,16 +164,16 @@ public:
     std::pair<double, double> graphPredict(int nodeKey, double pointX, double pointY,
         std::chrono::steady_clock::time_point observationTime, const NodeGraph::Node& node,
         double lookahead, bool reset);
+    NodeGraph::MotionData graphEstimateMotion(int nodeKey,NodeGraph::Point point,
+        std::chrono::steady_clock::time_point observationTime,const NodeGraph::Node& node,bool reset);
     std::vector<std::pair<double,double>> graphFuturePositions(int nodeKey, int frames) const;
     void retainGraphStates(const std::vector<int>& predictionKeys, const std::vector<int>& windKeys);
     void dispatchGraphMovement(const NodeGraph::Movement& movement);
-    void moveRelative(int dx, int dy);
+    void dispatchGraphRecoil(int counts, double pixelsPerCount);
     void clearQueuedMoves();
     void pressMouse();
     void releaseMouse();
     void resetPrediction();
-    bool check_target_in_scope(double target_x, double target_y,
-        double target_w, double target_h, double reduction_factor);
 
     void storeFuturePositions(const std::vector<std::pair<double, double>>& positions);
     void clearFuturePositions();
@@ -222,8 +185,6 @@ public:
 
     void setMouseInput(IMouseInput* newMouseInput);
 
-    void setTargetDetected(bool detected) { target_detected.store(detected); }
-    void setLastTargetTime(const std::chrono::steady_clock::time_point& t) { last_target_time = t; }
 };
 
 #endif // MOUSE_H

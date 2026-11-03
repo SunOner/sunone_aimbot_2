@@ -7,10 +7,12 @@
 #include <Windows.h>
 #include "overlay/node_editor.h"
 #include "overlay/node_preview.h"
+#include "overlay/source_choices.h"
 #include "nodes/node_graph.h"
 #include "nodes/node_layout.h"
 #include "nodes/node_config_bridge.h"
 #include "nodes/vision_runtime.h"
+#include "scr/data_collector.h"
 #include "imgui/imgui.h"
 #include "imgui/imgui_internal.h"
 #include "config.h"
@@ -26,6 +28,7 @@
 #include <fstream>
 #include <limits>
 #include <map>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -36,6 +39,9 @@ extern Config config;
 namespace
 {
 using namespace NodeGraph;
+struct PendingGraphEdit{bool reload=false;int offset=0,recoil=0;bool head=false;std::string applicationWarning;};
+std::mutex pendingGraphMutex;
+std::vector<PendingGraphEdit> pendingGraphEdits;
 constexpr const char* GraphFile = "node_graphs.ini";
 constexpr float CardWidth = Layout::CardWidth;
 constexpr float HeaderHeight = Layout::HeaderHeight;
@@ -67,6 +73,8 @@ NodeKind rerouteKind(ValueType type)
     case ValueType::Mask: return NodeKind::RerouteMask;
     case ValueType::OverlayStyle:return NodeKind::RerouteOverlay;
     case ValueType::LabelOptions:return NodeKind::RerouteLabels;
+    case ValueType::Motion:return NodeKind::RerouteMotion;
+    case ValueType::Calibration:return NodeKind::RerouteCalibration;
     }
     return NodeKind::RerouteBoolean;
 }
@@ -120,6 +128,12 @@ struct OverviewCaption
     int zoomBucket=-1;
     bool badge=false;
     std::uint64_t layouts=0;
+};
+struct GroupCaption
+{
+    int id=0;std::string source;
+    OverviewCaption layout;
+    ImRect bounds;
 };
 enum class InputDefaultKind { Unset, Number, Boolean, Text, Required, Center, Local, Empty };
 struct InputDefaultDisplay
@@ -205,21 +219,22 @@ struct Editor
     bool dirty = false;
     std::uint64_t observedRevision = 0;
     int activeGraph = -1;
-    std::array<bool,GraphCount> fit{};
-    std::array<bool,GraphCount> autoFit{};
-    ImVec2 canvasSize[GraphCount];
-    ImVec2 canvasOrigin[GraphCount];
-    ImVec2 pastePosition[GraphCount];
-    bool canvasHovered[GraphCount] = {};
-    bool focusSelection[GraphCount] = {};
-    int selected[GraphCount] = {};
-    std::vector<int> selection[GraphCount];
-    std::vector<int> tieSelection[GraphCount];
-    int selectedTie[GraphCount] = {};
+    std::array<bool,MaxGraphs> fit{};
+    std::array<bool,MaxGraphs> autoFit{};
+    ImVec2 canvasSize[MaxGraphs];
+    ImVec2 canvasOrigin[MaxGraphs];
+    std::array<std::vector<GroupCaption>,MaxGraphs> groupCaptions;
+    ImVec2 pastePosition[MaxGraphs];
+    bool canvasHovered[MaxGraphs] = {};
+    bool focusSelection[MaxGraphs] = {};
+    int selected[MaxGraphs] = {};
+    std::vector<int> selection[MaxGraphs];
+    std::vector<int> tieSelection[MaxGraphs];
+    int selectedTie[MaxGraphs] = {};
     struct PortFocus {int node=0;int port=0;bool output=false;};
-    std::array<PortFocus,GraphCount> portFocus{};
+    std::array<PortFocus,MaxGraphs> portFocus{};
     bool keyboardWire = false;
-    int selectedGroup[GraphCount] = {};
+    int selectedGroup[MaxGraphs] = {};
     int dragNode = 0;
     int toggleSelectionOnRelease = 0;
     int dragGroup = 0;
@@ -242,6 +257,13 @@ struct Editor
     int wireNode = 0;
     int wirePort = 0;
     bool wireOutput = true;
+    struct WireFeedback
+    {
+        int graph=-1,anchor=0,anchorPort=0;bool anchorOutput=false;
+        PortFocus target;float amount=0;ImVec2 endpoint;
+        std::array<int,4> checkedLink{};std::uint64_t revision=0,checks=0;
+        bool checked=false,valid=false;std::string error;
+    } wireFeedback;
     bool moved = false;
     ImVec2 dragStartMouse;
     ImVec2 dragStartNode;
@@ -304,7 +326,7 @@ struct Editor
     std::vector<Workspace> undo;
     std::vector<Workspace> redo;
     Telemetry live;
-    std::array<std::vector<std::pair<int,std::size_t>>,GraphCount> liveIndex;
+    std::array<std::vector<std::pair<int,std::size_t>>,MaxGraphs> liveIndex;
     double telemetryAt = -1.0;
     std::chrono::steady_clock::time_point appliedAt{};
     std::chrono::steady_clock::time_point editedAt{};
@@ -332,9 +354,9 @@ struct Editor
     int inputPopupNode=0,inputPopupPin=-1;
     ImGuiID inputPopup=0;
     std::map<std::array<int,5>,WireAnimation> wireAnimations;
-    std::array<CanvasRoutes,GraphCount> canvasRoutes;
+    std::array<CanvasRoutes,MaxGraphs> canvasRoutes;
     std::size_t drawnSignalPulses=0;
-    std::array<ImVec4,16> toolbarItems{};
+    std::array<ImVec4,20> toolbarItems{};
     std::size_t toolbarItemCount=0;
     Editor(){fit.fill(true);autoFit.fill(true);}
 } editor;
@@ -362,6 +384,8 @@ ImU32 pinColor(ValueType type)
     case ValueType::Detections:return IM_COL32(180,140,245,255);
     case ValueType::Target:return IM_COL32(244,143,83,255);
     case ValueType::Movement:return IM_COL32(240,126,172,255);
+    case ValueType::Motion:return IM_COL32(116,182,255,255);
+    case ValueType::Calibration:return IM_COL32(231,187,118,255);
     case ValueType::Frame:return IM_COL32(216,217,233,255);
     case ValueType::Depth:return IM_COL32(75,194,171,255);
     case ValueType::Mask:return IM_COL32(219,128,239,255);
@@ -470,6 +494,27 @@ const char* compactTitle(NodeKind kind)
     case K::ScreenshotOutput:return "Save image";
     case K::TargetNearest:return "Nearest";
     case K::TargetTracker:return "Tracker";
+    case K::ChooseTarget:return "Nearest";
+    case K::TrackDetections:return "Track";
+    case K::TargetPosition:case K::MotionPosition:return "Position";
+    case K::TargetSize:return "Size";
+    case K::TargetClass:return "Class";
+    case K::TargetAnchor:return "Aim offsets";
+    case K::BoxPoint:return "Box point";
+    case K::BoxContainsPoint:return "In box?";
+    case K::MotionEstimate:return "Motion filter";
+    case K::MotionVelocity:return "Velocity";
+    case K::MotionDamping:return "Damping";
+    case K::MotionReady:return "Ready";
+    case K::PredictionTime:return "Lead time";
+    case K::ProjectPoint:return "Project";
+    case K::FutureTrail:return "Trail";
+    case K::MouseProfile:return "Calibration";
+    case K::SharedCalibration:return "Calibration";
+    case K::CalibrationScale:return "Pixels / count";
+    case K::PointDelta:return "Delta";
+    case K::PixelsToCounts:return "To counts";
+    case K::ApplyMouseSpeed:return "Apply speed";
     case K::CameraCompensation:return "Cam. comp.";
     case K::NormalizeFps:return "FPS scale";
     case K::SpeedCurve:return "Speed";
@@ -543,6 +588,38 @@ const OverviewCaption& overviewCaption(NodeDisplay& display,const Node& node,flo
     }
     return caption;
 }
+const OverviewCaption& groupOverviewCaption(GroupCaption& cached,const Group& group,float zoom,ImFont* font,float baseSize)
+{
+    auto& caption=cached.layout;const int bucket=static_cast<int>(std::floor(zoom*64));
+    if(cached.source==group.title&&caption.font==font&&caption.baseSize==baseSize&&caption.cardWidth==group.width&&caption.zoomBucket==bucket)return caption;
+    cached.source=group.title;caption.font=font;caption.baseSize=baseSize;caption.cardWidth=group.width;caption.zoomBucket=bucket;++caption.layouts;
+    const float scale=std::max(0.25f,bucket/64.0f);
+    caption.fontSize=std::clamp(std::round(baseSize*1.8f*std::sqrt(scale)),12.0f,24.0f);
+    caption.wrapWidth=std::max(48.0f,group.width*scale-8);
+    caption.available=ImVec2(caption.wrapWidth,2*caption.fontSize);
+    std::string full=group.title.empty()?"Group":group.title;for(auto& letter:full)if(letter>='a'&&letter<='z')letter+='A'-'a';
+    caption.text=full;
+    const auto measure=[&](){return font->CalcTextSizeA(caption.fontSize,std::numeric_limits<float>::max(),caption.wrapWidth,caption.text.c_str());};
+    auto extent=measure();std::size_t length=full.size();
+    while(length&&(extent.y>caption.available.y+0.1f||extent.x>caption.available.x+0.1f))
+    {
+        --length;while(length&&(static_cast<unsigned char>(full[length])&0xc0)==0x80)--length;
+        caption.text=full.substr(0,length)+"...";extent=measure();
+    }
+    caption.lines.clear();caption.extent=ImVec2(0,0);
+    const char* end=caption.text.c_str()+caption.text.size();
+    for(const char* cursor=caption.text.c_str();cursor<end;)
+    {
+        const char* lineEnd=font->CalcWordWrapPosition(caption.fontSize,cursor,end,caption.wrapWidth);
+        if(lineEnd==cursor){unsigned int codepoint;lineEnd=cursor+std::max(1,ImTextCharFromUtf8(&codepoint,cursor,end));}
+        const char* visibleEnd=lineEnd;while(visibleEnd>cursor&&(visibleEnd[-1]==' '||visibleEnd[-1]=='\n'))--visibleEnd;
+        const float width=font->CalcTextSizeA(caption.fontSize,std::numeric_limits<float>::max(),0,cursor,visibleEnd).x;
+        caption.lines.push_back({static_cast<std::size_t>(cursor-caption.text.c_str()),static_cast<std::size_t>(visibleEnd-caption.text.c_str()),width});
+        caption.extent.x=std::max(caption.extent.x,width);caption.extent.y+=caption.fontSize;
+        cursor=lineEnd;while(cursor<end&&(*cursor==' '||*cursor=='\n'))++cursor;
+    }
+    return caption;
+}
 Node* findNode(Graph& graph, int id)
 {
     for (auto& node : graph.nodes) if (node.id == id) return &node;
@@ -606,24 +683,55 @@ void detachTie(Graph& graph,int id)
     for(auto& link:graph.links)link.ties.erase(std::remove(link.ties.begin(),link.ties.end(),id),link.ties.end());
     graph.ties.erase(std::remove_if(graph.ties.begin(),graph.ties.end(),[&](const WireTie& tie){return tie.id==id;}),graph.ties.end());
 }
+bool nodeInGroupTree(const Graph& graph,const Group& root,int id);
 bool tieInGroup(const Graph& graph,int id,const Group& group)
 {
     bool used=false;
     for(const auto& link:graph.links)if(usesTie(link,id))
     {
         used=true;
-        if(std::find(group.nodes.begin(),group.nodes.end(),link.fromNode)==group.nodes.end()||std::find(group.nodes.begin(),group.nodes.end(),link.toNode)==group.nodes.end())return false;
+        if(!nodeInGroupTree(graph,group,link.fromNode)||!nodeInGroupTree(graph,group,link.toNode))return false;
     }
     return used;
 }
 bool isSelected(int tab,int id);
+bool groupContains(const Group& group,float x,float y,float right,float bottom)
+{return x>=group.x&&y>=group.y+32&&right<=group.x+group.width&&bottom<=group.y+group.height;}
+bool groupContains(const Group& group,const Node& node)
+{
+    if(reroute(node.kind))return groupContains(group,node.x+24,node.y+8,node.x+40,node.y+24);
+    return groupContains(group,node.x,node.y,node.x+cardWidth(node),node.y+cardHeight(node));
+}
+bool groupContains(const Group& parent,const Group& child)
+{return parent.id!=child.id&&groupContains(parent,child.x,child.y,child.x+child.width,child.y+child.height);}
+bool groupDescendant(const Group& parent,const Group& child)
+{
+    return groupContains(parent,child);
+}
+const Group* containingGroup(const Graph& graph,const Node& node)
+{
+    const Group* owner=nullptr;for(const auto& group:graph.groups)if(groupContains(group,node)&&(!owner||group.width*group.height<owner->width*owner->height))owner=&group;
+    return owner;
+}
+bool nodeInGroupTree(const Graph& graph,const Group& root,const Node& node)
+{const auto* owner=containingGroup(graph,node);return owner&&(owner->id==root.id||groupDescendant(root,*owner));}
+bool nodeInGroupTree(const Graph& graph,const Group& root,int id)
+{const auto* node=findNode(graph,id);return node&&nodeInGroupTree(graph,root,*node);}
+bool syncGroupMembership(Graph& graph)
+{
+    std::vector<std::vector<int>> members(graph.groups.size());
+    for(const auto& node:graph.nodes)if(const auto* owner=containingGroup(graph,node))members[owner-graph.groups.data()].push_back(node.id);
+    bool changed=false;for(std::size_t g=0;g<graph.groups.size();++g)if(graph.groups[g].nodes!=members[g]){graph.groups[g].nodes=std::move(members[g]);changed=true;}
+    return changed;
+}
 void captureDragSelection(const Graph& graph,int tab,bool includeGroups=false)
 {
     editor.dragPositions.clear();editor.dragTiePositions.clear();editor.dragGroupPositions.clear();
-    for(const auto& node:graph.nodes)if(isSelected(tab,node.id))editor.dragPositions.push_back({node.id,node.x,node.y});
-    for(const auto& tie:graph.ties)if(isTieSelected(tab,tie.id))editor.dragTiePositions.push_back({tie.id,tie.x,tie.y,tie.angle});
-    if(includeGroups)for(const auto& group:graph.groups)
-        if(group.id==editor.selectedGroup[tab]||(!group.nodes.empty()&&std::all_of(group.nodes.begin(),group.nodes.end(),[&](int id){return isSelected(tab,id);})) )
+    const auto* root=includeGroups?findGroup(graph,editor.selectedGroup[tab]):nullptr;
+    for(const auto& node:graph.nodes)if((isSelected(tab,node.id)&&(!root||groupContains(*root,node)))||(root&&nodeInGroupTree(graph,*root,node)))editor.dragPositions.push_back({node.id,node.x,node.y});
+    for(const auto& tie:graph.ties)if(isTieSelected(tab,tie.id)||(root&&tieInGroup(graph,tie.id,*root)))editor.dragTiePositions.push_back({tie.id,tie.x,tie.y,tie.angle});
+    if(root)for(const auto& group:graph.groups)
+        if(group.id==root->id||groupDescendant(*root,group))
             editor.dragGroupPositions.push_back({group.id,group.x,group.y});
 }
 bool isSelected(int tab, int id)
@@ -653,6 +761,7 @@ void cancelLeftGesture()
     editor.pointerMove=false;editor.moveGraph=-1;
     editor.keyboardWire=false;
     editor.bendGraph=-1;editor.bendChanged=false;
+    editor.wireFeedback={};
 }
 void cancelGestures()
 {
@@ -684,9 +793,11 @@ void rememberSnapshot(const Workspace& snapshot)
 void remember(){rememberSnapshot(editor.draft);}
 void edited(bool logic = true)
 {
-    for(std::size_t tab=0;tab<GraphCount;++tab)
+    for(std::size_t tab=0;tab<editor.draft.graphs.size();++tab)
     {
-        auto& graph=editor.draft.graphs[tab];normalizeInputPorts(graph);pruneTies(graph);
+        auto& graph=editor.draft.graphs[tab];
+        if(!editor.pointerMove&&!editor.keyboardMove&&!editor.resizeNode)syncGroupMembership(graph);
+        normalizeInputPorts(graph);pruneTies(graph);
         auto& selected=editor.tieSelection[tab];selected.erase(std::remove_if(selected.begin(),selected.end(),[&](int id){return !findTie(graph,id);}),selected.end());
         if(!findTie(graph,editor.selectedTie[tab]))editor.selectedTie[tab]=selected.empty()?0:selected.back();
     }
@@ -788,7 +899,7 @@ void updateNodeResize(Graph& graph,int index,ImVec2 pointer)
         if(editor.resizeMask&ResizeTop)resized.y=snap(original->y+Layout::height(*original,true)-resized.height);
     }
     if(before.x==resized.x&&before.y==resized.y&&before.width==resized.width&&before.height==resized.height)return;
-    *node=std::move(resized);graph.groups=editor.resizeOriginal.graphs[index].groups;fitContainingGroups(graph,node->id);
+    *node=std::move(resized);graph.groups=editor.resizeOriginal.graphs[index].groups;
     editor.resizeChanged=node->x!=original->x||node->y!=original->y||node->width!=original->width||node->height!=original->height;
     // Returning to the starting point also restores the exact original frames.
     if(!editor.resizeChanged)graph.groups=editor.resizeOriginal.graphs[index].groups;
@@ -801,8 +912,14 @@ void finishNodeResize(bool confirm)
     editor.resizeNode=editor.resizeMask=0;editor.resizeGraph=-1;editor.resizeChanged=false;
     if(changed)
     {
-        if(confirm)rememberSnapshot(original);
-        else{editor.draft=std::move(original);edited(false);}
+        if(confirm){rememberSnapshot(original);edited(false);}
+        else
+        {
+            // Canvas holds a reference to its Graph for this frame. Restore the
+            // graph contents without replacing the workspace vector beneath it.
+            for(std::size_t i=0;i<original.graphs.size();++i)editor.draft.graphs[i]=std::move(original.graphs[i]);
+            edited(false);
+        }
     }
 }
 enum class NodeSizePreset{Automatic,Compact,Wide,FitContent};
@@ -827,7 +944,7 @@ void resizeSelection(Graph& graph,int index,NodeSizePreset preset)
                 node.height=std::clamp(Layout::up(nodeSettingsTop(node)+34+content),Layout::up(Layout::minimumHeight(node)),Layout::MaxHeight);
             }
         }
-        if(node.width!=oldWidth||node.height!=oldHeight){changed=true;fitContainingGroups(resized,node.id);}
+        if(node.width!=oldWidth||node.height!=oldHeight)changed=true;
     }
     if(changed){remember();graph=std::move(resized);editor.autoFit[index]=false;edited(false);}
 }
@@ -839,15 +956,12 @@ ImGuiMouseCursor resizeCursor(int edges)
 }
 bool primaryOutput(NodeKind kind)
 {
-    return kind==NodeKind::AimOutput||kind==NodeKind::AutoShootOutput||kind==NodeKind::RecoilOutput||kind==NodeKind::VisionOutput;
+    return kind==NodeKind::AimOutput||kind==NodeKind::AutoShootOutput||kind==NodeKind::RecoilOutput||kind==NodeKind::RecoilProfileOutput||kind==NodeKind::SharedRecoilOutput||kind==NodeKind::VisionOutput;
 }
 bool kindAllowed(const Graph& graph,NodeKind kind)
 {
-    if((kind==NodeKind::AimOutput&&graph.kind!=GraphKind::Aim)||
-        (kind==NodeKind::AutoShootOutput&&graph.kind!=GraphKind::AutoShoot)||
-        (kind==NodeKind::RecoilOutput&&graph.kind!=GraphKind::Recoil)||
-        (kind==NodeKind::VisionOutput&&graph.kind!=GraphKind::Vision))return false;
-    const bool visionOnly=(kind>=NodeKind::CaptureSource&&kind<=NodeKind::VisionOutput)||kind==NodeKind::ScreenshotOutput||kind==NodeKind::ImagePreview||
+    if(primaryOutput(kind)&&((graph.kind==GraphKind::Vision)!=(kind==NodeKind::VisionOutput)))return false;
+    const bool visionOnly=kind==NodeKind::CurrentFrame||(kind>=NodeKind::CaptureSource&&kind<=NodeKind::VisionOutput)||kind==NodeKind::ScreenshotOutput||kind==NodeKind::ImagePreview||
         (kind>=NodeKind::OverlayBoxes&&kind<=NodeKind::SetLabels);
     if(visionOnly&&graph.kind!=GraphKind::Vision)return false;
     return !primaryOutput(kind)||std::none_of(graph.nodes.begin(),graph.nodes.end(),[&](const Node& node){return node.kind==kind;});
@@ -868,7 +982,7 @@ void history(bool redo)
     source.pop_back();
     editor.cutAnimations.clear();
     cancelGestures();
-    for (int i=0;i<static_cast<int>(GraphCount);++i) { clearSelection(i); editor.selectedGroup[i]=0; }
+    for (int i=0;i<static_cast<int>(MaxGraphs);++i) { clearSelection(i); editor.selectedGroup[i]=0; }
     edited();
 }
 void removeNode(Graph& graph, int id)
@@ -962,6 +1076,17 @@ void remapNamedCopies(const Graph& graph,std::vector<Node>& nodes)
         used.push_back(name);names[original]=name;node.textParameters["name"]=name;
     }
     for(auto& node:nodes)if(variableGet(node.kind)){const auto found=names.find(textParameter(node,"name"));if(found!=names.end())node.textParameters["name"]=found->second;}
+    used.clear();names.clear();
+    for(const auto& page:editor.draft.graphs)for(const auto& node:page.nodes)if(node.kind==NodeKind::MouseProfile)used.push_back(textParameter(node,"name"));
+    for(auto& node:nodes)if(node.kind==NodeKind::MouseProfile)
+    {
+        const auto original=textParameter(node,"name");auto name=original;int suffix=2;
+        while(std::find(used.begin(),used.end(),name)!=used.end())
+        {const auto ending=" "+std::to_string(suffix++);std::size_t length=std::min(original.size(),128-ending.size());while(length&&length<original.size()&&(static_cast<unsigned char>(original[length])&0xc0)==0x80)--length;name=original.substr(0,length)+ending;}
+        used.push_back(name);names[original]=name;node.textParameters["name"]=name;
+    }
+    for(auto& node:nodes)if(calibrationIdentifier(node.kind)&&node.kind!=NodeKind::MouseProfile)
+    {const auto found=names.find(textParameter(node,"name"));if(found!=names.end())node.textParameters["name"]=found->second;}
 }
 void duplicateSelection(Graph& graph,int tab,bool recordHistory=true)
 {
@@ -969,14 +1094,16 @@ void duplicateSelection(Graph& graph,int tab,bool recordHistory=true)
     std::vector<Link> links;
     std::vector<Group> groups;
     const auto* selectedGroup=findGroup(graph,editor.selectedGroup[tab]);
-    const auto selected=[&](int id){return isSelected(tab,id)||(selectedGroup&&std::find(selectedGroup->nodes.begin(),selectedGroup->nodes.end(),id)!=selectedGroup->nodes.end());};
+    const auto selected=[&](int id){return isSelected(tab,id)||(selectedGroup&&nodeInGroupTree(graph,*selectedGroup,id));};
     for (const auto& node:graph.nodes) if (selected(node.id)&&!primaryOutput(node.kind)) nodes.push_back(node);
     const auto copied=[&](int id){return std::any_of(nodes.begin(),nodes.end(),[id](const Node& n){return n.id==id;});};
     for (const auto& link:graph.links) if (copied(link.fromNode)&&copied(link.toNode)) links.push_back(link);
     for(auto group:graph.groups)
     {
+        const bool tree=selectedGroup&&(group.id==selectedGroup->id||groupDescendant(*selectedGroup,group));
+        if(!tree&&(group.nodes.empty()||!std::all_of(group.nodes.begin(),group.nodes.end(),copied)))continue;
         group.nodes.erase(std::remove_if(group.nodes.begin(),group.nodes.end(),[&](int id){return !copied(id);}),group.nodes.end());
-        if(!group.nodes.empty())groups.push_back(std::move(group));
+        if(tree||!group.nodes.empty())groups.push_back(std::move(group));
     }
     if (nodes.empty()) return;
     remapNamedCopies(graph,nodes);
@@ -1017,7 +1144,7 @@ bool sameLayout(const Graph& left,const Graph& right)
     for(std::size_t i=0;i<left.groups.size();++i)
     {
         const auto& a=left.groups[i];const auto& b=right.groups[i];
-        if(a.id!=b.id||a.x!=b.x||a.y!=b.y||a.width!=b.width||a.height!=b.height)return false;
+        if(a.id!=b.id||a.x!=b.x||a.y!=b.y||a.width!=b.width||a.height!=b.height||a.nodes!=b.nodes)return false;
     }
     for(std::size_t i=0;i<left.ties.size();++i)
     {
@@ -1056,14 +1183,11 @@ void updateLayoutMove(Graph& graph,ImVec2 pointer,bool commit=false)
     }
     if(auto* group=findGroup(graph,editor.resizeGroup))
     {
-        float minWidth=128,minHeight=96;
-        for(int id:group->nodes)if(const auto* node=findNode(graph,id))
-        {minWidth=std::max(minWidth,node->x+cardWidth(*node)+16-group->x);minHeight=std::max(minHeight,node->y+cardHeight(*node)+16-group->y);}
-        assign(group->width,std::max(Layout::up(minWidth),snap(editor.dragStartSize.x+delta.x)));
-        assign(group->height,std::max(Layout::up(minHeight),snap(editor.dragStartSize.y+delta.y)));
+        assign(group->width,std::max(128.0f,snap(editor.dragStartSize.x+delta.x)));
+        assign(group->height,std::max(96.0f,snap(editor.dragStartSize.y+delta.y)));
     }
     if(!changed)return;
-    editor.moved=true;editor.autoFit[static_cast<int>(graph.kind)]=false;
+    editor.moved=true;if(editor.moveGraph>=0)editor.autoFit[editor.moveGraph]=false;
     if(distanceSquared(pointer,editor.dragStartMouse)>=ImGui::GetIO().MouseDragThreshold*ImGui::GetIO().MouseDragThreshold)editor.toggleSelectionOnRelease=0;
     edited(false);
 }
@@ -1071,7 +1195,11 @@ void finishPointerMove(bool confirm)
 {
     if(!editor.pointerMove)return;
     const int tab=editor.moveGraph;
-    if(confirm)updateLayoutMove(editor.draft.graphs[tab],ImGui::GetIO().MousePos,true);
+    if(confirm)
+    {
+        updateLayoutMove(editor.draft.graphs[tab],ImGui::GetIO().MousePos,true);
+        if(syncGroupMembership(editor.draft.graphs[tab]))edited(false);
+    }
     const bool changed=!sameLayout(editor.draft.graphs[tab],editor.moveOriginal.graphs[tab]);
     editor.pointerMove=false;editor.moveGraph=-1;
     if(changed)
@@ -1087,7 +1215,8 @@ void beginKeyboardMove(Graph& graph,int tab,bool duplicate)
     editor.moveOriginal=editor.draft;editor.moveSelection=editor.selection[tab];editor.moveTies=editor.tieSelection[tab];editor.moveGroup=editor.selectedGroup[tab];
     if(group&&editor.selection[tab].empty()&&editor.tieSelection[tab].empty())
     {
-        editor.selection[tab]=group->nodes;if(!group->nodes.empty())editor.selected[tab]=group->nodes.back();
+        editor.selection[tab].clear();for(const auto& node:graph.nodes)if(nodeInGroupTree(graph,*group,node))editor.selection[tab].push_back(node.id);
+        if(!editor.selection[tab].empty())editor.selected[tab]=editor.selection[tab].back();
         for(const auto& tie:graph.ties)if(tieInGroup(graph,tie.id,*group))editor.tieSelection[tab].push_back(tie.id);
     }
     const auto count=graph.nodes.size();
@@ -1097,6 +1226,7 @@ void beginKeyboardMove(Graph& graph,int tab,bool duplicate)
         if(graph.nodes.size()==count){editor.selection[tab]=editor.moveSelection;editor.tieSelection[tab]=editor.moveTies;editor.selected[tab]=editor.selection[tab].empty()?0:editor.selection[tab].back();return;}
     }
     captureDragSelection(graph,tab,true);editor.keyboardMove=true;editor.moveGraph=tab;editor.confirmKeyboardMove=false;editor.moved=duplicate;
+    if(duplicate)for(const auto& group:graph.groups)if(!findGroup(editor.moveOriginal.graphs[tab],group.id))editor.dragGroupPositions.push_back({group.id,group.x,group.y});
     editor.portFocus[tab]={};
     editor.dragStartMouse=ImGui::GetIO().MousePos;editor.autoFit[tab]=false;
 }
@@ -1106,6 +1236,7 @@ void finishKeyboardMove(int tab,bool confirm)
     if(confirm)
     {
         updateLayoutMove(editor.draft.graphs[tab],ImGui::GetIO().MousePos,true);
+        if(syncGroupMembership(editor.draft.graphs[tab]))edited(false);
         if(!sameLayout(editor.draft.graphs[tab],editor.moveOriginal.graphs[tab]))rememberSnapshot(editor.moveOriginal);
     }
     else
@@ -1209,15 +1340,17 @@ bool selectionText(const Graph& graph,int tab,std::string& text,std::string& err
     for(size_t i=0;i<GraphCount;++i)fragment.graphs[i].kind=static_cast<GraphKind>(i);
     auto& selected=fragment.graphs[static_cast<size_t>(graph.kind)];
     const auto* selectedGroup=findGroup(graph,editor.selectedGroup[tab]);
-    const auto included=[&](int id){return isSelected(tab,id)||(selectedGroup&&std::find(selectedGroup->nodes.begin(),selectedGroup->nodes.end(),id)!=selectedGroup->nodes.end());};
+    const auto included=[&](int id){return isSelected(tab,id)||(selectedGroup&&nodeInGroupTree(graph,*selectedGroup,id));};
     for(const auto& node:graph.nodes)if(included(node.id))selected.nodes.push_back(node);
     if(selected.nodes.empty()){error="Select nodes to copy.";return false;}
     for(const auto& link:graph.links)if(included(link.fromNode)&&included(link.toNode))selected.links.push_back(link);
     selected.ties=routingTies(graph,selected.links);
     for(auto group:graph.groups)
     {
+        const bool tree=selectedGroup&&(group.id==selectedGroup->id||groupDescendant(*selectedGroup,group));
+        if(!tree&&(group.nodes.empty()||!std::all_of(group.nodes.begin(),group.nodes.end(),included)))continue;
         group.nodes.erase(std::remove_if(group.nodes.begin(),group.nodes.end(),[&](int id){return !included(id);}),group.nodes.end());
-        if(!group.nodes.empty())selected.groups.push_back(std::move(group));
+        if(tree||!group.nodes.empty())selected.groups.push_back(std::move(group));
     }
     std::string encoded;
     if(!serialize(fragment,encoded,error))return false;
@@ -1232,16 +1365,17 @@ bool copySelection(const Graph& graph,int tab)
 void cutSelection(Graph& graph,int tab)
 {
     if(!copySelection(graph,tab))return;
-    const int groupId=editor.selectedGroup[tab];
+    const int groupId=editor.selectedGroup[tab];std::vector<int> removedFrames;
     if(const auto* group=findGroup(graph,groupId))
     {
-        for(const int id:group->nodes)if(!isSelected(tab,id))editor.selection[tab].push_back(id);
+        for(const auto& child:graph.groups)if(child.id==groupId||groupDescendant(*group,child))removedFrames.push_back(child.id);
+        for(const auto& node:graph.nodes)if(nodeInGroupTree(graph,*group,node)&&!isSelected(tab,node.id))editor.selection[tab].push_back(node.id);
         if(!editor.selection[tab].empty())editor.selected[tab]=editor.selection[tab].back();
     }
     deleteSelection(graph,tab);
     if(groupId)
     {
-        graph.groups.erase(std::remove_if(graph.groups.begin(),graph.groups.end(),[&](const Group& group){return group.id==groupId;}),graph.groups.end());
+        graph.groups.erase(std::remove_if(graph.groups.begin(),graph.groups.end(),[&](const Group& group){return std::find(removedFrames.begin(),removedFrames.end(),group.id)!=removedFrames.end();}),graph.groups.end());
         edited(false);
     }
 }
@@ -1365,14 +1499,32 @@ void fitGraph(Graph& graph, ImVec2 size)
     {left=std::min(left,group.x);top=std::min(top,group.y);right=std::max(right,group.x+group.width);bottom=std::max(bottom,group.y+group.height);}
     for(const auto& tie:graph.ties){left=std::min(left,tie.x-48);top=std::min(top,tie.y-48);right=std::max(right,tie.x+48);bottom=std::max(bottom,tie.y+48);}
     graph.zoom = std::clamp(std::min((size.x-44)/(right-left), (size.y-44)/(bottom-top)), 0.25f, 1.2f);
+    float titleSpace=0;
+    if(ImGui::GetCurrentContext()&&!graph.groups.empty()&&overviewNode(graph))
+    {
+        const auto overhang=[&](){
+            float space=0;for(const auto& group:graph.groups)
+            {
+                GroupCaption cached;const auto& caption=groupOverviewCaption(cached,group,graph.zoom,ImGui::GetFont(),ImGui::GetFontSize());
+                space=std::max(space,(top-group.y)*graph.zoom+caption.extent.y+12);
+            }
+            return space;
+        };
+        for(int pass=0;pass<3;++pass)
+        {
+            titleSpace=overhang();
+            graph.zoom=std::clamp(std::min((size.x-44)/(right-left),(size.y-44-titleSpace)/(bottom-top)),0.25f,1.2f);
+        }
+        titleSpace=std::min(overhang(),std::max(0.0f,size.y-(bottom-top)*graph.zoom-4));
+    }
     graph.panX = (size.x-(right-left)*graph.zoom)*0.5f-left*graph.zoom;
-    graph.panY = (size.y-(bottom-top)*graph.zoom)*0.5f-top*graph.zoom;
+    graph.panY = titleSpace+(size.y-titleSpace-(bottom-top)*graph.zoom)*0.5f-top*graph.zoom;
 }
 void frameSelection(Graph& graph,int index,ImVec2 size,bool changeZoom)
 {
     Graph selected=graph;selected.nodes.clear();selected.groups.clear();selected.ties.clear();
     const auto* group=findGroup(graph,editor.selectedGroup[index]);
-    for(const auto& node:graph.nodes)if(isSelected(index,node.id)||(group&&std::find(group->nodes.begin(),group->nodes.end(),node.id)!=group->nodes.end()))selected.nodes.push_back(node);
+    for(const auto& node:graph.nodes)if(isSelected(index,node.id)||(group&&nodeInGroupTree(graph,*group,node)))selected.nodes.push_back(node);
     for(const auto& tie:graph.ties)if(isTieSelected(index,tie.id)||(group&&tieInGroup(graph,tie.id,*group)))selected.ties.push_back(tie);
     if(selected.nodes.empty()&&selected.ties.empty())return;
     if(group)selected.groups.push_back(*group);
@@ -1857,6 +2009,9 @@ std::string valueText(const Value* value)
         if(!value->frame)return "NO FRAME";
         return std::to_string(value->frame->width)+" x "+std::to_string(value->frame->height)+(value->frame->gpu?" GPU":" CPU");
     }
+    if(value->type==ValueType::Motion)
+    {char text[96];std::snprintf(text,sizeof(text),"%.1f, %.1f px/s%s",value->motion.velocity.x,value->motion.velocity.y,value->motion.ready?"":" | WARMUP");return text;}
+    if(value->type==ValueType::Calibration)return value->calibration?value->calibration->profileName:"NO CALIBRATION";
     if(value->type==ValueType::Mask)
         return value->mask?std::to_string(value->mask->width)+" x "+std::to_string(value->mask->height)+" MASK":"NO MASK";
     char text[72];
@@ -1896,7 +2051,10 @@ const InputDefaultDisplay& inputDefault(NodeDisplay& display,const Node& node,st
     {kind=InputDefaultKind::Text;source=found->second;}
     else if(node.kind==NodeKind::CaptureSource&&pin==0)
     {kind=InputDefaultKind::Local;source="Source settings";}
-    else if(node.kind==NodeKind::FilterCircle&&pin==1)kind=InputDefaultKind::Center;
+    else if((node.kind==NodeKind::FilterCircle&&pin==1)||(node.kind==NodeKind::SpeedCurve&&pin==1)||((node.kind==NodeKind::ScopeCheck||node.kind==NodeKind::BoxContainsPoint)&&pin==2))kind=InputDefaultKind::Center;
+    else if(node.kind==NodeKind::RecoilOutput&&pin==2)
+    {kind=InputDefaultKind::Local;source="1 px / count";}
+    else if(node.kind==NodeKind::PointDelta&&pin==1&&parameter(node,"implicit_center")!=0)kind=InputDefaultKind::Center;
     else if(node.kind==NodeKind::MouseDelta&&pin==2)
     {
         bool wired=false;
@@ -2012,6 +2170,18 @@ void dataTooltip(const Value& value)
         }
         ImGui::EndTooltip();
     }
+    else if(value.type==ValueType::Motion)
+    {
+        ImGui::BeginTooltip();ImGui::Text("Position %.2f, %.2f",value.motion.position.x,value.motion.position.y);
+        ImGui::Text("Velocity %.2f, %.2f px/s",value.motion.velocity.x,value.motion.velocity.y);
+        ImGui::Text("Damping %.3f | %s",value.motion.damping,value.motion.ready?"Ready":"Warming up");ImGui::EndTooltip();
+    }
+    else if(value.type==ValueType::Calibration&&value.calibration)
+    {
+        const auto& c=*value.calibration;ImGui::BeginTooltip();ImGui::TextUnformatted(c.profileName.c_str());
+        ImGui::Text("Pixels per count: %.8g, %.8g",c.pixelsPerCount.x,c.pixelsPerCount.y);
+        ImGui::TextUnformatted(c.aimEnabled?"Aim conversion enabled":"Aim conversion disabled by a zero calibration axis");ImGui::EndTooltip();
+    }
     else if(value.type==ValueType::Detections&&value.detections)
     {
         ImGui::BeginTooltip();
@@ -2063,7 +2233,7 @@ void refreshTelemetry()
 {
     const auto revisions=editor.live.graphRevisions;
     editor.live=service().telemetry();editor.telemetryAt=ImGui::GetTime();
-    for(std::size_t graph=0;graph<GraphCount;++graph)
+    for(std::size_t graph=0;graph<MaxGraphs;++graph)
     {
         auto& index=editor.liveIndex[graph];index.clear();index.reserve(editor.live.graphs[graph].size());
         for(std::size_t i=0;i<editor.live.graphs[graph].size();++i)index.emplace_back(editor.live.graphs[graph][i].nodeId,i);
@@ -2203,16 +2373,24 @@ CatalogPath catalogPath(const Definition& def)
     case K::IntegerAdd:case K::IntegerSubtract:case K::IntegerMultiply:case K::IntegerDivide:case K::IntegerClamp:return {"Math","Integers"};
     case K::Greater:case K::Less:return {"Logic","Comparisons"};
     case K::Pulse:case K::Toggle:return {"Logic","Timing and state"};
-    case K::Target:case K::TargetNearest:case K::TargetTracker:return {"Targets","Selection"};
-    case K::TargetValid:case K::TargetObserved:case K::ScopeCheck:return {"Targets","Conditions"};
-    case K::AimPoint:case K::TargetDistance:return {"Targets","Properties"};
-    case K::Prediction:case K::CameraCompensation:return {"Motion","Prediction"};
-    case K::MouseDelta:case K::NormalizeFps:return {"Motion","Mouse conversion"};
+    case K::ChooseTarget:case K::TrackDetections:return {"Targets","Selection"};
+    case K::Target:case K::TargetNearest:case K::TargetTracker:case K::AimPoint:case K::ScopeCheck:case K::Prediction:return {"Compatibility","Combined nodes"};
+    case K::TargetValid:case K::TargetObserved:return {"Targets","Conditions"};
+    case K::TargetDistance:return {"Targets","Properties"};
+    case K::CameraCompensation:return {"Motion","Prediction"};
+    case K::MotionEstimate:case K::MotionPosition:case K::MotionVelocity:case K::MotionDamping:case K::MotionReady:case K::PredictionTime:case K::ProjectPoint:case K::FutureTrail:return {"Motion","Estimation and projection"};
+    case K::TargetAnchor:return {"Targets","Properties"};
+    case K::BoxPoint:case K::BoxContainsPoint:return {"Points","Bounding boxes"};
+    case K::NormalizeFps:return {"Motion","Mouse conversion"};
+    case K::MouseDelta:case K::MouseCalibration:return {"Compatibility","Combined nodes"};
+    case K::MouseProfile:case K::SharedCalibration:case K::CalibrationScale:case K::PixelsToCounts:case K::ApplyMouseSpeed:return {"Motion","Mouse conversion"};
+    case K::PointDelta:return {"Points","Transforms"};
+    case K::SharedMouseDelta:case K::SharedRecoilOutput:return {"Compatibility","Combined nodes"};
     case K::SpeedCurve:case K::WindMotion:case K::ScaleMovement:case K::LimitMovement:return {"Motion","Response"};
     case K::AutoAimEnabled:return {"Settings","Aim"};
     case K::AutoShootEnabled:return {"Settings","Auto shoot"};
     case K::RecoilEnabled:case K::RecoilStrength:return {"Settings","Recoil"};
-    case K::CaptureSource:return {"Vision","Capture"};
+    case K::CurrentFrame:case K::CaptureSource:return {"Vision","Capture"};
     case K::Inference:case K::DepthInference:return {"Vision","Models"};
     case K::DepthToMask:case K::ApplyMask:case K::FilterMask:return {"Vision","Masks"};
     case K::AimOutput:case K::AutoShootOutput:case K::RecoilOutput:return {"Outputs","Controls"};
@@ -2273,6 +2451,39 @@ void drawNodeShell(ImDrawList* draw,ImVec2 p,ImVec2 q,float header,float zoom,Im
     draw->AddRectFilled(add(p,ImVec2(0,8*zoom)),add(p,ImVec2(3*zoom,24*zoom)),(accent&0x00ffffff)|IM_COL32(0,0,0,active?230:85),2);
     if(signal>0.01f)draw->AddRect(p,q,(accent&0x00ffffff)|IM_COL32(0,0,0,static_cast<int>(210*signal)),6*zoom,0,1.0f+signal);
 }
+struct LocalSettingsRow {ImRect label,value;};
+float localSettingsRowHeight(float font,float scale)
+{
+    return std::max(font+8*scale,26*scale);
+}
+LocalSettingsRow localSettingsRow(ImVec2 position,float width,float font,float scale)
+{
+    const float height=localSettingsRowHeight(font,scale),gap=6*scale;
+    const float label=std::min(48*scale,std::max(0.0f,width-64*scale-gap));
+    return {{ImVec2(position.x,position.y+(height-font)*0.5f),ImVec2(position.x+label,position.y+(height+font)*0.5f)},
+        {ImVec2(position.x+label+gap,position.y),ImVec2(position.x+width,position.y+height)}};
+}
+bool localBooleanControl(const char* id,bool& value,ImVec2 size,float scale)
+{
+    const auto position=ImGui::GetCursorScreenPos();
+    const bool pressed=ImGui::InvisibleButton(id,size,ImGuiButtonFlags_EnableNav);
+    const auto item=ImGui::GetItemID();
+    if(pressed){value=!value;ImGui::MarkItemEdited(item);}
+    auto* storage=ImGui::GetStateStorage();const auto key=ImHashStr("##local_toggle",0,item);
+    const float before=storage->GetFloat(key,value?1.0f:0.0f);
+    const float amount=(value?1.0f:0.0f)+(before-(value?1.0f:0.0f))*std::exp(-18*std::clamp(ImGui::GetIO().DeltaTime,0.0f,1.0f/15));
+    storage->SetFloat(key,amount);
+    const auto& style=ImGui::GetStyle();const auto a=style.Colors[ImGui::IsItemHovered()?ImGuiCol_FrameBgHovered:ImGuiCol_FrameBg],b=style.Colors[ImGuiCol_CheckboxSelectedBg];
+    const ImVec4 tint(a.x+(b.x-a.x)*amount,a.y+(b.y-a.y)*amount,a.z+(b.z-a.z)*amount,a.w+(b.w-a.w)*amount);
+    const float height=std::min(18*scale,std::min(size.y,std::max(1.0f,size.x/1.85f))),width=height*1.85f;
+    const ImRect toggle(ImVec2(position.x,position.y+(size.y-height)*0.5f),ImVec2(position.x+width,position.y+(size.y+height)*0.5f));
+    auto* draw=ImGui::GetWindowDrawList();draw->AddRectFilled(toggle.Min,toggle.Max,ImGui::GetColorU32(tint),height*0.5f);
+    draw->AddRect(toggle.Min,toggle.Max,ImGui::GetColorU32(ImGuiCol_Border),height*0.5f,0,std::max(0.5f,scale));
+    const float radius=height*0.34f,padding=height*0.16f;
+    draw->AddCircleFilled(ImVec2(toggle.Min.x+padding+radius+(width-2*(padding+radius))*amount,toggle.GetCenter().y),radius,ImGui::GetColorU32(value?ImGuiCol_CheckMark:ImGuiCol_TextDisabled),16);
+    ImGui::RenderNavCursor(ImRect(position,add(position,size)),item);
+    return pressed;
+}
 void layoutCatalogCard(CatalogPreviewState& preview,float width)
 {
     if(preview.layoutWidth==width)return;
@@ -2305,7 +2516,7 @@ void layoutCatalogCard(CatalogPreviewState& preview,float width)
         row.height=std::max(PinSpacing,height+8);y+=row.height;preview.rows.push_back(row);
     }
     preview.settingsY=y+4;
-    if(hasNodeSettings(preview.node))y+=preview.node.kind==NodeKind::Boolean?56:font*2+36;
+    if(hasNodeSettings(preview.node))y+=localSettingsRowHeight(font,1)+20;
     if(preview.kind==NodeKind::ImagePreview)y+=std::clamp((width-20)*9/16,64.0f,240.0f)+8;
     preview.cardHeight=reroute(preview.kind)?60:y+16;
 }
@@ -2359,19 +2570,21 @@ void drawCatalogCard(CatalogPreviewState& preview)
             draw->AddRectFilled(a,b,IM_COL32(23,25,29,105),4);
             const auto cursor=ImGui::GetCursorScreenPos();ImGui::PushStyleVar(ImGuiStyleVar_DisabledAlpha,1);
             ImGui::PushStyleVar(ImGuiStyleVar_FramePadding,ImVec2(5,4));ImGui::BeginDisabled();
-            draw->AddText(add(a,ImVec2(5,6)),ImGui::GetColorU32(ImGuiCol_Text),variableGet(preview.kind)||variableSet(preview.kind)?"Variable name":"Value");
+            const auto row=localSettingsRow(add(a,ImVec2(5,6)),std::max(1.0f,b.x-a.x-21),font,1);
+            const bool named=variableGet(preview.kind)||variableSet(preview.kind)||calibrationIdentifier(preview.kind);
+            draw->AddText(row.label.Min,ImGui::GetColorU32(ImGuiCol_Text),named?"Name":"Value");
+            ImGui::SetCursorScreenPos(row.value.Min);ImGui::SetNextItemWidth(row.value.GetWidth());
             if(preview.kind==NodeKind::Boolean)
             {
-                const float toggleWidth=std::max(18.0f,ImGui::GetFrameHeight()*0.72f)*1.85f;
-                ImGui::SetCursorScreenPos(ImVec2(b.x-toggleWidth-10,a.y+2));ImGui::SetNextItemWidth(toggleWidth);
-                bool value=preview.node.value!=0;ImGui::Checkbox("##literal",&value);
+                bool value=preview.node.value!=0;localBooleanControl("##literal",value,row.value.GetSize(),1);
             }
             else
             {
-                ImGui::SetCursorScreenPos(add(a,ImVec2(5,font+12)));ImGui::SetNextItemWidth(std::max(16.0f,b.x-a.x-20));
+                ImGui::PushStyleVar(ImGuiStyleVar_FramePadding,ImVec2(5,(row.value.GetHeight()-font)*0.5f));
                 if(preview.kind==NodeKind::Number){double value=preview.node.value;ImGui::InputDouble("##literal",&value,0,0,"%.5f");}
                 else if(preview.kind==NodeKind::Integer){int value=static_cast<int>(preview.node.value);ImGui::InputInt("##literal",&value,0,0);}
                 else{char value[129]{};const auto name=textParameter(preview.node,"name");std::memcpy(value,name.data(),std::min(name.size(),sizeof(value)-1));ImGui::InputText("##literal",value,sizeof(value));}
+                ImGui::PopStyleVar();
             }
             ImGui::EndDisabled();ImGui::PopStyleVar(2);ImGui::SetCursorScreenPos(cursor);
         }
@@ -2747,17 +2960,38 @@ bool keyParameterControl(const Node& node,const ParameterSpec& spec,double& valu
 bool textChoiceParameter(NodeKind kind,const char* key)
 {
     return !std::strcmp(key,"capture_method")||!std::strcmp(key,"capture_target")||!std::strcmp(key,"backend")||
-        !std::strcmp(key,"game_overlay_icon_anchor")||(kind==NodeKind::ScreenshotOutput&&!std::strcmp(key,"format"));
+        !std::strcmp(key,"game_overlay_icon_anchor")||!std::strcmp(key,"capture_window_title")||!std::strcmp(key,"virtual_camera_name")||
+        (kind==NodeKind::ScreenshotOutput&&!std::strcmp(key,"format"));
+}
+bool sourceChoiceControl(const Node& node,const char* key,std::string& value,int pin)
+{
+    static std::vector<SourceChoices::Choice> choices;static char custom[1025]{};bool changed=false;
+    const bool camera=!std::strcmp(key,"virtual_camera_name");
+    if(!ImGui::BeginCombo("##value",value.empty()?(camera?"Select camera...":"Select window..."):value.c_str()))return false;
+    ownInputPopup(node.id,pin);
+    if(ImGui::IsWindowAppearing()){choices=SourceChoices::enumerate(camera);std::snprintf(custom,sizeof(custom),"%s",value.c_str());}
+    if(ImGui::Button("Refresh"))choices=SourceChoices::enumerate(camera);
+    if(ImGui::BeginChild("##sources",ImVec2(300,std::max(1,std::min(8,static_cast<int>(choices.size())))*ImGui::GetTextLineHeightWithSpacing()+4)))
+    {
+        ImGuiListClipper clipper;clipper.Begin(static_cast<int>(choices.size()));
+        while(clipper.Step())for(int i=clipper.DisplayStart;i<clipper.DisplayEnd;++i)
+            {ImGui::PushID(i);if(ImGui::Selectable(choices[i].label.c_str(),choices[i].value==value)){value=choices[i].value;std::snprintf(custom,sizeof(custom),"%s",value.c_str());changed=true;}ImGui::PopID();}
+        if(choices.empty())ImGui::TextDisabled(camera?"No cameras found.":"No capture windows found.");
+    }
+    ImGui::EndChild();ImGui::SetNextItemWidth(-1);
+    if(ImGui::InputTextWithHint("##custom","Custom name...",custom,sizeof(custom))){value=custom;changed=true;}
+    ImGui::EndCombo();return changed;
 }
 bool textChoiceControl(const Node& node,const char* key,std::string& value,int pin)
 {
+    if(!std::strcmp(key,"capture_window_title")||!std::strcmp(key,"virtual_camera_name"))return sourceChoiceControl(node,key,value,pin);
     std::vector<const char*> choices;
     const std::string name=key;
     if(name=="capture_method")choices={"duplication_api","winrt","virtual_camera","udp_capture"};
     else if(name=="capture_target")choices={"monitor","window"};
     else if(name=="backend")choices={"DML","CPU","TRT"};
     else if(node.kind==NodeKind::ScreenshotOutput&&name=="format")choices={"png","jpg"};
-    else if(name=="game_overlay_icon_anchor")choices={"center","top","bottom"};
+    else if(name=="game_overlay_icon_anchor")choices={"center","top","bottom","head"};
     if(choices.empty())return false;
     bool changed=false;
     if(ImGui::BeginCombo("##value",value.c_str(),ImGuiComboFlags_NoArrowButton))
@@ -2905,21 +3139,6 @@ bool modelChoiceControl(const Node& node,std::string& value,int graph,int pin,In
     if(ImGui::IsItemActive()||ImGui::IsItemEdited()){owned=ImGui::GetCurrentContext()->LastItemData;ownInlineItem(node.id);}
     ImGui::EndCombo();ImGui::GetCurrentContext()->LastItemData=owned;return changed;
 }
-bool inlineCheckbox(const char* label,bool& value,int id,float scale)
-{
-    // The menu's labeled checkbox reserves a wide 58 px row. Use its compact
-    // switch and a wrapped label so both stay inside the node at every zoom.
-    const auto position=ImGui::GetCursorScreenPos();const float width=ImGui::GetContentRegionAvail().x;
-    const float toggleWidth=std::max(18.0f,ImGui::GetFrameHeight()*0.72f)*1.85f;
-    const float labelWidth=std::max(10.0f,width-toggleWidth-6*scale);
-    ImGui::BeginGroup();ImGui::PushTextWrapPos(ImGui::GetCursorPosX()+labelWidth);
-    ImGui::TextWrapped("%s",label);const bool labelPressed=ImGui::IsItemClicked(ImGuiMouseButton_Left);
-    ImGui::PopTextWrapPos();ImGui::SameLine();
-    ImGui::SetCursorScreenPos(ImVec2(position.x+width-toggleWidth,position.y));ImGui::SetNextItemWidth(toggleWidth);
-    bool changed=ImGui::Checkbox("##value",&value);ownInlineItem(id);
-    if(labelPressed){value=!value;changed=true;}
-    ImGui::EndGroup();return changed;
-}
 int drivenInput(const Graph& graph,const Node& node,const char* key)
 {
     const auto& inputs=definition(node.kind).inputs;
@@ -2931,16 +3150,15 @@ int drivenInput(const Graph& graph,const Node& node,const char* key)
 }
 void variableNameControl(Graph& graph,int id,NodeDisplay& state)
 {
-    auto* node=findNode(graph,id);if(!node||(!variableGet(node->kind)&&!variableSet(node->kind)))return;
+    auto* node=findNode(graph,id);if(!node||(!variableGet(node->kind)&&!variableSet(node->kind)&&!calibrationIdentifier(node->kind)))return;
     auto& buffer=state.settingsBuffers["name"];buffer.resize(129,0);
     const auto value=textParameter(*node,"name");
     if(value!=buffer.data())
     {std::fill(buffer.begin(),buffer.end(),0);std::memcpy(buffer.data(),value.data(),std::min(value.size(),buffer.size()-1));}
-    ImGui::TextUnformatted("Variable name");ImGui::SetNextItemWidth(-1);
     if(ImGui::InputText("##name",buffer.data(),buffer.size()))
     {rememberParameterChange();node->textParameters["name"]=buffer.data();edited();}
     ownInlineItem(id);
-    if(ImGui::IsItemHovered())ImGui::SetTooltip("Static identifier shared by a matching Get and Set pair.");
+    if(ImGui::IsItemHovered())ImGui::SetTooltip(calibrationIdentifier(node->kind)?"The same name connects Mouse calibration to Shared calibration in every Logic workflow.":"Static identifier shared by a matching Get and Set pair.");
 }
 ImRect settingsRect(const Graph& graph,ImVec2 origin,const Node& node)
 {
@@ -2979,24 +3197,36 @@ void inlineSettings(Graph& graph,int index,int id,NodeDisplay& state,ImVec2 orig
     const float top=panel.Min.y+6*scale;
     ImGui::SetCursorScreenPos(ImVec2(window->WorkRect.Min.x,top));ImGui::BeginGroup();
     ImGui::BeginDisabled(!interactive);
+    const auto row=localSettingsRow(ImVec2(window->WorkRect.Min.x,top),window->WorkRect.GetWidth(),ImGui::GetFontSize(),scale);
+    const bool named=variableGet(node->kind)||variableSet(node->kind)||calibrationIdentifier(node->kind);
+    ImGui::SetCursorScreenPos(row.label.Min);ImGui::TextUnformatted(named?"Name":"Value");
+    const bool labelPressed=ImGui::IsItemClicked(ImGuiMouseButton_Left);
+    if(named&&ImGui::IsItemHovered())ImGui::SetTooltip(calibrationIdentifier(node->kind)?"Shared name: connects calibration sources and readers across Logic workflows.":"Variable name: connects the matching Get and Set in this graph.");
+    ImGui::SetCursorScreenPos(row.value.Min);ImGui::SetNextItemWidth(row.value.GetWidth());
     if(node->kind==NodeKind::Boolean)
     {
-        bool value=node->value!=0;if(inlineCheckbox("Value",value,id,scale)){remember();node->value=value?1:0;edited();}
-        ownInlineItem(id);
+        bool value=node->value!=0;bool changed=localBooleanControl("##value",value,row.value.GetSize(),scale);ownInlineItem(id);
+        if(labelPressed){value=!value;changed=true;}
+        if(changed){remember();node->value=value?1:0;edited();}
     }
-    else if(node->kind==NodeKind::Number)
+    else
     {
-        double value=node->value;ImGui::TextUnformatted("Value");ImGui::SetNextItemWidth(-1);
-        if(ImGui::InputDouble("##constant",&value,0,0,"%.5f")&&std::isfinite(value)){rememberParameterChange();node->value=value;edited();}
-        ownInlineItem(id);
+        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding,ImVec2(5*scale,(row.value.GetHeight()-ImGui::GetFontSize())*0.5f));
+        if(node->kind==NodeKind::Number)
+        {
+            double value=node->value;
+            if(ImGui::InputDouble("##constant",&value,0,0,"%.5f")&&std::isfinite(value)){rememberParameterChange();node->value=value;edited();}
+            ownInlineItem(id);
+        }
+        else if(node->kind==NodeKind::Integer)
+        {
+            int value=static_cast<int>(node->value);
+            if(ImGui::InputInt("##constant",&value,0,0)){rememberParameterChange();node->value=value;edited();}
+            ownInlineItem(id);
+        }
+        else variableNameControl(graph,id,state);
+        ImGui::PopStyleVar();
     }
-    else if(node->kind==NodeKind::Integer)
-    {
-        int value=static_cast<int>(node->value);ImGui::TextUnformatted("Value");ImGui::SetNextItemWidth(-1);
-        if(ImGui::InputInt("##constant",&value,0,0)){rememberParameterChange();node->value=value;edited();}
-        ownInlineItem(id);
-    }
-    variableNameControl(graph,id,state);
     state.settingsContent=std::max(0.0f,(ImGui::GetCursorScreenPos().y-top)/scale+12);
     ImGui::EndDisabled();ImGui::EndGroup();
     ImGui::PopClipRect();ImGui::PopStyleVar(4);ImGui::PopFont();ImGui::PopItemFlag();ImGui::PopID();ImGui::PopID();
@@ -3147,6 +3377,13 @@ void inspector(Graph& graph,int index)
     if(!node){ImGui::EndPopup();return;}
     const Node snapshot=*node;const int id=node->id;
     ImGui::TextDisabled("%s",definition(snapshot.kind).title);
+    if(snapshot.kind==NodeKind::CollectDataset||snapshot.kind==NodeKind::DatasetOutput)
+    {
+        const int key=index*NodeKeyStride+id;const auto state=cvm::GetDataCollectionNodeUiState(key);
+        if(ImGui::MenuItem("Copy recording folder",nullptr,false,!state.resolved_output_dir.empty()))ImGui::SetClipboardText(state.resolved_output_dir.c_str());
+        if(ImGui::MenuItem("Reset recording counters"))cvm::ResetDataCollectionNodeCounters(key);
+        ImGui::Separator();
+    }
     if(ImGui::MenuItem("Node information","Enter"))openProperties(index);
     if(ImGui::MenuItem("Copy","Ctrl+C"))copySelection(graph,index);
     if(ImGui::MenuItem("Duplicate","Ctrl+D"))duplicateSelection(graph,index);
@@ -3261,6 +3498,22 @@ void propertiesPanel(Graph& graph,int index,ImVec2 position,ImVec2 size)
         ImGui::TextDisabled("%s",node->disabled?"Disabled":node->bypassed?"Bypassed":"Enabled");
         ImGui::Text("Inputs: %zu  |  Outputs: %zu",def.inputs.size(),def.outputs.size());
         ImGui::TextWrapped("Edit settings directly inside the expanded node.");
+        if(node->kind==NodeKind::CollectDataset||node->kind==NodeKind::DatasetOutput)
+        {
+            const int key=index*NodeKeyStride+node->id;
+            const auto state=cvm::GetDataCollectionNodeUiState(key);
+            ImGui::Separator();ImGui::TextDisabled("RECORDING");
+            ImGui::Text("Observed frames: %llu",static_cast<unsigned long long>(state.observed_frame_count));
+            ImGui::Text("Save attempts: %llu",static_cast<unsigned long long>(state.attempted_sample_count));
+            ImGui::Text("Images: %llu | Labels: %llu",static_cast<unsigned long long>(state.saved_image_count),static_cast<unsigned long long>(state.saved_label_count));
+            if(!state.status.empty())ImGui::TextWrapped("%s",state.status.c_str());
+            if(!state.resolved_output_dir.empty())
+            {
+                ImGui::TextWrapped("%s",state.resolved_output_dir.c_str());
+                if(ImGui::Button("Copy folder path"))ImGui::SetClipboardText(state.resolved_output_dir.c_str());
+            }
+            if(ImGui::Button("Reset counters"))cvm::ResetDataCollectionNodeCounters(key);
+        }
     }
     else ImGui::TextWrapped("Select a node to inspect its live data and description.");
     ImGui::PopID();ImGui::End();ImGui::PopStyleVar();
@@ -3279,13 +3532,13 @@ void groupInspector(Graph& graph,int tab)
     ImVec4 color=ImGui::ColorConvertU32ToFloat4(group->color);
     if (ImGui::ColorEdit3("Color",&color.x))
     {remember();color.w=1;group->color=ImGui::ColorConvertFloat4ToU32(color);edited(false);}
-    ImGui::TextDisabled("%zu nodes | Drag the header to move the group",group->nodes.size());
+    ImGui::TextDisabled("%zu nodes | Drag the header to move the group",static_cast<std::size_t>(std::count_if(graph.nodes.begin(),graph.nodes.end(),[&](const Node& node){return nodeInGroupTree(graph,*group,node);})));
     if (ImGui::Button("Select members"))
     {
-        clearSelection(tab);editor.selection[tab]=group->nodes;
+        clearSelection(tab);for(const auto& node:graph.nodes)if(nodeInGroupTree(graph,*group,node))editor.selection[tab].push_back(node.id);
         for(const auto& tie:graph.ties)if(tieInGroup(graph,tie.id,*group))editor.tieSelection[tab].push_back(tie.id);
         if(!editor.tieSelection[tab].empty())editor.selectedTie[tab]=editor.tieSelection[tab].back();
-        if(!group->nodes.empty())editor.selected[tab]=group->nodes.back();ImGui::CloseCurrentPopup();
+        if(!editor.selection[tab].empty())editor.selected[tab]=editor.selection[tab].back();ImGui::CloseCurrentPopup();
     }
     ImGui::SameLine();
     if (ImGui::Button("Ungroup"))
@@ -3313,7 +3566,7 @@ void tieInspector(Graph& graph,int tab)
     }
     ImGui::EndPopup();
 }
-enum class ToolIcon {Add,Inspect,Group,Tie,Bypass,Collapse,Undo,Redo,Arrange,Fit,Expand,Files,Restore,Tools,Help};
+enum class ToolIcon {Add,Inspect,Group,Tie,Bypass,Collapse,Undo,Redo,Arrange,Fit,Hide,Maximize,Windowed,Fullscreen,ExitFullscreen,Files,Restore,Tools,Help};
 bool toolButton(const char* id,const char* tooltip,ToolIcon icon,bool enabled=true,bool accent=false)
 {
     ImGui::BeginDisabled(!enabled);
@@ -3345,7 +3598,15 @@ bool toolButton(const char* id,const char* tooltip,ToolIcon icon,bool enabled=tr
         draw->AddRect(add(c,ImVec2(3,3)),add(c,ImVec2(9,9)),color,1,0,1.4f);
         line(-3,-4,3,-4);line(0,-4,0,6);line(0,6,3,6);break;
     case ToolIcon::Fit:for(float x:{-1.0f,1.0f})for(float y:{-1.0f,1.0f}){line(8*x,8*y,3*x,8*y);line(8*x,8*y,8*x,3*y);}break;
-    case ToolIcon::Expand:line(-7,7,7,-7);line(-7,7,-7,1);line(-7,7,-1,7);line(7,-7,1,-7);line(7,-7,7,-1);break;
+    case ToolIcon::Hide:line(-7,5,7,5);break;
+    case ToolIcon::Maximize:draw->AddRect(add(c,ImVec2(-8,-7)),add(c,ImVec2(8,7)),color,1,0,1.6f);line(-8,-3,8,-3);break;
+    case ToolIcon::Windowed:draw->AddRect(add(c,ImVec2(-7,-3)),add(c,ImVec2(4,8)),color,1,0,1.6f);line(-3,-3,-3,-7);line(-3,-7,8,-7);line(8,-7,8,4);line(8,4,4,4);break;
+    case ToolIcon::Fullscreen:case ToolIcon::ExitFullscreen:
+        for(float x:{-1.0f,1.0f})for(float y:{-1.0f,1.0f})
+        {
+            const float outer=icon==ToolIcon::Fullscreen?8.0f:3.0f,inner=icon==ToolIcon::Fullscreen?3.0f:8.0f;
+            line(outer*x,outer*y,inner*x,outer*y);line(outer*x,outer*y,outer*x,inner*y);
+        }break;
     case ToolIcon::Files:line(-8,3,-8,8);line(-8,8,8,8);line(8,8,8,3);line(-3,-8,-3,2);line(-6,-1,-3,2);line(-3,2,0,-1);line(5,2,5,-8);line(2,-5,5,-8);line(5,-8,8,-5);break;
     case ToolIcon::Restore:draw->PathArcTo(c,8,0.5f,5.5f,18);draw->PathStroke(color,0,1.7f);line(6,-6,0,-6);line(6,-6,6,-1);break;
     case ToolIcon::Tools:for(int x:{-6,0,6})draw->AddCircleFilled(add(c,ImVec2(static_cast<float>(x),0)),1.7f,color);break;
@@ -3410,9 +3671,13 @@ void openCatalogAtCursor(const Graph& graph,int index)
 }
 void nudgeSelection(Graph& graph,int index,float x,float y)
 {
-    if(editor.selection[index].empty()&&editor.tieSelection[index].empty())return;
-    remember();for(auto& node:graph.nodes)if(isSelected(index,node.id)){node.x=snap(node.x+x);node.y=snap(node.y+y);}
-    for(auto& tie:graph.ties)if(isTieSelected(index,tie.id)){tie.x=snap(tie.x+x);tie.y=snap(tie.y+y);}editor.autoFit[index]=false;edited(false);
+    if(editor.selection[index].empty()&&editor.tieSelection[index].empty()&&!findGroup(graph,editor.selectedGroup[index]))return;
+    remember();captureDragSelection(graph,index,true);
+    for(const auto& start:editor.dragPositions)if(auto* node=findNode(graph,start.id)){node->x=snap(node->x+x);node->y=snap(node->y+y);}
+    for(const auto& start:editor.dragGroupPositions)if(auto* group=findGroup(graph,start.id)){group->x=snap(group->x+x);group->y=snap(group->y+y);}
+    for(const auto& start:editor.dragTiePositions)if(auto* tie=findTie(graph,start.id)){tie->x=snap(tie->x+x);tie->y=snap(tie->y+y);}
+    syncGroupMembership(graph);editor.autoFit[index]=false;edited(false);
+    editor.dragPositions.clear();editor.dragGroupPositions.clear();editor.dragTiePositions.clear();
 }
 void shortcutsPopup()
 {
@@ -3424,7 +3689,7 @@ void shortcutsPopup()
     if(ImGui::BeginTable("signal_colors",3))
     {
         for(const auto type:{ValueType::Boolean,ValueType::Float,ValueType::Integer,ValueType::Point,ValueType::Detections,
-            ValueType::Target,ValueType::Movement,ValueType::Frame,ValueType::Depth,ValueType::Mask,ValueType::String,ValueType::Monitor,ValueType::Monitors,ValueType::OverlayStyle,ValueType::LabelOptions})
+            ValueType::Target,ValueType::Movement,ValueType::Frame,ValueType::Depth,ValueType::Mask,ValueType::String,ValueType::Monitor,ValueType::Monitors,ValueType::OverlayStyle,ValueType::LabelOptions,ValueType::Motion,ValueType::Calibration})
         {
             ImGui::TableNextColumn();ImGui::PushStyleColor(ImGuiCol_Text,pinColor(type));
             ImGui::TextWrapped("%s",typeName(type));ImGui::PopStyleColor();
@@ -3629,6 +3894,10 @@ void canvas(Graph& graph, int index)
         for (float y=origin.y+std::fmod(graph.panY,spacing);y<end.y;y+=spacing) draw->AddLine(ImVec2(origin.x,y),ImVec2(end.x,y),color);
     }
     drawLayoutSnapPreview(draw,graph,origin,end);
+    const bool groupOverview=overviewNode(graph);
+    auto& groupLabels=editor.groupCaptions[index];
+    groupLabels.erase(std::remove_if(groupLabels.begin(),groupLabels.end(),[&](const GroupCaption& caption){return !findGroup(graph,caption.id);}),groupLabels.end());
+    if(groupLabels.capacity()<MaxGroups)groupLabels.reserve(MaxGroups);
     int hoverGroup=0,hoverResizeGroup=0;
     for (const auto& group:graph.groups)
     {
@@ -3639,10 +3908,23 @@ void canvas(Graph& graph, int index)
         draw->AddRectFilled(p,q,rgb|IM_COL32(0,0,0,13),7*graph.zoom);
         draw->AddRectFilled(p,ImVec2(q.x,p.y+28*graph.zoom),rgb|IM_COL32(0,0,0,selected?65:38),7*graph.zoom);
         draw->AddRect(p,q,rgb|IM_COL32(0,0,0,selected?220:100),7*graph.zoom,0,selected?2.0f:1.0f);
-        const ImVec4 clip(p.x+10*graph.zoom,p.y,q.x-12*graph.zoom,p.y+28*graph.zoom);
-        draw->AddText(ImGui::GetFont(),ImGui::GetFontSize()*graph.zoom,add(p,ImVec2(10*graph.zoom,5*graph.zoom)),rgb|IM_COL32(0,0,0,235),group.title.c_str(),nullptr,0,&clip);
+        bool overLabel=false;
+        if(groupOverview)
+        {
+            auto cached=std::find_if(groupLabels.begin(),groupLabels.end(),[&](const GroupCaption& caption){return caption.id==group.id;});
+            if(cached==groupLabels.end()){groupLabels.push_back({});cached=groupLabels.end()-1;cached->id=group.id;}
+            const auto& caption=groupOverviewCaption(*cached,group,graph.zoom,ImGui::GetFont(),ImGui::GetFontSize());
+            cached->bounds=ImRect(ImVec2(p.x,p.y-caption.extent.y-10),ImVec2(p.x+caption.extent.x+8,p.y-4));
+            overLabel=hovered&&cached->bounds.Contains(io.MousePos);
+            if(overLabel&&!leftGesture&&!editor.rightGesture)ImGui::SetTooltip("%s\nDrag to move the group",group.title.c_str());
+        }
+        else
+        {
+            const ImVec4 clip(p.x+10*graph.zoom,p.y,q.x-12*graph.zoom,p.y+28*graph.zoom);
+            draw->AddText(ImGui::GetFont(),ImGui::GetFontSize()*graph.zoom,add(p,ImVec2(10*graph.zoom,5*graph.zoom)),rgb|IM_COL32(0,0,0,235),group.title.c_str(),nullptr,0,&clip);
+        }
         draw->AddLine(ImVec2(q.x-12*graph.zoom,q.y-4*graph.zoom),ImVec2(q.x-4*graph.zoom,q.y-12*graph.zoom),rgb|IM_COL32(0,0,0,190),1.5f);
-        const bool overHeader=hovered&&contains(io.MousePos,p,ImVec2(q.x,p.y+28*graph.zoom));
+        const bool overHeader=overLabel||(hovered&&contains(io.MousePos,p,ImVec2(q.x,p.y+28*graph.zoom)));
         const bool overResize=hovered&&contains(io.MousePos,add(q,ImVec2(-14*graph.zoom,-14*graph.zoom)),add(q,ImVec2(3,3)));
         // The topmost group control owns both the target and the action.
         if(overHeader||overResize){hoverGroup=group.id;hoverResizeGroup=overResize?group.id:0;}
@@ -3694,14 +3976,29 @@ void canvas(Graph& graph, int index)
         ImGui::PushID(tie.id);const float fade=visualEase("##tie_hover",over?1.0f:0.0f);ImGui::PopID();
         drawWireTie(draw,graph,tie,origin,isTieSelected(index,tie.id),fade);
     }
+    // Draw overview names over crossing wires, before the node cards. Their
+    // layout is cached; moving the viewport only updates these screen bounds.
+    if(groupOverview)for(const auto& cached:groupLabels)
+    {
+        const auto* group=findGroup(graph,cached.id);if(!group||!cached.bounds.Overlaps(ImRect(origin,end)))continue;
+        const auto& caption=cached.layout;
+        const ImU32 color=editor.selectedGroup[index]==group->id?Cyan:(group->color&0x00ffffff)|IM_COL32(0,0,0,245);
+        draw->AddRectFilled(cached.bounds.Min,cached.bounds.Max,IM_COL32(27,29,33,235),3);
+        float y=cached.bounds.Min.y+3;
+        for(const auto& line:caption.lines)
+        {
+            draw->AddText(ImGui::GetFont(),caption.fontSize,ImVec2(cached.bounds.Min.x+4,y),color,caption.text.c_str()+line.begin,caption.text.c_str()+line.end);
+            y+=caption.fontSize;
+        }
+    }
     int hoverNode = 0, hoverPort = -1, hoverCollapse = 0,hoverResizeNode=0,hoverResizeEdges=0;
     std::vector<int> previewNodes;
-    if(index==3)for(const auto& node:graph.nodes)
+    if(graph.kind==GraphKind::Vision)for(const auto& node:graph.nodes)
     {
         if(node.kind!=NodeKind::ImagePreview||node.disabled||node.bypassed||compactNode(graph,node))continue;
         if(parameter(node,"enabled")==0&&std::none_of(graph.links.begin(),graph.links.end(),[&](const Link& link){return link.toNode==node.id&&link.toPort==0;}))continue;
         if(previewRect(graph,origin,node).Overlaps(ImRect(origin,end)))
-        {if(isSelected(index,node.id))previewNodes.insert(previewNodes.begin(),node.id);else previewNodes.push_back(node.id);}
+        {if(isSelected(index,node.id))previewNodes.insert(previewNodes.begin(),previewKey(index,node.id));else previewNodes.push_back(previewKey(index,node.id));}
     }
     if(previewNodes.size()>MaxLivePreviews)previewNodes.resize(MaxLivePreviews);
     service().setPreviewNodes(previewNodes);NodePreview::retain(previewNodes);
@@ -3710,6 +4007,11 @@ void canvas(Graph& graph, int index)
     int hoverDefaultNode=-1,hoverDefaultPin=-1;
     bool nearestPortOutput=false;
     float nearestPortDistance=std::numeric_limits<float>::max();
+    Editor::PortFocus magneticPort;float magneticDistance=std::numeric_limits<float>::max();
+    const auto* wireAnchor=editor.wireNode&&!editor.keyboardWire?findNode(graph,editor.wireNode):nullptr;
+    const bool looseAnchor=wireAnchor&&looseReroute(graph,*wireAnchor);
+    const auto anchorType=wireAnchor?(editor.wireOutput?definition(wireAnchor->kind).outputs[editor.wirePort].type:definition(wireAnchor->kind).inputs[editor.wirePort].type):ValueType::Float;
+    const float magneticRadius=std::clamp(22.0f*std::sqrt(graph.zoom),18.0f,28.0f);
     for (std::size_t nodeIndex=0;nodeIndex<graph.nodes.size();++nodeIndex)
     {
         const auto& node=graph.nodes[nodeIndex];
@@ -3789,6 +4091,14 @@ void canvas(Graph& graph, int index)
                     nearestPortDistance=portDistance;nearestPortNode=node.id;
                     nearestPort=static_cast<int>(pin);nearestPortOutput=side!=0;
                 }
+                if(wireAnchor&&node.id!=wireAnchor->id&&(side!=0)!=editor.wireOutput)
+                {
+                    const auto target=reroute(node.kind)?rerouteCenter(graph,origin,node):pos;
+                    const float distance=distanceSquared(target,io.MousePos);
+                    if(hovered&&distance<magneticRadius*magneticRadius&&distance<magneticDistance&&
+                        (looseAnchor||looseReroute(graph,node)||(editor.wireOutput?canConnectTypes(anchorType,pins[pin].type):canConnectTypes(pins[pin].type,anchorType))))
+                    {magneticPort={node.id,static_cast<int>(pin),side!=0};magneticDistance=distance;}
+                }
                 const bool connected=(geometry.connections[nodeIndex][side]&(std::uint64_t{1}<<pin))!=0;
                 if(!isReroute||handleFade>0.004f)
                 {
@@ -3851,9 +4161,9 @@ void canvas(Graph& graph, int index)
         {
             const auto panel=previewRect(graph,origin,node);draw->AddRectFilled(panel.Min,panel.Max,IM_COL32(17,19,23,255),4*graph.zoom);
             draw->PushClipRect(panel.Min,panel.Max,true);
-            const bool requested=std::find(previewNodes.begin(),previewNodes.end(),node.id)!=previewNodes.end();
+            const bool requested=std::find(previewNodes.begin(),previewNodes.end(),previewKey(index,node.id))!=previewNodes.end();
             const auto image=requested&&value?value->preview:Preview{};
-            const auto texture=NodePreview::texture(node.id,image,g_pd3dDevice,g_pd3dDeviceContext);
+            const auto texture=NodePreview::texture(previewKey(index,node.id),image,g_pd3dDevice,g_pd3dDeviceContext);
             if(texture)
             {
                 const float scale=std::min(panel.GetWidth()/image->width,panel.GetHeight()/image->height);
@@ -3894,18 +4204,6 @@ void canvas(Graph& graph, int index)
         }
         if(selected&&!isReroute&&!node.collapsed)
         {
-            const float half=std::clamp(3*graph.zoom,2.0f,4.0f);
-            const ImVec2 handles[]={p,ImVec2((p.x+q.x)*0.5f,p.y),ImVec2(q.x,p.y),ImVec2(q.x,(p.y+q.y)*0.5f),
-                q,ImVec2((p.x+q.x)*0.5f,q.y),ImVec2(p.x,q.y),ImVec2(p.x,(p.y+q.y)*0.5f)};
-            for(const auto handle:handles)
-            {
-                bool socket=false;
-                for(int side=0;side<2;++side)for(std::size_t pin=0;pin<(side?def.outputs:def.inputs).size();++pin)
-                    if(distanceSquared(handle,portPoint(graph,origin,node,side!=0,static_cast<int>(pin)))<std::pow(4*graph.zoom+half+1,2))socket=true;
-                if(socket)continue;
-                draw->AddRectFilled(add(handle,ImVec2(-half,-half)),add(handle,ImVec2(half,half)),IM_COL32(27,36,43,255),1);
-                draw->AddRect(add(handle,ImVec2(-half,-half)),add(handle,ImVec2(half,half)),Cyan,1);
-            }
             if(hovered&&!leftGesture&&editor.panButton<0&&!editor.rightGesture)
                 if(const int edges=nodeResizeHit(graph,node,origin,io.MousePos)){hoverResizeNode=node.id;hoverResizeEdges=edges;}
         }
@@ -3925,6 +4223,8 @@ void canvas(Graph& graph, int index)
     // later card body must not overwrite the nearest visible port.
     // The visible chevron wins over a neighboring pin's expanded hit halo.
     // Exact port centers lie outside the chevron rectangle and stay connectable.
+    if(magneticPort.node)
+    {nearestPortNode=magneticPort.node;nearestPort=magneticPort.port;nearestPortOutput=magneticPort.output;hoverCollapse=0;}
     if(nearestPortNode&&!hoverCollapse)
     {
         hoverNode=nearestPortNode;hoverPort=nearestPort;hoverOutput=nearestPortOutput;hoverCollapse=0;
@@ -4106,7 +4406,8 @@ void canvas(Graph& graph, int index)
                 else
                 {
                     editor.dragGroup=group->id;
-                    for (int id:group->nodes) if (const auto* node=findNode(graph,id)) editor.dragPositions.push_back({id,node->x,node->y});
+                    for(const auto& node:graph.nodes)if(nodeInGroupTree(graph,*group,node))editor.dragPositions.push_back({node.id,node.x,node.y});
+                    for(const auto& child:graph.groups)if(groupDescendant(*group,child))editor.dragGroupPositions.push_back({child.id,child.x,child.y});
                     for(const auto& tie:graph.ties)if(tieInGroup(graph,tie.id,*group))editor.dragTiePositions.push_back({tie.id,tie.x,tie.y,tie.angle});
                 }
                 beginPointerMove(index);
@@ -4198,6 +4499,9 @@ void canvas(Graph& graph, int index)
     }
     if (editor.wireNode)
     {
+        auto& feedback=editor.wireFeedback;
+        if(feedback.graph!=index||feedback.anchor!=editor.wireNode||feedback.anchorPort!=editor.wirePort||feedback.anchorOutput!=editor.wireOutput)
+        {feedback={};feedback.graph=index;feedback.anchor=editor.wireNode;feedback.anchorPort=editor.wirePort;feedback.anchorOutput=editor.wireOutput;feedback.endpoint=io.MousePos;}
         const auto focus=editor.portFocus[index];const int targetNode=editor.keyboardWire?focus.node:hoverNode;
         const int targetPort=editor.keyboardWire?focus.port:hoverPort;const bool targetOutput=editor.keyboardWire?focus.output:hoverOutput;
         std::string connectionError;
@@ -4206,7 +4510,10 @@ void canvas(Graph& graph, int index)
         if(targetNode&&targetPort>=0&&targetOutput!=editor.wireOutput)
         {
             candidate=editor.wireOutput?Link{editor.wireNode,editor.wirePort,targetNode,targetPort}:Link{targetNode,targetPort,editor.wireNode,editor.wirePort};
-            compatible=canConnectReroutes(graph,candidate,connectionError);
+            const auto key=linkKey(candidate);const auto revision=service().revision();
+            if(!feedback.checked||feedback.checkedLink!=key||feedback.revision!=revision)
+            {feedback.checked=true;feedback.checkedLink=key;feedback.revision=revision;feedback.error.clear();feedback.valid=canConnectReroutes(graph,candidate,feedback.error);++feedback.checks;}
+            compatible=feedback.valid;connectionError=feedback.error;
         }
         if (const Node* node=findNode(graph,editor.wireNode))
         {
@@ -4215,8 +4522,21 @@ void canvas(Graph& graph, int index)
             if(compatible)
             {
                 const auto* target=findNode(graph,targetNode);
-                endpoint=reroute(target->kind)?rerouteCenter(graph,origin,*target):portPoint(graph,origin,*target,targetOutput,targetPort);
+                const auto point=reroute(target->kind)?rerouteCenter(graph,origin,*target):portPoint(graph,origin,*target,targetOutput,targetPort);
+                if(feedback.target.node!=targetNode||feedback.target.port!=targetPort||feedback.target.output!=targetOutput)feedback.amount=0;
+                feedback.target={targetNode,targetPort,targetOutput};
+                feedback.amount=1-(1-feedback.amount)*std::exp(-22*std::clamp(io.DeltaTime,0.0f,1.0f/15));
+                endpoint=add(io.MousePos,multiply(ImVec2(point.x-io.MousePos.x,point.y-io.MousePos.y),feedback.amount));
+                const auto& pin=targetOutput?definition(target->kind).outputs[targetPort]:definition(target->kind).inputs[targetPort];
+                const auto color=pinColor(pin.type);const auto rgb=color&0x00ffffff;
+                const float base=std::max(3.0f,4*graph.zoom),radius=base+(std::max(7.0f,6*graph.zoom)-base)*feedback.amount;
+                draw->AddCircleFilled(point,radius+5,rgb|IM_COL32(0,0,0,static_cast<int>(38*feedback.amount)),16);
+                draw->AddCircleFilled(point,radius+1,IM_COL32(27,29,33,255),16);
+                draw->AddCircleFilled(point,radius,color,16);
+                draw->AddCircle(point,radius+3,rgb|IM_COL32(0,0,0,static_cast<int>(220*feedback.amount)),16,1.5f);
             }
+            else{feedback.target={};feedback.amount=0;}
+            feedback.endpoint=endpoint;
             const auto& anchorPins=editor.wireOutput?definition(node->kind).outputs:definition(node->kind).inputs;
             auto type=anchorPins[editor.wirePort].type;
             if(compatible)type=connectionType(graph,candidate);
@@ -4242,6 +4562,7 @@ void canvas(Graph& graph, int index)
                 ImGui::OpenPopup("node_catalog");
             }
             editor.wireNode=0;
+            feedback={};
         }
     }
     if (ImGui::IsMouseReleased(ImGuiMouseButton_Left))
@@ -4290,7 +4611,7 @@ void drawEditor(int index)
     if (!editor.initialized)
     {
         editor.draft=service().workspace(); editor.initialized=true;editor.observedRevision=service().revision();
-        for (int i=0;i<static_cast<int>(GraphCount);++i)
+        for (int i=0;i<static_cast<int>(editor.draft.graphs.size());++i)
         {
             auto& graph = editor.draft.graphs[i];
             snapLayout(graph);
@@ -4316,17 +4637,27 @@ void drawEditor(int index)
     editor.toolbarItemCount=0;
     const bool hasSelection=!editor.selection[index].empty();
     const auto* selectedGroup=findGroup(graph,editor.selectedGroup[index]);
-    const bool canCopySelection=hasSelection||(selectedGroup&&!selectedGroup->nodes.empty());
+    const bool canCopySelection=hasSelection||(selectedGroup&&std::any_of(graph.nodes.begin(),graph.nodes.end(),[&](const Node& node){return nodeInGroupTree(graph,*selectedGroup,node);}));
     bool bypassable=false;
     for(const auto& node:graph.nodes)if(isSelected(index,node.id)&&canBypass(node.kind))bypassable=true;
     ImGui::BeginDisabled(editor.keyboardMove);
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,ImVec2(4,5));
+    const float toolbarWidth=ImGui::GetContentRegionAvail().x;
+    const bool fullToolbar=toolbarWidth>=650,compactToolbar=toolbarWidth>=400;
+    if(toolbarWidth>=212)
+    {
     if (toolButton("add","Add node",ToolIcon::Add))
     { editor.catalogPosition=ImVec2((80-graph.panX)/graph.zoom,(60-graph.panY)/graph.zoom);editor.catalogWireNode=0;editor.catalogFocus=true;editor.search[0]=0;ImGui::OpenPopup("node_catalog"); }
     ImGui::SameLine();
+    }
+    if(compactToolbar)
+    {
     if(toolButton("inspect","Node information (Enter / double-click node)",ToolIcon::Inspect,true,editor.inspectorOpen))
     {if(editor.inspectorOpen)editor.inspectorOpen=false;else openProperties(index);}
     ImGui::SameLine();
+    }
+    if(fullToolbar)
+    {
     if(toolButton("group","Group selected nodes (Ctrl+G)",ToolIcon::Group,hasSelection))groupSelection(graph,index);
     ImGui::SameLine();
     if(toolButton("tie","Tie wires: drag across connections (Z + drag)",ToolIcon::Tie,true,editor.tieMode))editor.tieMode=!editor.tieMode;
@@ -4334,30 +4665,66 @@ void drawEditor(int index)
     if(toolButton("bypass","Toggle bypass (Ctrl+B)",ToolIcon::Bypass,bypassable))bypassSelection(graph,index);
     ImGui::SameLine();
     if(toolButton("collapse","Collapse / expand selected nodes (Space)",ToolIcon::Collapse,hasSelection))collapseSelection(graph,index);
+    }
+    if(compactToolbar)
+    {
+    if(fullToolbar)
     toolDivider();
     if(toolButton("undo","Undo (Ctrl+Z)",ToolIcon::Undo,!editor.undo.empty()))history(false);
     ImGui::SameLine();
     if(toolButton("redo","Redo (Ctrl+Y / Ctrl+Shift+Z)",ToolIcon::Redo,!editor.redo.empty()))history(true);
     toolDivider();
+    if(fullToolbar)
+    {
     if(toolButton("arrange","Arrange graph by connections (Alt+L)\nSpace expanded cards, fit groups and keep settings. Undo restores positions.",ToolIcon::Arrange,!graph.nodes.empty()))arrangeGraph(graph,index);
     ImGui::SameLine();
+    }
     if(toolButton("fit","Fit graph",ToolIcon::Fit)){editor.fit[index]=editor.autoFit[index]=true;}
     ImGui::SameLine();
-    if(toolButton("expand","Expand editor and fit graph",ToolIcon::Expand)){Overlay_ExpandForNodes();editor.fit[index]=editor.autoFit[index]=true;}
+    }
+    if(fullToolbar)
+    {
     toolDivider();
     if(toolButton("files","Import / export all graphs",ToolIcon::Files))ImGui::OpenPopup("graph_files");
     ImGui::SameLine();
     if(toolButton("restore","Restore this starter graph",ToolIcon::Restore))ImGui::OpenPopup("restore_graph");
     ImGui::SameLine();
+    }
     if(toolButton("tools","Selection tools and keyboard shortcuts",ToolIcon::Tools))ImGui::OpenPopup("graph_tools");
     ImGui::SameLine();
     const float available=ImGui::GetContentRegionAvail().x;
-    if(available>=32)ImGui::SetCursorPosX(ImGui::GetCursorPosX()+available-32);
+    if(available>=140)ImGui::SetCursorPosX(ImGui::GetCursorPosX()+available-140);
     if(toolButton("help","Keyboard and mouse reference (?)\nAll edits apply immediately and save automatically.",ToolIcon::Help))ImGui::OpenPopup("graph_shortcuts");
+    ImGui::SameLine();
+    if(toolButton("hide","Hide overlay\nUse the overlay hotkey to show it again.",ToolIcon::Hide))Overlay_Hide();
+    ImGui::SameLine();
+    const auto windowMode=Overlay_GetWindowMode();
+    const bool maximized=windowMode==OverlayWindowGeometry::Mode::Maximized;
+    if(toolButton("maximize",maximized?"Restore window size":"Maximize window (keep taskbar visible)",maximized?ToolIcon::Windowed:ToolIcon::Maximize,true,maximized))Overlay_ToggleMaximized();
+    ImGui::SameLine();
+    const bool fullscreen=windowMode==OverlayWindowGeometry::Mode::Fullscreen;
+    if(toolButton("fullscreen",fullscreen?"Exit fullscreen (F11)":"Fullscreen (F11)",fullscreen?ToolIcon::ExitFullscreen:ToolIcon::Fullscreen,true,fullscreen))Overlay_ToggleFullscreen();
     ImGui::PopStyleVar();
     ImGui::EndDisabled();
+    const char* toolbarPopup=nullptr;
     if(beginEditorPopup("graph_tools"))
     {
+        if(!fullToolbar)
+        {
+            if(toolbarWidth<212&&ImGui::MenuItem("Add node","Shift+A"))
+            {editor.catalogPosition=ImVec2((80-graph.panX)/graph.zoom,(60-graph.panY)/graph.zoom);editor.catalogWireNode=0;editor.catalogFocus=true;editor.search[0]=0;toolbarPopup="node_catalog";}
+            if(!compactToolbar)
+            {
+                if(ImGui::MenuItem("Node information","Enter")){if(editor.inspectorOpen)editor.inspectorOpen=false;else openProperties(index);}
+                if(ImGui::MenuItem("Undo","Ctrl+Z",false,!editor.undo.empty()))history(false);
+                if(ImGui::MenuItem("Redo","Ctrl+Y",false,!editor.redo.empty()))history(true);
+                if(ImGui::MenuItem("Fit graph"))editor.fit[index]=editor.autoFit[index]=true;
+            }
+            if(ImGui::MenuItem("Tie wires","Z + drag",editor.tieMode))editor.tieMode=!editor.tieMode;
+            if(ImGui::MenuItem("Import / export all graphs"))toolbarPopup="graph_files";
+            if(ImGui::MenuItem("Restore this starter graph"))toolbarPopup="restore_graph";
+            ImGui::Separator();
+        }
         if(ImGui::MenuItem("Select all","Ctrl+A"))selectAll(graph,index);
         if(ImGui::MenuItem("Copy selected","Ctrl+C",false,canCopySelection))copySelection(graph,index);
         if(ImGui::MenuItem("Cut selected","Ctrl+X",false,canCopySelection))cutSelection(graph,index);
@@ -4379,6 +4746,7 @@ void drawEditor(int index)
         if(ImGui::MenuItem("Delete selection","Delete",false,hasSelection||!editor.tieSelection[index].empty()||editor.selectedGroup[index]!=0))deleteSelection(graph,index);
         ImGui::EndPopup();
     }
+    if(toolbarPopup)ImGui::OpenPopup(toolbarPopup);
     if (beginEditorPopup("graph_files"))
     {
         ImGui::TextDisabled("All graphs, layout and values");
@@ -4391,7 +4759,7 @@ void drawEditor(int index)
         ImGui::TextUnformatted("Restore the starter graph for this tab?");
         if (ImGui::Button("Restore"))
         {
-            remember();graph=defaults().graphs[index];editor.fit[index]=editor.autoFit[index]=true;editor.loadFailed=false;
+            remember();{auto starter=defaults().graphs[static_cast<int>(graph.kind)];starter.workflow=graph.workflow;starter.workflowName=graph.workflowName;starter.workflowIcon=graph.workflowIcon;starter.pageName=graph.pageName;starter.active=graph.active;starter.enabled=graph.enabled;graph=std::move(starter);}editor.fit[index]=editor.autoFit[index]=true;editor.loadFailed=false;
             clearSelection(index);editor.selectedGroup[index]=0;cancelGestures();edited();ImGui::CloseCurrentPopup();
         }
         ImGui::EndPopup();
@@ -4488,9 +4856,11 @@ void NodeEditor_Load()
     editor.dirty=false;editor.error=false;editor.saveFailed=false;editor.message.clear();
     auto workspace=NodeGraph::service().workspace();
     const bool legacy=workspace.sourceVersion<NodeGraph::CurrentFormatVersion;
+    const bool legacyProfiles=workspace.sourceVersion<14;
     const bool legacyLayout=workspace.sourceVersion<10;
     NodeGraph::migrateLegacySettings(workspace,config,!exists);
-    bool normalized=NodeGraph::initializeMissingModels(workspace,config.ai_model,
+    bool normalized=legacyProfiles&&NodeGraph::importLegacyCalibrations(workspace,config);
+    normalized|=NodeGraph::initializeMissingModels(workspace,config.ai_model,
 #ifdef USE_CUDA
         "TRT"
 #else
@@ -4506,6 +4876,13 @@ void NodeEditor_Load()
     }
 }
 void NodeEditor_SetPreview(bool preview) {editor.preview=preview;}
+void NodeEditor_FocusNode(int graph,int id)
+{
+    if(graph<0||graph>=static_cast<int>(service().workspace().graphs.size()))return;
+    NodeEditor_EndInteraction(true);editor.draft=service().workspace();editor.initialized=true;editor.observedRevision=service().revision();
+    if(!findNode(editor.draft.graphs[graph],id))return;
+    editor.activeGraph=graph;selectOne(graph,id);editor.fit[graph]=editor.autoFit[graph]=false;editor.focusSelection[graph]=true;
+}
 bool NodeEditor_ToolbarContainsPoint(float x,float y)
 {
     for(std::size_t i=0;i<editor.toolbarItemCount;++i)
@@ -4533,7 +4910,7 @@ void NodeEditor_PrepareFrame()
 }
 void NodeEditor_PreserveViewport()
 {
-    for(std::size_t graph=0;graph<GraphCount;++graph)
+    for(std::size_t graph=0;graph<MaxGraphs;++graph)
         if(editor.canvasSize[graph].x>0&&editor.canvasSize[graph].y>0)editor.autoFit[graph]=false;
 }
 void NodeEditor_EndInteraction(bool preserveViewport)
@@ -4542,9 +4919,9 @@ void NodeEditor_EndInteraction(bool preserveViewport)
     if(editor.resizeNode)finishNodeResize(false);
     if(editor.bendGraph>=0)finishWireBend(false);
     if(editor.pointerMove)finishPointerMove(false);
-    if(editor.keyboardMove&&editor.activeGraph>=0&&editor.activeGraph<static_cast<int>(GraphCount))finishKeyboardMove(editor.activeGraph,false);
+    if(editor.keyboardMove&&editor.activeGraph>=0&&editor.activeGraph<static_cast<int>(editor.draft.graphs.size()))finishKeyboardMove(editor.activeGraph,false);
     cancelGestures();
-    for(std::size_t graph=0;graph<GraphCount;++graph)invalidateActivity(graph);
+    for(std::size_t graph=0;graph<MaxGraphs;++graph)invalidateActivity(graph);
     if(preserveViewport)NodeEditor_PreserveViewport();
     editor.drawnSignalPulses=0;editor.telemetryAt=-1;
 }
@@ -4563,6 +4940,7 @@ void NodeEditor_RunFileActions()
     const int action=editor.fileAction;
     if (!action) return;
     editor.fileAction=0;
+    if(action==3&&(editor.fileGraph<0||editor.fileGraph>=static_cast<int>(editor.draft.graphs.size())))return;
     wchar_t filename[32768]=L"node_graphs.sngraph";
     if(action==3)filename[0]=L'\0';
     OPENFILENAMEW dialog{};
@@ -4613,7 +4991,7 @@ void NodeEditor_RunFileActions()
         if(!validate(imported,error)){editor.message=error;editor.error=true;return;}
         editor.loadFailed=false;
         remember(); editor.draft=std::move(imported); edited();
-        for (int i=0;i<static_cast<int>(GraphCount);++i) {editor.fit[i]=editor.autoFit[i]=true;clearSelection(i);editor.selectedGroup[i]=0;}
+        for (int i=0;i<static_cast<int>(MaxGraphs);++i) {editor.fit[i]=editor.autoFit[i]=true;clearSelection(i);editor.selectedGroup[i]=0;}
         cancelGestures();
         if(!editor.error)editor.message=legacy?"Graphs imported. Legacy parameters were copied from the current configuration.":"Graphs imported.";
     }
@@ -4643,7 +5021,163 @@ void NodeEditor_RunFileActions()
         editor.message="All graphs exported."; editor.error=false;
     }
 }
-void draw_node_aim() { drawEditor(0); }
-void draw_node_auto_shoot() { drawEditor(1); }
-void draw_node_recoil() { drawEditor(2); }
-void draw_node_vision() { drawEditor(3); }
+namespace
+{
+bool commitWorkflowEdit(Workspace workspace,std::string& error)
+{
+    if(editor.loadFailed){error="Import a valid workspace before editing workflows.";return false;}
+    if(!validate(workspace,error))return false;
+    NodeEditor_EndInteraction(true);const auto before=service().workspace();
+    if(!service().publish(workspace,error))return false;
+    rememberSnapshot(before);editor.draft=std::move(workspace);editor.initialized=true;editor.observedRevision=service().revision();edited();return true;
+}
+std::string cleanWorkflowName(std::string name)
+{
+    const auto begin=name.find_first_not_of(" \t\r\n");if(begin==std::string::npos)return {};
+    return name.substr(begin,name.find_last_not_of(" \t\r\n")-begin+1);
+}
+}
+void NodeEditor_RequestReload(const std::string& applicationWarning)
+{
+    std::lock_guard<std::mutex> lock(pendingGraphMutex);
+    if(pendingGraphEdits.size()<64)pendingGraphEdits.push_back({true,0,0,false,applicationWarning});
+}
+void NodeEditor_RequestTuning(int offsetDirection,int recoilDirection,bool head)
+{
+    std::lock_guard<std::mutex> lock(pendingGraphMutex);
+    if(pendingGraphEdits.size()<64)pendingGraphEdits.push_back({false,std::clamp(offsetDirection,-1,1),std::clamp(recoilDirection,-1,1),head});
+}
+void NodeEditor_ProcessPendingActions()
+{
+    std::vector<PendingGraphEdit> pending;
+    {std::lock_guard<std::mutex> lock(pendingGraphMutex);pending.swap(pendingGraphEdits);}
+    for(const auto& command:pending)
+    {
+        std::string error;
+        if(command.reload)
+        {
+            NodeEditor_EndInteraction(true);
+            Workspace imported;std::ifstream file(GraphFile,std::ios::binary|std::ios::ate);std::string data;
+            if(!file||file.tellg()<0||file.tellg()>static_cast<std::streamoff>(MaxWorkspaceBytes))error="Cannot read node_graphs.ini (maximum 4 MiB).";
+            else
+            {
+                data.resize(static_cast<std::size_t>(file.tellg()));file.seekg(0);
+                if(!data.empty()&&!file.read(data.data(),static_cast<std::streamsize>(data.size())))error="Could not read node_graphs.ini.";
+                else if(deserialize(data,imported,error))
+                {
+                    const bool legacy=imported.sourceVersion<CurrentFormatVersion;bool normalized=false;
+                    migrateLegacySettings(imported,config);
+                    for(auto& graph:imported.graphs)normalized|=normalizeLayout(graph,imported.sourceVersion<10);
+                    editor.loadFailed=false;
+                    if(commitWorkflowEdit(std::move(imported),error))
+                    {
+                        editor.loadError.clear();editor.dirty=legacy||normalized;editor.activeGraph=-1;
+                        for(std::size_t i=0;i<MaxGraphs;++i){clearSelection(static_cast<int>(i));editor.selectedGroup[i]=0;editor.canvasRoutes[i]=CanvasRoutes{};editor.fit[i]=editor.autoFit[i]=true;}
+                        editor.message=command.applicationWarning.empty()?"Workflows reloaded.":"Workflows reloaded. "+command.applicationWarning;editor.error=!command.applicationWarning.empty();
+                    }
+                }
+            }
+            if(!error.empty()){editor.error=true;editor.message=error;editor.loadError=error+" The last valid workspace is still running. Autosave is paused until a valid reload/import.";editor.loadFailed=true;editor.dirty=false;}
+        }
+        else
+        {
+            if(editor.loadFailed)continue;
+            NodeEditor_EndInteraction(true);auto workspace=service().workspace();
+            if(adjustActiveDefaults(workspace,command.offset,command.recoil,command.head)&&!commitWorkflowEdit(std::move(workspace),error))
+            {editor.error=true;editor.message=error;}
+        }
+    }
+    const auto now=std::chrono::steady_clock::now();
+    if(editor.dirty&&now-editor.editedAt>=std::chrono::milliseconds(350)&&(!editor.saveFailed||now-editor.saveAttemptAt>=std::chrono::seconds(2)))NodeEditor_Flush();
+}
+int NodeEditor_CreateWorkflow(const std::string& title,int kind,std::string& error,int icon,bool filledTemplate)
+{
+    NodeEditor_EndInteraction(true);auto workspace=service().workspace();const auto name=cleanWorkflowName(title);
+    if(name.empty()||kind<0||kind>3){error="Enter a workflow name and type.";return -1;}
+    if(workspace.graphs.size()>=MaxGraphs){error="The workspace already has "+std::to_string(MaxGraphs)+" workflows.";return -1;}
+    int id=5;std::vector<int> ids;
+    for(std::size_t i=0;i<workspace.graphs.size();++i)
+    {
+        const int existing=workflowId(workspace.graphs[i],i);id=std::max(id,existing+1);
+        if(std::find(ids.begin(),ids.end(),existing)==ids.end())ids.push_back(existing);
+        if(workflowTitle(workspace.graphs[i])==name){error="A workflow with this name already exists.";return -1;}
+    }
+    if(ids.size()>=MaxWorkflows){error="The workspace already has "+std::to_string(MaxWorkflows)+" workflows.";return -1;}
+    Workspace templates;if(filledTemplate)templates=defaults();
+    Graph graph=filledTemplate?templates.graphs[kind]:Graph{};graph.kind=static_cast<GraphKind>(kind);graph.workflow=id;graph.workflowName=name;graph.workflowIcon=icon;graph.pageName="Default";
+    if(filledTemplate&&graph.kind==GraphKind::Vision)
+    {
+        const bool existingCapture=std::any_of(workspace.graphs.begin(),workspace.graphs.end(),[](const Graph& page){
+            return page.active&&page.enabled&&std::any_of(page.nodes.begin(),page.nodes.end(),[](const Node& node){return node.kind==NodeKind::CaptureSource&&!node.disabled&&!node.bypassed;});
+        });
+        if(existingCapture)for(auto& node:graph.nodes)if(node.kind==NodeKind::CaptureSource)
+            node=defaultNode(NodeKind::CurrentFrame,node.id,node.x,node.y);
+        if(existingCapture)Layout::arrange(graph);
+    }
+    const bool sourceExists=std::any_of(workspace.graphs.begin(),workspace.graphs.end(),[](const Graph& other){
+        return std::any_of(other.nodes.begin(),other.nodes.end(),[](const Node& node){return node.kind==NodeKind::MouseProfile&&textParameter(node,"name")=="mouse";});
+    });
+    if(filledTemplate)
+    {
+        if(sourceExists)
+        {
+            std::vector<int> removed;
+            for(const auto& node:graph.nodes)if(node.kind==NodeKind::MouseProfile)removed.push_back(node.id);
+            graph.nodes.erase(std::remove_if(graph.nodes.begin(),graph.nodes.end(),[](const Node& node){return node.kind==NodeKind::MouseProfile;}),graph.nodes.end());
+            for(auto& group:graph.groups)for(int id:removed)group.nodes.erase(std::remove(group.nodes.begin(),group.nodes.end(),id),group.nodes.end());
+        }
+        else if(std::any_of(graph.nodes.begin(),graph.nodes.end(),[](const Node& node){return calibrationIdentifier(node.kind)&&node.kind!=NodeKind::MouseProfile;})&&
+            std::none_of(graph.nodes.begin(),graph.nodes.end(),[](const Node& node){return node.kind==NodeKind::MouseProfile;}))
+        {
+            int id=1;for(const auto& node:graph.nodes)id=std::max(id,node.id+1);
+            graph.nodes.push_back(defaultNode(NodeKind::MouseProfile,id));
+        }
+        Layout::arrange(graph);
+    }
+    graph.pageName.clear();
+    const int index=static_cast<int>(workspace.graphs.size());workspace.graphs.push_back(std::move(graph));
+    if(!commitWorkflowEdit(std::move(workspace),error))return -1;
+    clearSelection(index);editor.fit[index]=editor.autoFit[index]=true;return id;
+}
+bool NodeEditor_RenameWorkflow(int workflow,const std::string& title,std::string& error)
+{
+    const auto workspace=service().workspace();const int page=activePage(workspace,workflow);
+    if(page<0){error="Workflow not found.";return false;}
+    return NodeEditor_ConfigureWorkflow(workflow,title,workspace.graphs[page].workflowIcon,error);
+}
+bool NodeEditor_ConfigureWorkflow(int workflow,const std::string& title,int icon,std::string& error)
+{
+    auto workspace=service().workspace();const auto name=cleanWorkflowName(title);bool found=false;
+    if(name.empty()){error="Enter a workflow name.";return false;}
+    for(std::size_t i=0;i<workspace.graphs.size();++i)
+    {
+        if(workflowId(workspace.graphs[i],i)==workflow){workspace.graphs[i].workflowName=name;workspace.graphs[i].workflowIcon=icon;found=true;}
+        else if(workflowTitle(workspace.graphs[i])==name){error="A workflow with this name already exists.";return false;}
+    }
+    if(!found){error="Workflow not found.";return false;}return commitWorkflowEdit(std::move(workspace),error);
+}
+bool NodeEditor_RemoveWorkflow(int workflow,std::string& error)
+{
+    NodeEditor_EndInteraction(true);auto workspace=service().workspace();
+    if(activePage(workspace,workflow)<0){error="Workflow not found.";return false;}
+    for(std::size_t i=workspace.graphs.size();i-->0;)if(workflowId(workspace.graphs[i],i)==workflow)workspace.graphs.erase(workspace.graphs.begin()+i);
+    if(!commitWorkflowEdit(std::move(workspace),error))return false;
+    for(std::size_t i=0;i<MaxGraphs;++i){clearSelection(static_cast<int>(i));editor.canvasRoutes[i]=CanvasRoutes{};editor.focusSelection[i]=false;}
+    editor.activeGraph=-1;return true;
+}
+bool NodeEditor_SetWorkflowEnabled(int workflow,bool enabled,std::string& error)
+{
+    auto workspace=service().workspace();bool found=false;
+    for(std::size_t i=0;i<workspace.graphs.size();++i)if(workflowId(workspace.graphs[i],i)==workflow){workspace.graphs[i].enabled=enabled;found=true;}
+    if(!found){error="Workflow not found.";return false;}return commitWorkflowEdit(std::move(workspace),error);
+}
+void draw_node_workflow(int workflow)
+{
+    auto workspace=service().workspaceMetadata();int index=activePage(workspace,workflow);
+    if(index<0){ImGui::TextDisabled("Add a workflow with + in the sidebar.");if(!editor.undo.empty()&&ImGui::Button("Undo removal"))history(false);return;}
+    drawEditor(index);
+}
+void draw_node_aim() { draw_node_workflow(1); }
+void draw_node_auto_shoot() { draw_node_workflow(2); }
+void draw_node_recoil() { draw_node_workflow(3); }
+void draw_node_vision() { draw_node_workflow(4); }

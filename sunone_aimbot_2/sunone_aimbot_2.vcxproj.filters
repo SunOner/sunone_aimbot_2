@@ -4,6 +4,8 @@
     <ClCompile Include="scr\data_collector.cpp" />
     <ClCompile Include="scr\other_tools.cpp" />
     <ClCompile Include="capture\capture.cpp" />
+    <ClCompile Include="overlay\draw_system.cpp" />
+    <ClCompile Include="keyboard\graph_key_state.cpp" />
     <ClCompile Include="overlay\overlay.cpp" />
     <ClCompile Include="mouse\ghub.cpp" />
     <ClCompile Include="mouse\hid.c" />
@@ -32,10 +34,9 @@
     <ClCompile Include="capture\duplication_api_capture.cpp" />
     <ClCompile Include="capture\virtual_camera.cpp" />
     <ClCompile Include="sunone_aimbot_2.cpp" />
-    <ClCompile Include="overlay\draw_capture.cpp" />
-    <ClCompile Include="overlay\draw_target.cpp" />
-    <ClCompile Include="overlay\draw_mouse.cpp" />
-    <ClCompile Include="overlay\draw_ai.cpp" />
+    <ClCompile Include="overlay\draw_model_export.cpp" />
+    <ClCompile Include="overlay\draw_input_device.cpp" />
+    <ClCompile Include="overlay\source_choices.cpp" />
     <ClCompile Include="overlay\draw_buttons.cpp" />
     <ClCompile Include="overlay\draw_overlay.cpp" />
     <ClCompile Include="overlay\draw_debug.cpp" />
@@ -45,7 +46,6 @@
     <ClCompile Include="mouse\kmbox_net\kmboxNet.cpp" />
     <ClCompile Include="mouse\kmboxNetConnection.cpp" />
     <ClCompile Include="overlay\Game_overlay.cpp" />
-    <ClCompile Include="overlay\draw_game_overlay.cpp" />
     <ClCompile Include="overlay\config_dirty.cpp" />
     <ClCompile Include="nodes\node_graph.cpp" />
     <ClCompile Include="nodes\preview_image.cpp" />
@@ -66,7 +66,6 @@
     <ClCompile Include="depth\depth_anything_trt.cpp" />
     <ClCompile Include="depth\depth_mask.cpp" />
     <ClCompile Include="depth\depth_utils.cpp" />
-    <ClCompile Include="overlay\draw_depth.cpp" />
     <ClCompile Include="runtime\thread_loops_shared.cpp" />
     <ClCompile Include="runtime\mouse_thread_loop.cpp" />
     <ClCompile Include="runtime\game_overlay_loop.cpp" />
@@ -82,7 +81,6 @@
   <ItemGroup>
     <ClInclude Include="scr\data_collector.h" />
     <ClInclude Include="include\other_tools.h" />
-    <ClInclude Include="include\memory_images.h" />
     <ClInclude Include="capture\capture.h" />
     <ClInclude Include="overlay\overlay.h" />
     <ClInclude Include="overlay\window_geometry.h" />
@@ -125,6 +123,9 @@
     <ClInclude Include="mouse\kmboxNetConnection.h" />
     <ClInclude Include="overlay\Game_overlay.h" />
     <ClInclude Include="overlay\config_dirty.h" />
+    <ClInclude Include="overlay\export_job.h" />
+    <ClInclude Include="overlay\source_choices.h" />
+    <ClInclude Include="keyboard\graph_key_state.h" />
     <ClInclude Include="nodes\node_graph.h" />
     <ClInclude Include="nodes\preview_image.h" />
     <ClInclude Include="overlay\node_preview.h" />

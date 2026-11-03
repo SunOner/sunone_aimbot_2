@@ -77,7 +77,6 @@ std::atomic<bool> capture_borders_changed(false);
 std::atomic<bool> capture_fps_changed(false);
 std::atomic<bool> capture_window_changed(false);
 std::atomic<bool> detector_model_changed(false);
-std::atomic<bool> show_window_changed(false);
 std::atomic<bool> input_method_changed(false);
 
 std::atomic<bool> zooming(false);
@@ -340,15 +339,7 @@ int main(int argc, char** argv)
 
         createInputDevices();
 
-        MouseThread mouseThread(
-            config.detection_resolution,
-            config.fovX,
-            config.fovY,
-            config.minSpeedMultiplier,
-            config.maxSpeedMultiplier,
-            config.predictionInterval,
-            activeMouseInputOwner.get()
-        );
+        MouseThread mouseThread(config.detection_resolution,activeMouseInputOwner.get());
 
         globalMouseThread = &mouseThread;
         assignInputDevices();

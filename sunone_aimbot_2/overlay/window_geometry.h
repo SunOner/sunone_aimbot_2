@@ -44,4 +44,34 @@ inline Rect fit(Rect desired, Rect work, unsigned dpi, bool center = false)
         std::clamp(desired.y, bounds.available.y, bounds.available.y + remainingY);
     return desired;
 }
+
+enum class Mode { Windowed, Maximized, Fullscreen };
+
+struct Presentation
+{
+    Mode mode = Mode::Windowed;
+    Mode beforeFullscreen = Mode::Windowed;
+    Rect restored{};
+
+    void change(Mode next, Rect current)
+    {
+        if (mode == Mode::Windowed && next != Mode::Windowed) restored = current;
+        mode = next;
+    }
+    void toggleMaximized(Rect current)
+    {
+        change(mode == Mode::Maximized ? Mode::Windowed : Mode::Maximized, current);
+    }
+    void toggleFullscreen(Rect current)
+    {
+        if (mode == Mode::Fullscreen) change(beforeFullscreen, current);
+        else { beforeFullscreen = mode; change(Mode::Fullscreen, current); }
+    }
+    Rect bounds(Rect work, Rect monitor, unsigned dpi) const
+    {
+        if (mode == Mode::Maximized) return work;
+        if (mode == Mode::Fullscreen) return monitor;
+        return fit(restored, work, dpi);
+    }
+};
 }

@@ -113,10 +113,10 @@ void draw_buttons()
         drawBindingRowsAndMarkDirty("Zoom", config.button_zoom);
         drawBindingRowsAndMarkDirty("Exit", config.button_exit);
         drawBindingRowsAndMarkDirty("Pause", config.button_pause);
-        drawBindingRowsAndMarkDirty("Reload Config", config.button_reload_config);
+        drawBindingRowsAndMarkDirty("Reload settings and graphs", config.button_reload_config);
         drawBindingRowsAndMarkDirty("Open Overlay", config.button_open_overlay);
 
-        const auto row = OverlayUI::BeginSettingRow("Arrow Key Options");
+        const auto row = OverlayUI::BeginSettingRow("Arrow tuning of active pages");
         if (ImGui::Checkbox("##value", &config.enable_arrows_settings))
             OverlayConfig_MarkDirty();
         OverlayUI::EndSettingRow(row);

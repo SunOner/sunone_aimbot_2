@@ -38,7 +38,6 @@ extern cv::Mat latestFrame;
 extern std::mutex frameMutex;
 extern std::condition_variable frameCV;
 extern std::atomic<bool> shouldExit;
-extern std::atomic<bool> show_window_changed;
 
 class IScreenCapture
 {

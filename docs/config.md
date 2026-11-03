@@ -51,7 +51,6 @@ capture_use_cuda = true
 | `monitor_idx` | `0` | Monitor index for monitor capture. |
 | `circle_fov_enabled` | `true` | Enables the current circular FOV limiter. |
 | `circle_fov_radius_percent` | `100` | Circle FOV radius as a percent of the processed capture area. Clamped to `1..100`. |
-| `circle_fov_show_preview` | `true` | Shows Circle FOV in the GUI preview when available. |
 | `capture_borders` | `true` | Include window borders when applicable. |
 | `capture_cursor` | `true` | Include cursor when applicable. |
 | `virtual_camera_name` | `None` | Camera name for virtual camera capture. |
@@ -81,7 +80,6 @@ See [FFmpeg sender examples](guides/udp-capture.md) and [Circle FOV setup](guide
 | `head_y_offset` | `0.05` | Vertical target offset for head aim. |
 | `auto_aim` | `false` | Enables automatic aim behavior when supported by current controls and buttons. |
 | `tracker_enabled` | `true` | Enables the simple persistent target tracker. When disabled, aiming falls back to nearest-target selection each detection frame. |
-| `tracker_overlay_table_enabled` | `true` | Shows the target-track information table in the Tracker overlay tab. |
 
 ## Mouse Movement and Tracking
 
@@ -247,7 +245,7 @@ CUDA capture can still create CPU copies when preview, debugging, data collectio
 | `button_zoom` | `RightMouseButton` | Zoom/scope button list. |
 | `button_exit` | `F2` | Exit hotkey. |
 | `button_pause` | `F3` | Pause hotkey. |
-| `button_reload_config` | `F4` | Reload config hotkey. |
+| `button_reload_config` | `F4` | Reload application settings and workflow graphs. |
 | `button_open_overlay` | `Home` | Open overlay hotkey. |
 | `enable_arrows_settings` | `false` | Enables arrow-key settings behavior. |
 
@@ -339,8 +337,6 @@ Data collection needs CPU-readable frames, so it can change capture performance 
 
 | Key | Default | Meaning |
 |---|---:|---|
-| `show_window` | `true` | Shows debug/preview window. This can require CPU frame copies. |
-| `show_fps` | `false` | Shows FPS counter. |
 | `screenshot_button` | `None` | Screenshot hotkey. |
 | `screenshot_delay` | `500` | Screenshot delay in milliseconds. |
 | `verbose` | `false` | Enables more logging. |
@@ -348,7 +344,7 @@ Data collection needs CPU-readable frames, so it can change capture performance 
 
 ## Game Profiles
 
-`active_game` selects a `[Games]` profile. Entry format: `name = sensitivity,yaw,pitch[,fovScaled,baseFOV]`.
+On migration, alternative `[Games]` settings become disabled Mouse calibration nodes. Edit calibration inputs directly in the graph; aiming and recoil share the same named source. Legacy entry format: `name = sensitivity,yaw,pitch[,fovScaled,baseFOV]`.
 
 ```ini
 active_game = UNIFIED

@@ -7,6 +7,7 @@ std::string legacyOutputFormat(const std::string& text)
     std::istringstream rows(text);std::ostringstream legacy;std::string line;
     while(std::getline(rows,line))
     {
+        if(line.rfind("PAGES ",0)==0||line.rfind("PAGE ",0)==0)continue;
         if(line.rfind("SUNONE_NODE_GRAPH ",0)==0)line="SUNONE_NODE_GRAPH 11";
         else if(line.rfind("LINK ",0)==0)for(int field=0;field<2;++field)line.resize(line.rfind(' '));
         legacy<<line<<'\n';

@@ -114,7 +114,6 @@ struct CaptureThreadConfig
     std::string udp_ip;
     int udp_port = 0;
     std::string backend;
-    bool show_window = false;
     bool verbose = false;
 #ifdef USE_CUDA
     bool capture_use_cuda = true;
@@ -142,7 +141,6 @@ CaptureThreadConfig SnapshotCaptureConfig()
     snapshot.udp_ip = config.udp_ip;
     snapshot.udp_port = config.udp_port;
     snapshot.backend = config.backend;
-    snapshot.show_window = config.show_window;
     snapshot.verbose = config.verbose;
 #ifdef USE_CUDA
     snapshot.capture_use_cuda = config.capture_use_cuda;
@@ -220,7 +218,6 @@ void MaybeLogCudaCaptureDiagnostics(CudaCaptureDiagnostics& diag, const CaptureT
         << " method=" << cfg.capture_method
         << " capture_fps=" << cfg.capture_fps
         << " use_cuda=" << (cfg.capture_use_cuda ? "true" : "false")
-        << " show_window=" << (cfg.show_window ? "true" : "false")
         << " circle_fov=" << (cfg.circle_fov_enabled ? "true" : "false")
         << " circle_fov_radius=" << cfg.circle_fov_radius_percent
         << " prefer_gpu=" << (diag.lastPreferGpu ? "true" : "false")
@@ -670,7 +667,9 @@ void captureThread(int CAPTURE_WIDTH, int CAPTURE_HEIGHT)
             }
 
 #ifdef USE_CUDA
-            const bool needCpuCopyFromGpu = currentCfg.show_window;
+            // Visible Preview/dataset nodes request CPU pixels lazily from the
+            // graph frame. The retired global preview must not download every frame.
+            const bool needCpuCopyFromGpu = false;
 #endif
 
             cv::Mat sourceCpu;

@@ -27,7 +27,6 @@ class TrtDetector
 public:
     TrtDetector();
     ~TrtDetector();
-    void initialize(const std::string& modelFile);
     void initialize(const std::string& modelFile,const NodeGraph::Node& settings,int width,int height=0);
     void processFrame(
         const cv::Mat& detection_frame,
@@ -39,7 +38,7 @@ public:
     void inferenceThread();
     void requestStop();
     bool isInitialized() const;
-    std::vector<Detection> detect(const cv::Mat& frame);
+    std::vector<Detection> detect(const cv::Mat& frame,const NodeGraph::Node& settings);
     std::vector<Detection> detect(const NodeGraph::FrameStream& frame,const NodeGraph::Node& settings);
 
     float img_scale;

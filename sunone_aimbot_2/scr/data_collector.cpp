@@ -32,6 +32,8 @@ struct CollectRuntimeState
     std::uint64_t sample_counter = 0;
     std::uint64_t saved_image_count = 0;
     std::uint64_t saved_label_count = 0;
+    std::uint64_t frame_counter_baseline = 0;
+    std::uint64_t sample_counter_baseline = 0;
     int64_t last_collect_save_ns = 0;
     std::string last_output_dir;
     std::string last_status;
@@ -435,14 +437,27 @@ void ResetDataCollectionRuntime()
     g_collectNodeRuntimeStates.clear();
     g_collectRuntimeState.last_status = "Counters reset.";
 }
+void ResetDataCollectionNodeCounters(int nodeKey)
+{
+    std::lock_guard<std::mutex> lock(g_collectRuntimeMutex);
+    const auto found=g_collectNodeRuntimeStates.find(nodeKey);
+    if(found==g_collectNodeRuntimeStates.end())return;
+    auto& state=found->second;
+    // Keep the sampling sequence/cooldown so a UI reset cannot overwrite a
+    // sample or change the cadence of an in-flight recording operation.
+    state.frame_counter_baseline=state.frame_counter;
+    state.sample_counter_baseline=state.sample_counter;
+    state.saved_image_count=state.saved_label_count=0;
+    state.last_status="Counters reset.";
+}
 
 DataCollectionUiState GetDataCollectionNodeUiState(int nodeKey)
 {
     DataCollectionUiState ui;
     std::lock_guard<std::mutex> lock(g_collectRuntimeMutex);
     const auto found=g_collectNodeRuntimeStates.find(nodeKey);if(found==g_collectNodeRuntimeStates.end())return ui;
-    const auto& state=found->second;ui.enabled=true;ui.observed_frame_count=state.frame_counter;
-    ui.attempted_sample_count=state.sample_counter;ui.saved_image_count=state.saved_image_count;ui.saved_label_count=state.saved_label_count;
+    const auto& state=found->second;ui.enabled=true;ui.observed_frame_count=state.frame_counter-state.frame_counter_baseline;
+    ui.attempted_sample_count=state.sample_counter-state.sample_counter_baseline;ui.saved_image_count=state.saved_image_count;ui.saved_label_count=state.saved_label_count;
     ui.resolved_output_dir=state.last_output_dir;ui.status=state.last_status;return ui;
 }
 

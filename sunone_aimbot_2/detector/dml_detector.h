@@ -17,11 +17,9 @@
 class DirectMLDetector
 {
 public:
-    DirectMLDetector(const std::string& model_path = "", int deviceId = -1, bool cpuOnly = false);
+    DirectMLDetector(const std::string& model_path = "", int deviceId = 0, bool cpuOnly = false);
     ~DirectMLDetector();
 
-    std::vector<Detection> detect(const cv::Mat& input_frame);
-    std::vector<std::vector<Detection>> detectBatch(const std::vector<cv::Mat>& frames);
     std::vector<std::vector<Detection>> detectBatch(const std::vector<cv::Mat>& frames, const NodeGraph::Node& settings);
 
     void dmlInferenceThread();
@@ -30,7 +28,6 @@ public:
         const cv::Mat& source_frame = cv::Mat(),
         std::chrono::steady_clock::time_point frameTimestamp = {});
 
-    int getNumberOfClasses();
     bool isReady() const;
 
     std::chrono::duration<double, std::milli> lastInferenceTimeDML;

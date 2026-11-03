@@ -197,6 +197,13 @@ void collectorUsesIndependentCadenceAndConnectedModel()
     {std::ifstream input(entry.path());std::string contents((std::istreambuf_iterator<char>(input)),{});require(contents.find("4 ")!=std::string::npos&&contents.find("7 ")!=std::string::npos,"Collector labels lost connected detections");}
     for(int id:{first.id,second.id})
     {const auto status=cvm::GetDataCollectionNodeUiState(VisionBase+id);require(status.observed_frame_count==2&&status.saved_image_count==1&&status.saved_label_count==1,"Collector statistics leaked across nodes");}
+    cvm::ResetDataCollectionNodeCounters(VisionBase+second.id);
+    const auto reset=cvm::GetDataCollectionNodeUiState(VisionBase+second.id);
+    require(reset.observed_frame_count==0&&reset.attempted_sample_count==0&&reset.saved_image_count==0&&reset.saved_label_count==0,"Node counter reset left stale values");
+    require(cvm::GetDataCollectionNodeUiState(VisionBase+first.id).saved_image_count==1,"Counter reset affected another collector");
+    require(!NodeVision::collectDataset(VisionBase+second.id,frame(NodeVision::cpuImage(image),3),detections(3),second),"Reset changed the recording cadence");
+    require(NodeVision::collectDataset(VisionBase+second.id,frame(NodeVision::cpuImage(image),4),detections(4),second),"Recording did not resume after a counter reset");
+    require(cvm::GetDataCollectionNodeUiState(VisionBase+second.id).saved_image_count==1&&std::distance(fs::directory_iterator(images),fs::directory_iterator())==3,"Reset reused a sample filename or lost new counters");
     require(!NodeVision::collectDataset(VisionBase+first.id,frame(NodeVision::cpuImage(image),3),detections(2),first),"Collector accepted labels from a different frame");
     Actions active;active.activeCollectorKeys={VisionBase+second.id};NodeVision::retainVisionOutputs(active);
     require(cvm::GetDataCollectionNodeUiState(VisionBase+first.id).observed_frame_count==0,"Deleted collector retained its cadence state");

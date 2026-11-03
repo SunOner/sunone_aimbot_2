@@ -9,6 +9,7 @@
 #include "nodes/vision_outputs.h"
 #include "nodes/preview_image.h"
 #include "runtime/input_state.h"
+#include "keyboard/graph_key_state.h"
 #include "detection_buffer.h"
 #include "config.h"
 #include <algorithm>
@@ -114,7 +115,7 @@ bool syncCaptureConfiguration(bool force)
         context.captureConfigurationChanged=[]{detectionBuffer.clear();};
         context.inputCaptured=editorInputCaptured.load();context.inputCapturedNow=[]{return editorInputCaptured.load();};
         context.aimHeld=aiming.load();context.shootHeld=shooting.load();context.zoomHeld=zooming.load();context.controlActive=graphAimActive.load();
-        context.keyDown=[](int key){return !editorInputCaptured.load()&&key>0&&key<256&&(GetAsyncKeyState(key)&0x8000)!=0;};
+        context.keyDown=GraphInput::keyDown;
         {std::lock_guard<std::mutex> cfg(configMutex);context.center={config.detection_resolution*0.5,config.detection_resolution*0.5};}
         sources.clear();models.clear();for(auto& node:NodeGraph::service().evaluateConfiguration(context))
             if(node.kind==NodeGraph::NodeKind::CaptureSource)sources.push_back(std::move(node));else if(node.kind==NodeGraph::NodeKind::Inference)models.push_back(std::move(node));
@@ -222,7 +223,7 @@ NodeGraph::Actions processFrame(const NodeGraph::FrameStream& frame,const Infer&
         const NodeGraph::MaskStream& mask,const NodeGraph::FrameStream& depth,const NodeGraph::Node& node){
         return current()&&publishOverlayAtRevision(key,input,detections,mask,depth,node,evaluatedRevision);
     };
-    context.keyDown=[](int key){return !editorInputCaptured.load()&&key>0&&key<256&&(GetAsyncKeyState(key)&0x8000)!=0;};
+    context.keyDown=GraphInput::keyDown;
     context.nodeError=[](int key){const auto found=errors.find(key);return found==errors.end()?std::string{}:found->second;};
     const auto actions=NodeGraph::service().evaluateVision(context);
     if(!current()||actions.revision!=evaluatedRevision)return inactive;

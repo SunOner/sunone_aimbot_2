@@ -21,7 +21,6 @@ public:
     int monitor_idx;
     bool circle_fov_enabled;
     int circle_fov_radius_percent;
-    bool circle_fov_show_preview;
     bool capture_borders;
     bool capture_cursor;
     std::string virtual_camera_name;
@@ -34,7 +33,6 @@ public:
     float head_y_offset;
     bool auto_aim;
     bool tracker_enabled;
-    bool tracker_overlay_table_enabled;
 
     // Mouse
     int fovX;
@@ -235,8 +233,6 @@ public:
     int class_head;
 
     // Debug
-    bool show_window;
-    bool show_fps;
     std::vector<std::string> screenshot_button;
     int screenshot_delay;
     bool verbose;
@@ -254,11 +250,11 @@ public:
     std::unordered_map<std::string, GameProfile> game_profiles;
     std::string                                  active_game;
 
-    const GameProfile & currentProfile() const;
-    std::pair<double, double> degToCounts(double degX, double degY, double fovNow) const;
 
     bool loadConfig(const std::string& filename = "config.ini");
     bool saveConfig(const std::string& filename = "config.ini");
+    bool reloadApplicationSettings(const std::string& filename = "config.ini");
+    bool sameInputDeviceSettings(const Config& other) const;
 
     std::string joinStrings(const std::vector<std::string>& vec, const std::string& delimiter = ",");
 private:

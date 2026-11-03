@@ -63,7 +63,6 @@ bool Config::loadConfig(const std::string& filename)
         monitor_idx = 0;
         circle_fov_enabled = true;
         circle_fov_radius_percent = 100;
-        circle_fov_show_preview = true;
         capture_borders = true;
         capture_cursor = true;
         virtual_camera_name = "None";
@@ -76,7 +75,6 @@ bool Config::loadConfig(const std::string& filename)
         head_y_offset = 0.05f;
         auto_aim = false;
         tracker_enabled = true;
-        tracker_overlay_table_enabled = true;
 
         // Mouse
         fovX = 106;
@@ -272,8 +270,6 @@ bool Config::loadConfig(const std::string& filename)
         class_head = 1;
 
         // Debug
-        show_window = true;
-        show_fps = false;
         screenshot_button = splitString("None");
         screenshot_delay = 500;
         verbose = false;
@@ -391,7 +387,6 @@ bool Config::loadConfig(const std::string& filename)
     circle_fov_radius_percent = get_long("circle_fov_radius_percent", 100);
     if (circle_fov_radius_percent < 1) circle_fov_radius_percent = 1;
     if (circle_fov_radius_percent > 100) circle_fov_radius_percent = 100;
-    circle_fov_show_preview = get_bool("circle_fov_show_preview", true);
     capture_borders = get_bool("capture_borders", true);
     capture_cursor = get_bool("capture_cursor", true);
     virtual_camera_name = get_string("virtual_camera_name", "None");
@@ -404,7 +399,6 @@ bool Config::loadConfig(const std::string& filename)
     head_y_offset = (float)get_double("head_y_offset", 0.05);
     auto_aim = get_bool("auto_aim", false);
     tracker_enabled = get_bool("tracker_enabled", true);
-    tracker_overlay_table_enabled = get_bool("tracker_overlay_table_enabled", true);
 
     // Mouse
     fovX = get_long("fovX", 106);
@@ -639,8 +633,6 @@ bool Config::loadConfig(const std::string& filename)
     class_head = get_long("class_head", 1);
 
     // Debug window
-    show_window = get_bool("show_window", true);
-    show_fps = get_bool("show_fps", false);
     screenshot_button = splitString(get_string("screenshot_button", "None"));
     screenshot_delay = get_long("screenshot_delay", 500);
     verbose = get_bool("verbose", false);
@@ -678,7 +670,6 @@ bool Config::saveConfig(const std::string& filename)
         << "monitor_idx = " << monitor_idx << "\n"
         << "circle_fov_enabled = " << (circle_fov_enabled ? "true" : "false") << "\n"
         << "circle_fov_radius_percent = " << circle_fov_radius_percent << "\n"
-        << "circle_fov_show_preview = " << (circle_fov_show_preview ? "true" : "false") << "\n"
         << "capture_borders = " << (capture_borders ? "true" : "false") << "\n"
         << "capture_cursor = " << (capture_cursor ? "true" : "false") << "\n"
         << "virtual_camera_name = " << virtual_camera_name << "\n"
@@ -692,8 +683,7 @@ bool Config::saveConfig(const std::string& filename)
         << "body_y_offset = " << body_y_offset << "\n"
         << "head_y_offset = " << head_y_offset << "\n"
         << "auto_aim = " << (auto_aim ? "true" : "false") << "\n"
-        << "tracker_enabled = " << (tracker_enabled ? "true" : "false") << "\n"
-        << "tracker_overlay_table_enabled = " << (tracker_overlay_table_enabled ? "true" : "false") << "\n\n";
+        << "tracker_enabled = " << (tracker_enabled ? "true" : "false") << "\n\n";
 
     // Mouse
     file << "# Mouse move\n"
@@ -912,8 +902,6 @@ bool Config::saveConfig(const std::string& filename)
 
     // Debug
     file << "# Debug\n"
-        << "show_window = " << (show_window ? "true" : "false") << "\n"
-        << "show_fps = " << (show_fps ? "true" : "false") << "\n"
         << "screenshot_button = " << joinStrings(screenshot_button) << "\n"
         << "screenshot_delay = " << screenshot_delay << "\n"
         << "verbose = " << (verbose ? "true" : "false") << "\n\n";
@@ -938,22 +926,38 @@ bool Config::saveConfig(const std::string& filename)
     return true;
 }
 
-const Config::GameProfile& Config::currentProfile() const
+bool Config::sameInputDeviceSettings(const Config& other) const
 {
-    auto it = game_profiles.find(active_game);
-    if (it != game_profiles.end()) return it->second;
-    throw std::runtime_error("Active game profile not found: " + active_game);
+#define SAME(field) if(field!=other.field)return false
+    SAME(input_method);SAME(arduino_baudrate);SAME(arduino_port);SAME(arduino_16_bit_mouse);SAME(arduino_enable_keys);
+    SAME(rp2350_baudrate);SAME(rp2350_port);SAME(rp2350_16_bit_mouse);SAME(rp2350_enable_keys);
+    SAME(teensy_hid_serial);SAME(teensy_hid_vid_filter);SAME(teensy_hid_pid_filter);SAME(teensy_hid_usage_page);SAME(teensy_hid_usage_id);
+    SAME(teensy_hid_open_index);SAME(teensy_hid_packet_timeout_ms);SAME(teensy_hid_reconnect_interval_ms);
+    SAME(kmbox_net_ip);SAME(kmbox_net_port);SAME(kmbox_net_uuid);SAME(kmbox_a_pidvid);
+    SAME(makcu_baudrate);SAME(makcu_port);SAME(makcu_enable_keys);
+    SAME(button_targeting);SAME(button_shoot);SAME(button_zoom);
+#undef SAME
+    return true;
 }
-
-std::pair<double, double> Config::degToCounts(double degX, double degY, double fovNow) const
+bool Config::reloadApplicationSettings(const std::string& filename)
 {
-    const auto& gp = currentProfile();
-    double scale = (gp.fovScaled && gp.baseFOV > 1.0) ? (fovNow / gp.baseFOV) : 1.0;
-
-    if (gp.sens == 0.0 || gp.yaw == 0.0 || gp.pitch == 0.0)
-        return { 0.0, 0.0 };
-
-    double cx = degX / (gp.sens * gp.yaw * scale);
-    double cy = degY / (gp.sens * gp.pitch * scale);
-    return { cx, cy };
+    std::error_code error;if(!std::filesystem::is_regular_file(filename,error))return false;
+    Config next=*this;if(!next.loadConfig(filename))return false;
+#define COPY(field) field=next.field
+    COPY(input_method);COPY(arduino_baudrate);COPY(arduino_port);COPY(arduino_16_bit_mouse);COPY(arduino_enable_keys);
+    COPY(rp2350_baudrate);COPY(rp2350_port);COPY(rp2350_16_bit_mouse);COPY(rp2350_enable_keys);
+    COPY(teensy_hid_serial);COPY(teensy_hid_vid_filter);COPY(teensy_hid_pid_filter);COPY(teensy_hid_usage_page);COPY(teensy_hid_usage_id);
+    COPY(teensy_hid_open_index);COPY(teensy_hid_packet_timeout_ms);COPY(teensy_hid_reconnect_interval_ms);
+    COPY(kmbox_net_ip);COPY(kmbox_net_port);COPY(kmbox_net_uuid);COPY(kmbox_a_pidvid);
+    COPY(makcu_baudrate);COPY(makcu_port);COPY(makcu_enable_keys);
+    COPY(button_targeting);COPY(button_shoot);COPY(button_zoom);COPY(button_exit);COPY(button_pause);COPY(button_reload_config);COPY(button_open_overlay);COPY(enable_arrows_settings);
+    COPY(overlay_opacity);COPY(overlay_ui_scale);COPY(overlay_sidebar_collapsed);COPY(overlay_exclude_from_capture);
+    COPY(overlay_x);COPY(overlay_y);COPY(overlay_width);COPY(overlay_height);
+    COPY(cpuCoreReserveCount);COPY(systemMemoryReserveMB);COPY(verbose);
+#ifdef USE_CUDA
+    COPY(gpuMemoryReserveMB);COPY(enableGpuExclusiveMode);
+#endif
+    COPY(config_path);
+#undef COPY
+    return true;
 }

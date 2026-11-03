@@ -1,6 +1,6 @@
 # Overlay and GUI Behavior
 
-- `show_window` controls the debug preview, which may require CPU frame copies.
+- Preview nodes show capture, depth and masks. Visible previews request CPU pixels only when needed.
 - Render Overlay controls detection boxes, predictions, frame outlines, Circle FOV and icons.
 
 ```ini
@@ -15,6 +15,8 @@ Overlay settings seed the graph on first launch; edit an existing Render Overlay
 ## Editor Window Placement
 
 The editor fits the monitor's work area and DPI. Saved geometry is reused when it fits; oversized windows shrink, and a disconnected monitor falls back to the screen containing the cursor. Limits update after display changes.
+
+The graph toolbar ends with Help, Hide, Maximize (keeps the taskbar visible), and Fullscreen. Hide and Alt+F4 dismiss the editor; the overlay hotkey reopens it with its layout and window mode preserved. The editor does not appear in the taskbar or Alt+Tab. F11 toggles fullscreen and returns to the previous window mode. Click an active mode again to restore the normal window size. Narrow toolbars move secondary actions into the tools menu.
 
 ## Latency Compensation
 

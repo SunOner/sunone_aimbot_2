@@ -13,6 +13,8 @@ struct ProgressPhase {
 };
 
 inline std::mutex gProgressMutex;
+inline std::recursive_mutex gTrtBuildMutex;
+inline thread_local const std::atomic<bool>* gTrtCancellationToken=nullptr;
 inline std::map<std::string, ProgressPhase> gProgressPhases;
 inline std::atomic<bool> gIsTrtExporting = false;
 inline std::atomic<bool> gTrtExportCancelRequested = false;
@@ -26,7 +28,7 @@ inline long long TrtNowMs() noexcept
 
 inline void TrtExportResetState() noexcept
 {
-    gTrtExportCancelRequested = false;
+    gTrtExportCancelRequested = gTrtCancellationToken&&gTrtCancellationToken->load();
     gTrtExportLastUpdateMs = TrtNowMs();
 }
 
@@ -47,7 +49,7 @@ public:
         std::lock_guard<std::mutex> lock(gProgressMutex);
         gProgressPhases[phaseName].current = step;
         gTrtExportLastUpdateMs = TrtNowMs();
-        return !gTrtExportCancelRequested.load();
+        return !gTrtExportCancelRequested.load()&&!(gTrtCancellationToken&&gTrtCancellationToken->load());
     }
 
     void phaseFinish(const char* phaseName) noexcept override {

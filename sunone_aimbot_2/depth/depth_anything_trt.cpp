@@ -333,6 +333,7 @@ namespace depth_anything
 
     bool DepthAnythingTrt::exportEngine(const std::string& modelPath, nvinfer1::ILogger& logger, std::string* enginePath)
     {
+        std::lock_guard<std::recursive_mutex> buildLock(gTrtBuildMutex);
         reset();
 
         std::string resolvedPath;
@@ -558,6 +559,7 @@ namespace depth_anything
 
     bool DepthAnythingTrt::loadEngine(const std::string& modelPath, nvinfer1::ILogger& logger)
     {
+        std::lock_guard<std::recursive_mutex> buildLock(gTrtBuildMutex);
         if (OtherTools::HasExtensionCaseInsensitive(modelPath, ".onnx"))
         {
             if (!buildEngine(modelPath, logger))
@@ -620,6 +622,7 @@ namespace depth_anything
 
     bool DepthAnythingTrt::buildEngine(const std::string& onnxPath, nvinfer1::ILogger& logger)
     {
+        std::lock_guard<std::recursive_mutex> buildLock(gTrtBuildMutex);
         auto builder = nvinfer1::createInferBuilder(logger);
         if (!builder)
         {

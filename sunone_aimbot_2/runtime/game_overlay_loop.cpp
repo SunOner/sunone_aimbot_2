@@ -22,6 +22,7 @@
 #include "other_tools.h"
 #include "runtime/thread_loops.h"
 #include "runtime/input_state.h"
+#include "config.h"
 #include "nodes/vision_outputs.h"
 #include "nodes/vision_runtime.h"
 

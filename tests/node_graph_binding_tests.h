@@ -26,7 +26,7 @@ void testEveryOptionHasATypedInput()
             require(type==(spec.kind==ParameterKind::Boolean?ValueType::Boolean:spec.kind==ParameterKind::Integer?ValueType::Integer:ValueType::Float)||
                 (!def.inputs[pin].option&&type==ValueType::Float&&spec.kind==ParameterKind::Integer),"An option has the wrong wire type");
         }
-        for(const auto& spec:def.textParameters)if(!((variableGet(def.kind)||variableSet(def.kind))&&std::string(spec.key)=="name"))
+        for(const auto& spec:def.textParameters)if(!((variableGet(def.kind)||variableSet(def.kind)||calibrationIdentifier(def.kind))&&std::string(spec.key)=="name"))
         {
             require(def.inputs[optionPin(def.kind,spec.key)].type==ValueType::String,"A text option has no String input");
             require(std::count_if(def.inputs.begin(),def.inputs.end(),[&](const Pin& input){return input.defaultParameter&&std::strcmp(input.defaultParameter,spec.key)==0;})==1,"A text setting does not have exactly one input");
@@ -36,16 +36,20 @@ void testEveryOptionHasATypedInput()
 void testBoundOptionsReachNativeCallbacks()
 {
     Service service;Fixture fixture;auto workspace=defaults();auto& graph=workspace.graphs[0];
+    int estimator=0;for(const auto& node:graph.nodes)if(node.kind==NodeKind::MotionEstimate)estimator=node.id;
     constant(graph,90,0.7);constant(graph,91,1,true);graph.nodes.push_back(stringNode(92,"wired sensitivity profile"));
-    graph.links.push_back({90,0,5,optionPin(NodeKind::Prediction,"kalman_velocity_damping")});
-    graph.links.push_back({91,0,5,optionPin(NodeKind::Prediction,"kalman_enabled")});
-    graph.links.push_back({92,0,10,optionPin(NodeKind::MouseDelta,"profile_name")});
+    graph.links.push_back({90,0,estimator,optionPin(NodeKind::MotionEstimate,"kalman_velocity_damping")});
+    graph.links.push_back({91,0,estimator,optionPin(NodeKind::MotionEstimate,"kalman_enabled")});
+    const int profiles=0;int calibration=0;for(const auto& node:graph.nodes)if(node.kind==NodeKind::MouseProfile)calibration=node.id;
+    graph.links.push_back({92,0,calibration,optionPin(NodeKind::MouseProfile,"profile_name")});
     bool predicted=false,converted=false;
-    const auto predict=fixture.context.predict;const auto delta=fixture.context.mouseDelta;
-    fixture.context.predict=[&](int key,Point point,const Node& settings,double lookahead,bool reset){predicted=parameter(settings,"kalman_velocity_damping")==0.7&&parameter(settings,"kalman_enabled")==1;return predict(key,point,settings,lookahead,reset);};
-    fixture.context.mouseDelta=[&](Point point,double speed,Point center,const Node& settings){converted=textParameter(settings,"profile_name")=="wired sensitivity profile";return delta(point,speed,center,settings);};
-    publish(service,workspace);require(service.evaluate(fixture.context).aim&&predicted&&converted,"A callback received stored options instead of its wired values");
-    require(textParameter(node(service.workspace().graphs[0],10),"profile_name")!="wired sensitivity profile","Runtime bindings overwrote an editable fallback");
+    const auto predict=fixture.context.estimateMotion;
+    fixture.context.estimateMotion=[&](int key,Point point,const Node& settings,bool reset){predicted=parameter(settings,"kalman_velocity_damping")==0.7&&parameter(settings,"kalman_enabled")==1;return predict(key,point,settings,reset);};
+    publish(service,workspace);const auto actions=service.evaluate(fixture.context);
+    const auto telemetry=service.telemetry();
+    for(const auto& value:telemetry.graphs[profiles])if(value.nodeId==calibration&&value.value.calibration)converted=value.value.calibration->profileName=="wired sensitivity profile";
+    require(actions.aim,"Shared conversion did not produce movement");require(predicted,"An estimator received stored options instead of its wired values");require(converted,"A shared source received a stored name instead of its wired value");
+    require(textParameter(node(service.workspace().graphs[profiles],calibration),"profile_name")!="wired sensitivity profile","Runtime bindings overwrote an editable fallback");
 }
 void testWideOptionMasksAndTextOutputs()
 {

@@ -123,6 +123,7 @@ std::string trtEngineCachePath(const std::string& onnxFile, const TrtBuildOption
 nvinfer1::ICudaEngine* buildEngineFromOnnx(const std::string& onnxFile,nvinfer1::ILogger& logger,
     const TrtBuildOptions& options,nvinfer1::IRuntime& runtime)
 {
+    std::lock_guard<std::recursive_mutex> buildLock(gTrtBuildMutex);
     if(options.inputWidth<=0||options.inputHeight<=0||options.minProfileSize<=0||
         options.minProfileSize>options.optProfileSize||options.optProfileSize>options.maxProfileSize)
         throw std::runtime_error("TensorRT profile requires minimum <= optimal <= maximum and positive input dimensions.");

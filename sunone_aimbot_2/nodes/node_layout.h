@@ -21,7 +21,7 @@ inline bool isReroute(NodeKind kind)
 {
     return (kind>=NodeKind::RerouteBoolean&&kind<=NodeKind::RerouteMovement)||
         kind==NodeKind::RerouteFrame||kind==NodeKind::RerouteDepth||kind==NodeKind::RerouteMask||kind==NodeKind::RerouteInteger||
-        kind==NodeKind::RerouteString||kind==NodeKind::RerouteMonitor||kind==NodeKind::RerouteMonitors||kind==NodeKind::RerouteOverlay||kind==NodeKind::RerouteLabels;
+        kind==NodeKind::RerouteString||kind==NodeKind::RerouteMonitor||kind==NodeKind::RerouteMonitors||kind==NodeKind::RerouteOverlay||kind==NodeKind::RerouteLabels||kind==NodeKind::RerouteMotion||kind==NodeKind::RerouteCalibration;
 }
 inline bool inputVisible(const Node& node,std::size_t pin)
 {
@@ -39,15 +39,14 @@ inline bool hasSettings(const Node& node)
 {
     // Runtime settings are edited at their input sockets. Only source literals
     // and the static identifier of a Get/Set pair need a separate local field.
-    return node.kind==NodeKind::Number||node.kind==NodeKind::Integer||node.kind==NodeKind::Boolean||variableGet(node.kind)||variableSet(node.kind);
+    return node.kind==NodeKind::Number||node.kind==NodeKind::Integer||node.kind==NodeKind::Boolean||variableGet(node.kind)||variableSet(node.kind)||calibrationIdentifier(node.kind);
 }
 inline float naturalSettingsHeight(const Node& node)
 {
     if(!hasSettings(node))return 0;
     float height=12;
-    if(node.kind==NodeKind::Number||node.kind==NodeKind::Integer)height+=56;
-    if(node.kind==NodeKind::Boolean)height+=44;
-    if(variableGet(node.kind)||variableSet(node.kind))height+=60;
+    // Every local value or identifier uses the same label + editor row.
+    height+=44;
     return height;
 }
 inline float settingsTop(const Node& node)
@@ -55,7 +54,7 @@ inline float settingsTop(const Node& node)
     const auto& def=definition(node.kind);
     return HeaderHeight+10+PinSpacing*static_cast<float>(std::max(inputCount(node),def.outputs.size()));
 }
-inline float width(const Node& node){return isReroute(node.kind)?64:node.width>0?std::clamp(snap(node.width),MinWidth,MaxWidth):node.kind==NodeKind::ImagePreview?352:inputCount(node)>8?288:CardWidth;}
+inline float width(const Node& node){return isReroute(node.kind)?64:node.width>0?std::clamp(snap(node.width),MinWidth,MaxWidth):node.kind==NodeKind::ImagePreview?352:node.kind==NodeKind::MouseCalibration||node.kind==NodeKind::MouseProfile?320:inputCount(node)>8?288:CardWidth;}
 inline float previewHeight(const Node& node){return node.kind==NodeKind::ImagePreview?std::clamp((width(node)-24)*9/16,64.0f,384.0f)+8:0;}
 inline float minimumHeight(const Node& node)
 {
@@ -190,7 +189,8 @@ inline bool arrange(Graph& graph,int bandColumns=4)
         std::vector<Unit> ordered;ordered.reserve(units.size());for(int u:unitOrder)ordered.push_back(std::move(units[u]));units=std::move(ordered);
         // Frames follow their dependencies, keeping parallel independent
         // branches on a row rather than stacking unrelated outputs.
-        const int columns=std::any_of(units.begin(),units.end(),[](const Unit& u){return u.group>=0;})?2:3;
+        const bool framed=std::any_of(units.begin(),units.end(),[](const Unit& u){return u.group>=0;});
+        const int columns=framed?(group<0&&units.size()>=7?3:2):3;
         const float left=group<0?0:Grid,top=group<0?0:2*Grid;
         struct Placed{float x,y,width,height;};std::vector<Placed> placed;
         float x=left,right=left,bottom=top;int column=0;

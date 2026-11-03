@@ -25,6 +25,7 @@
 
 #include "trt_detector.h"
 #include "nvinf.h"
+#include "tensorrt/trt_monitor.h"
 #include "sunone_aimbot_2.h"
 #include "other_tools.h"
 #include "postProcess.h"
@@ -330,25 +331,6 @@ void TrtDetector::getBindings()
     }
 }
 
-void TrtDetector::initialize(const std::string& modelFile)
-{
-    NodeGraph::Node settings=NodeGraph::defaultNode(NodeGraph::NodeKind::Inference,1);
-    int resolution=320;
-    {
-        std::lock_guard<std::mutex> lock(configMutex);
-        settings.parameters["fixed_input_size"]=config.fixed_input_size?1:0;
-        settings.parameters["confidence_threshold"]=config.confidence_threshold;
-        settings.parameters["nms_threshold"]=config.nms_threshold;
-        settings.parameters["max_detections"]=config.max_detections;
-        settings.parameters["use_cuda_graph"]=config.use_cuda_graph?1:0;
-        settings.parameters["use_pinned_memory"]=config.use_pinned_memory?1:0;
-        settings.parameters["export_enable_fp16"]=config.export_enable_fp16?1:0;
-        settings.parameters["export_enable_fp8"]=config.export_enable_fp8?1:0;
-        resolution=config.detection_resolution;
-    }
-    initialize(modelFile,settings,resolution,resolution);
-}
-
 void TrtDetector::initialize(const std::string& modelFile,const NodeGraph::Node& settings,int width,int height)
 {
     destroyCudaGraph();
@@ -527,6 +509,7 @@ size_t TrtDetector::getElementSize(nvinfer1::DataType dtype)
 
 void TrtDetector::loadEngine(const std::string& modelFile)
 {
+    std::lock_guard<std::recursive_mutex> buildLock(gTrtBuildMutex);
     const auto path=std::filesystem::u8path(modelFile);
     auto extension=path.extension().string();
     std::transform(extension.begin(),extension.end(),extension.begin(),[](unsigned char value){return static_cast<char>(std::tolower(value));});
@@ -575,14 +558,8 @@ void TrtDetector::processFrameGpu(const cv::cuda::GpuMat& image,std::chrono::ste
     });
 }
 
-std::vector<Detection> TrtDetector::detect(const cv::Mat& frame)
+std::vector<Detection> TrtDetector::detect(const cv::Mat& frame,const NodeGraph::Node& settings)
 {
-    // Provider benchmark compatibility; production passes a node-owned snapshot.
-    NodeGraph::Node settings=inferenceSettings;
-    {std::lock_guard<std::mutex> lock(configMutex);
-        settings.parameters["confidence_threshold"]=config.confidence_threshold;
-        settings.parameters["nms_threshold"]=config.nms_threshold;
-        settings.parameters["max_detections"]=config.max_detections;}
     return inferGraphFrame(frame,cv::cuda::GpuMat(),settings);
 }
 
@@ -709,7 +686,7 @@ void TrtDetector::inferenceThread()
             for(auto it=models.begin();it!=models.end();)
             {
                 const bool keep=std::any_of(active.begin(),active.end(),[&](const NodeGraph::Node& node){return
-                    static_cast<int>(NodeGraph::GraphKind::Vision)*1000001+node.id==it->first&&NodeGraph::parameter(node,"enabled")!=0;});
+                    node.runtimeKey==it->first&&NodeGraph::parameter(node,"enabled")!=0;});
                 if(!keep)it=models.erase(it);else ++it;
             }
             providerRevision=revision;
