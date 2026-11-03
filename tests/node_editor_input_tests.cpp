@@ -65,6 +65,10 @@ struct EditorHarness
     float windowWidth=1100;
     int graphIndex=0;
     int workflow=0;
+    bool settingsTab=false;
+    float settingsScroll=0;
+    ImVec2 settingsOrigin{};
+    OverlayWindowControls::Strip windowControls;
     std::string clipboard;
     std::vector<ImDrawVert> vertices;
 
@@ -129,9 +133,24 @@ struct EditorHarness
         ImGui::SetNextWindowSize(ImVec2(windowWidth, 740), ImGuiCond_Always);
         ImGui::Begin("Input regression", nullptr, ImGuiWindowFlags_NoDecoration |
             ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings);
-        if(workflow){draw_node_workflow(workflow);graphIndex=activePage(service().workspaceMetadata(),workflow);}
+        OverlayWindowControls::reserveHeader(!settingsTab);
+        if(settingsTab)
+        {
+            ImGui::BeginChild("settings",ImVec2(0,0),ImGuiChildFlags_None,ImGuiWindowFlags_AlwaysVerticalScrollbar);
+            settingsOrigin=ImGui::GetWindowPos();settingsScroll=ImGui::GetScrollY();
+            ImGui::TextUnformatted("Settings");ImGui::Dummy(ImVec2(80,1800));
+            ImGui::EndChild();
+        }
+        else if(workflow){draw_node_workflow(workflow);graphIndex=activePage(service().workspaceMetadata(),workflow);}
         else drawEditor(graphIndex);
         if(graphIndex>=0)origin = editor.canvasOrigin[graphIndex];
+        switch(windowControls.draw(Overlay_GetWindowMode()))
+        {
+        case OverlayWindowControls::Action::Hide:Overlay_Hide();break;
+        case OverlayWindowControls::Action::Maximize:Overlay_ToggleMaximized();break;
+        case OverlayWindowControls::Action::Fullscreen:Overlay_ToggleFullscreen();break;
+        default:break;
+        }
         const auto* draw = ImGui::GetWindowDrawList();
         vertices.assign(draw->VtxBuffer.begin(), draw->VtxBuffer.end());
         ImGui::End();
@@ -1941,28 +1960,40 @@ namespace
 {
 void testWindowButtonsStayOrderedAndReachable()
 {
-    for(float width:{220.0f,240.0f,358.0f,420.0f,610.0f,640.0f,680.0f,1100.0f})
+    for(bool settings:{false,true})for(float width:{220.0f,240.0f,358.0f,420.0f,610.0f,640.0f,680.0f,1100.0f})
     {
-        EditorHarness h;h.windowWidth=width;h.frame();
-        const auto count=editor.toolbarItemCount;
-        require(count>=5&&count<=editor.toolbarItems.size(),"Window controls exceeded the native toolbar hit-test cache");
-        const auto help=editor.toolbarItems[count-4],hide=editor.toolbarItems[count-3],maximize=editor.toolbarItems[count-2],fullscreen=editor.toolbarItems[count-1];
-        require(help.y==hide.y&&hide.y==maximize.y&&maximize.y==fullscreen.y&&hide.x-help.z==4&&maximize.x-hide.z==4&&fullscreen.x-maximize.z==4,
-            "Help, hide, maximize and fullscreen are not ordered on one row");
-        require(fullscreen.z<=20+width&&help.x>=20,"Window controls fell outside a narrow toolbar");
-        require(NodeEditor_ToolbarContainsPoint(hide.x+16,hide.y+16)&&NodeEditor_ToolbarContainsPoint(maximize.x+16,maximize.y+16)&&NodeEditor_ToolbarContainsPoint(fullscreen.x+16,fullscreen.y+16),
+        EditorHarness h;h.settingsTab=settings;h.windowWidth=width;h.frame();h.frame();
+        const auto hide=h.windowControls.bounds[0],maximize=h.windowControls.bounds[1],fullscreen=h.windowControls.bounds[2];
+        require(hide.y==maximize.y&&maximize.y==fullscreen.y&&maximize.x-hide.z==4&&fullscreen.x-maximize.z==4,
+            "Hide, maximize and fullscreen are not ordered on one row");
+        require(fullscreen.z<=20+width&&hide.x>=20,"Window controls fell outside a narrow toolbar");
+        require(h.windowControls.contains(hide.x+16,hide.y+16)&&h.windowControls.contains(maximize.x+16,maximize.y+16)&&h.windowControls.contains(fullscreen.x+16,fullscreen.y+16),
             "Native window dragging swallowed a window button");
-        const auto clickControl=[&](std::size_t offset){const auto r=editor.toolbarItems[editor.toolbarItemCount-offset];h.click({r.x+16,r.y+16});};
+        if(!settings)
+        {
+            const auto help=editor.toolbarItems[editor.toolbarItemCount-1];
+            require(help.y==hide.y&&hide.x-help.z==4,"Graph help does not sit immediately before the common window controls");
+            for(std::size_t i=0;i<editor.toolbarItemCount;++i)require(editor.toolbarItems[i].z<hide.x,"Graph tools overlap the common header");
+        }
+        else
+        {
+            require(h.settingsOrigin.y>=hide.w+5,"Settings overlap the fixed window header");
+            h.move({h.settingsOrigin.x+40,h.settingsOrigin.y+80});
+            ImGui::GetIO().AddMouseWheelEvent(0,-8);h.frame();h.frame();
+            require(h.settingsScroll>0,"The settings fixture did not scroll");
+            require(h.windowControls.bounds[0].y==hide.y&&h.windowControls.bounds[2].x==fullscreen.x,"Window controls scrolled with settings");
+        }
+        const auto clickControl=[&](std::size_t index){const auto r=h.windowControls.bounds[index];h.click({r.x+16,r.y+16});};
         const auto revision=service().revision();const auto panX=h.graph().panX,panY=h.graph().panY,zoom=h.graph().zoom;
-        clickControl(2);require(Overlay_GetWindowMode()==OverlayWindowGeometry::Mode::Maximized,"Maximize button did not expand the window");
-        clickControl(1);require(Overlay_GetWindowMode()==OverlayWindowGeometry::Mode::Fullscreen,"Fullscreen button did not enter fullscreen");
-        clickControl(1);require(Overlay_GetWindowMode()==OverlayWindowGeometry::Mode::Maximized,"Leaving fullscreen forgot the previous maximized mode");
-        clickControl(2);require(Overlay_GetWindowMode()==OverlayWindowGeometry::Mode::Windowed,"Maximize button did not restore the original window");
+        clickControl(1);require(Overlay_GetWindowMode()==OverlayWindowGeometry::Mode::Maximized,"Maximize button did not expand the window");
+        clickControl(2);require(Overlay_GetWindowMode()==OverlayWindowGeometry::Mode::Fullscreen,"Fullscreen button did not enter fullscreen");
+        clickControl(2);require(Overlay_GetWindowMode()==OverlayWindowGeometry::Mode::Maximized,"Leaving fullscreen forgot the previous maximized mode");
+        clickControl(1);require(Overlay_GetWindowMode()==OverlayWindowGeometry::Mode::Windowed,"Maximize button did not restore the original window");
         require(!editor.dragNode&&!editor.wireNode&&editor.panButton<0&&service().revision()==revision&&h.graph().panX==panX&&h.graph().panY==panY&&h.graph().zoom==zoom,
             "Window buttons modified graph navigation or started a canvas gesture");
-        clickControl(3);require(testOverlayHidden,"Hide button did not request overlay hiding");
+        clickControl(0);require(testOverlayHidden,"Hide button did not request overlay hiding");
         require(service().revision()==revision&&!editor.dragNode&&!editor.wireNode&&editor.panButton<0,"Hide button changed the graph or started a canvas gesture");
-        clickControl(4);require(ImGui::IsPopupOpen(nullptr,ImGuiPopupFlags_AnyPopupId),"Help was lost when moving window controls");
+        if(!settings){const auto help=editor.toolbarItems[editor.toolbarItemCount-1];h.click({help.x+16,help.y+16});require(ImGui::IsPopupOpen(nullptr,ImGuiPopupFlags_AnyPopupId),"Help was lost when moving window controls");}
     }
 }
 }

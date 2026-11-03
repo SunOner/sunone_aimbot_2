@@ -84,6 +84,7 @@
     <ClInclude Include="capture\capture.h" />
     <ClInclude Include="overlay\overlay.h" />
     <ClInclude Include="overlay\window_geometry.h" />
+    <ClInclude Include="overlay\window_controls.h" />
     <ClInclude Include="mouse\ghub.h" />
     <ClInclude Include="mouse\hidapi.h" />
     <ClInclude Include="mouse\KmboxAConnection.h" />

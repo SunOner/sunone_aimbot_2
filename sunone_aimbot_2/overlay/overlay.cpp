@@ -31,6 +31,7 @@
 #include "overlay/config_dirty.h"
 #include "overlay/node_editor.h"
 #include "overlay/window_geometry.h"
+#include "overlay/window_controls.h"
 #include "nodes/node_graph.h"
 #include "nodes/vision_runtime.h"
 #include "nodes/preview_image.h"
@@ -103,6 +104,7 @@ static RECT g_manualWindowDragStartRect{};
 static int g_activeOverlayTab = 0;
 static int ActiveWorkflowId(){return g_activeOverlayTab<0?-g_activeOverlayTab:g_activeOverlayTab<static_cast<int>(NodeGraph::GraphCount)?g_activeOverlayTab+1:0;}
 static RECT g_sidebarToggleRect{};
+static OverlayWindowControls::Strip g_windowControls;
 static bool g_pendingOverlayGeometryDirty = false;
 static OverlayWindowGeometry::Presentation g_windowPresentation;
 enum class WindowAction { None, Maximize, Fullscreen, Hide };
@@ -1315,6 +1317,7 @@ LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
             ::GetClientRect(hWnd, &rc);
 
             if (g_windowPresentation.mode != OverlayWindowGeometry::Mode::Windowed) return HTCLIENT;
+            if (g_windowControls.contains(static_cast<float>(pt.x), static_cast<float>(pt.y))) return HTCLIENT;
 
             const UINT dpi = GetDpiForWindowSafe(hWnd);
             const int border = ::MulDiv(RESIZE_BORDER_PX, (int)dpi, 96);
@@ -1775,6 +1778,7 @@ static HRESULT RenderOverlayFrame(bool allowAutoResize, bool allowConfigSave)
 
         float contentExtraW = 0.0f;
         const bool graphTab = ActiveWorkflowId()!=0;
+        OverlayWindowControls::reserveHeader(graphTab);
         ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 8.0f);
         ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, graphTab ? ImVec2(0.0f, 0.0f) : ImGui::GetStyle().WindowPadding);
         ImGui::PushStyleColor(ImGuiCol_ChildBg, IM_COL32(0, 0, 0, 0));
@@ -1790,6 +1794,14 @@ static HRESULT RenderOverlayFrame(bool allowAutoResize, bool allowConfigSave)
         ImGui::EndChild();
         ImGui::PopStyleColor(2);
         ImGui::PopStyleVar();
+
+        switch (g_windowControls.draw(Overlay_GetWindowMode()))
+        {
+        case OverlayWindowControls::Action::Hide: Overlay_Hide(); break;
+        case OverlayWindowControls::Action::Maximize: Overlay_ToggleMaximized(); break;
+        case OverlayWindowControls::Action::Fullscreen: Overlay_ToggleFullscreen(); break;
+        default: break;
+        }
 
         if(openCreate)ImGui::OpenPopup("New workflow");if(openRename)ImGui::OpenPopup("Workflow appearance");
         if(ImGui::BeginPopup("New workflow"))

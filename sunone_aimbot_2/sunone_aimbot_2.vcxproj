@@ -160,6 +160,7 @@
     <ClInclude Include="overlay\Game_overlay.h" />
     <ClInclude Include="overlay\overlay.h" />
     <ClInclude Include="overlay\window_geometry.h" />
+    <ClInclude Include="overlay\window_controls.h" />
     <ClInclude Include="scr\data_collector.h" />
     <ClInclude Include="sunone_aimbot_2.h" />
     <ClInclude Include="runtime\thread_loops.h" />

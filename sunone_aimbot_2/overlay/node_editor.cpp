@@ -7,6 +7,7 @@
 #include <Windows.h>
 #include "overlay/node_editor.h"
 #include "overlay/node_preview.h"
+#include "overlay/window_controls.h"
 #include "overlay/source_choices.h"
 #include "nodes/node_graph.h"
 #include "nodes/node_layout.h"
@@ -3566,7 +3567,7 @@ void tieInspector(Graph& graph,int tab)
     }
     ImGui::EndPopup();
 }
-enum class ToolIcon {Add,Inspect,Group,Tie,Bypass,Collapse,Undo,Redo,Arrange,Fit,Hide,Maximize,Windowed,Fullscreen,ExitFullscreen,Files,Restore,Tools,Help};
+enum class ToolIcon {Add,Inspect,Group,Tie,Bypass,Collapse,Undo,Redo,Arrange,Fit,Files,Restore,Tools,Help};
 bool toolButton(const char* id,const char* tooltip,ToolIcon icon,bool enabled=true,bool accent=false)
 {
     ImGui::BeginDisabled(!enabled);
@@ -3598,15 +3599,6 @@ bool toolButton(const char* id,const char* tooltip,ToolIcon icon,bool enabled=tr
         draw->AddRect(add(c,ImVec2(3,3)),add(c,ImVec2(9,9)),color,1,0,1.4f);
         line(-3,-4,3,-4);line(0,-4,0,6);line(0,6,3,6);break;
     case ToolIcon::Fit:for(float x:{-1.0f,1.0f})for(float y:{-1.0f,1.0f}){line(8*x,8*y,3*x,8*y);line(8*x,8*y,8*x,3*y);}break;
-    case ToolIcon::Hide:line(-7,5,7,5);break;
-    case ToolIcon::Maximize:draw->AddRect(add(c,ImVec2(-8,-7)),add(c,ImVec2(8,7)),color,1,0,1.6f);line(-8,-3,8,-3);break;
-    case ToolIcon::Windowed:draw->AddRect(add(c,ImVec2(-7,-3)),add(c,ImVec2(4,8)),color,1,0,1.6f);line(-3,-3,-3,-7);line(-3,-7,8,-7);line(8,-7,8,4);line(8,4,4,4);break;
-    case ToolIcon::Fullscreen:case ToolIcon::ExitFullscreen:
-        for(float x:{-1.0f,1.0f})for(float y:{-1.0f,1.0f})
-        {
-            const float outer=icon==ToolIcon::Fullscreen?8.0f:3.0f,inner=icon==ToolIcon::Fullscreen?3.0f:8.0f;
-            line(outer*x,outer*y,inner*x,outer*y);line(outer*x,outer*y,outer*x,inner*y);
-        }break;
     case ToolIcon::Files:line(-8,3,-8,8);line(-8,8,8,8);line(8,8,8,3);line(-3,-8,-3,2);line(-6,-1,-3,2);line(-3,2,0,-1);line(5,2,5,-8);line(2,-5,5,-8);line(5,-8,8,-5);break;
     case ToolIcon::Restore:draw->PathArcTo(c,8,0.5f,5.5f,18);draw->PathStroke(color,0,1.7f);line(6,-6,0,-6);line(6,-6,6,-1);break;
     case ToolIcon::Tools:for(int x:{-6,0,6})draw->AddCircleFilled(add(c,ImVec2(static_cast<float>(x),0)),1.7f,color);break;
@@ -4693,17 +4685,9 @@ void drawEditor(int index)
     if(toolButton("tools","Selection tools and keyboard shortcuts",ToolIcon::Tools))ImGui::OpenPopup("graph_tools");
     ImGui::SameLine();
     const float available=ImGui::GetContentRegionAvail().x;
-    if(available>=140)ImGui::SetCursorPosX(ImGui::GetCursorPosX()+available-140);
+    constexpr float rightControls=OverlayWindowControls::ReservedWidth+32;
+    if(available>=rightControls)ImGui::SetCursorPosX(ImGui::GetCursorPosX()+available-rightControls);
     if(toolButton("help","Keyboard and mouse reference (?)\nAll edits apply immediately and save automatically.",ToolIcon::Help))ImGui::OpenPopup("graph_shortcuts");
-    ImGui::SameLine();
-    if(toolButton("hide","Hide overlay\nUse the overlay hotkey to show it again.",ToolIcon::Hide))Overlay_Hide();
-    ImGui::SameLine();
-    const auto windowMode=Overlay_GetWindowMode();
-    const bool maximized=windowMode==OverlayWindowGeometry::Mode::Maximized;
-    if(toolButton("maximize",maximized?"Restore window size":"Maximize window (keep taskbar visible)",maximized?ToolIcon::Windowed:ToolIcon::Maximize,true,maximized))Overlay_ToggleMaximized();
-    ImGui::SameLine();
-    const bool fullscreen=windowMode==OverlayWindowGeometry::Mode::Fullscreen;
-    if(toolButton("fullscreen",fullscreen?"Exit fullscreen (F11)":"Fullscreen (F11)",fullscreen?ToolIcon::ExitFullscreen:ToolIcon::Fullscreen,true,fullscreen))Overlay_ToggleFullscreen();
     ImGui::PopStyleVar();
     ImGui::EndDisabled();
     const char* toolbarPopup=nullptr;
