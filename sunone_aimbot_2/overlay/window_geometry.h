@@ -62,6 +62,12 @@ struct Presentation
     {
         change(mode == Mode::Maximized ? Mode::Windowed : Mode::Maximized, current);
     }
+    void setMode(Mode next,Rect current)
+    {
+        if(mode==next)return;
+        if(next==Mode::Fullscreen)beforeFullscreen=mode;
+        change(next,current);
+    }
     void toggleFullscreen(Rect current)
     {
         if (mode == Mode::Fullscreen) change(beforeFullscreen, current);

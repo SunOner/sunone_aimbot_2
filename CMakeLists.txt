@@ -272,6 +272,7 @@ set(AIMBOT_SOURCES
     "${SRC_DIR}/mouse/RP2350.cpp"
     "${SRC_DIR}/mouse/AimbotTarget.cpp"
     "${SRC_DIR}/nodes/node_graph.cpp"
+    "${SRC_DIR}/mcp/workflow_host.cpp"
     "${SRC_DIR}/nodes/node_config_bridge.cpp"
     "${SRC_DIR}/nodes/vision_runtime.cpp"
     "${SRC_DIR}/nodes/vision_outputs.cpp"
@@ -336,6 +337,9 @@ if(MSVC)
 endif()
 
 add_executable(ai ${AIMBOT_SOURCES})
+foreach(_mcp_configuration IN LISTS CMAKE_CONFIGURATION_TYPES)
+    configure_file("${CMAKE_SOURCE_DIR}/tools/workflow_mcp.py" "${CMAKE_CURRENT_BINARY_DIR}/${_mcp_configuration}/workflow_mcp.py" COPYONLY)
+endforeach()
 
 set_target_properties(ai PROPERTIES
     OUTPUT_NAME "ai"
@@ -442,6 +446,7 @@ target_link_libraries(ai PRIVATE
     d2d1
     setupapi
     WindowsApp
+    advapi32
 )
 
 if(NOT AIMBOT_USE_CUDA)
@@ -553,6 +558,10 @@ message(STATUS "C++/WinRT include: ${AIMBOT_CPPWINRT_INCLUDE_DIR}")
 
 include(CTest)
 if(BUILD_TESTING)
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if(Python3_Interpreter_FOUND)
+        add_test(NAME workflow_mcp_protocol_regressions COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/workflow_mcp_tests.py")
+    endif()
     add_executable(overlay_window_geometry_tests "${CMAKE_SOURCE_DIR}/tests/overlay_window_geometry_tests.cpp")
     target_include_directories(overlay_window_geometry_tests PRIVATE "${SRC_DIR}")
     if(MSVC)
@@ -637,6 +646,7 @@ if(BUILD_TESTING)
     # --benchmark mode also measures the real D3D11 renderer offscreen.
     add_executable(node_editor_input_tests
         "${CMAKE_SOURCE_DIR}/tests/node_editor_input_tests.cpp"
+        "${SRC_DIR}/config/config.cpp"
         "${SRC_DIR}/overlay/node_preview.cpp"
         "${SRC_DIR}/nodes/node_graph.cpp"
         "${SRC_DIR}/nodes/node_config_bridge.cpp"
@@ -646,7 +656,7 @@ if(BUILD_TESTING)
         "${SRC_DIR}/imgui/imgui_tables.cpp"
         "${SRC_DIR}/imgui/imgui_impl_dx11.cpp"
         "${SRC_DIR}/imgui/imgui_widgets.cpp")
-    target_link_libraries(node_editor_input_tests PRIVATE d3d11 dxgi)
+    target_link_libraries(node_editor_input_tests PRIVATE d3d11 dxgi WindowsApp)
     set(_node_benchmark_commit "unknown")
     set(_node_benchmark_dirty "unknown")
     find_package(Git QUIET)
@@ -666,7 +676,7 @@ if(BUILD_TESTING)
         NODE_BENCHMARK_BACKEND="$<IF:$<BOOL:${AIMBOT_USE_CUDA}>,cuda,dml>")
     target_include_directories(node_editor_input_tests PRIVATE
         "${SRC_DIR}" "${SRC_DIR}/config" "${SRC_DIR}/keyboard"
-        "${SRC_DIR}/imgui" "${AIMBOT_OPENCV_INCLUDE_DIR}")
+        "${SRC_DIR}/imgui" "${AIMBOT_OPENCV_INCLUDE_DIR}" "${AIMBOT_CPPWINRT_INCLUDE_DIR}")
     target_compile_definitions(node_editor_input_tests PRIVATE UNICODE _UNICODE _CONSOLE NOMINMAX)
     if(MSVC)
         set_target_properties(node_editor_input_tests PROPERTIES MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")

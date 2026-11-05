@@ -48,6 +48,7 @@
     <ClCompile Include="overlay\Game_overlay.cpp" />
     <ClCompile Include="overlay\config_dirty.cpp" />
     <ClCompile Include="nodes\node_graph.cpp" />
+    <ClCompile Include="mcp\workflow_host.cpp" />
     <ClCompile Include="nodes\preview_image.cpp" />
     <ClCompile Include="overlay\node_preview.cpp" />
     <ClCompile Include="nodes\node_config_bridge.cpp" />
@@ -135,6 +136,12 @@
     <ClInclude Include="nodes\vision_runtime.h" />
     <ClInclude Include="nodes\vision_outputs.h" />
     <ClInclude Include="overlay\node_editor.h" />
+    <ClInclude Include="overlay\node_mcp.inl" />
+    <ClInclude Include="mcp\workflow_host.h" />
+    <ClInclude Include="mcp\client_setup.h" />
+    <ClInclude Include="mcp\application_control.h" />
+    <ClInclude Include="overlay\node_mcp_application.inl" />
+    <ClInclude Include="overlay\model_export_control.h" />
     <ClInclude Include="mem\gpu_resource_manager.h" />
     <ClInclude Include="mem\cpu_affinity_manager.h" />
     <ClInclude Include="detector\cuda_preprocess.h" />

@@ -360,6 +360,15 @@ void pauseRejectsLateResultsAndReleasesButton()
     waitFor(state, [&] { return state->downs == 2; }, "Fresh detection must work after resume");
 }
 
+void explicitPauseIsIdempotent()
+{
+    DetectionBuffer buffer;const auto generation=buffer.currentGeneration();
+    buffer.setPaused(false);require(buffer.currentGeneration()==generation,"Setting the existing pause state invalidated frames");
+    buffer.setPaused(true);require(buffer.isPaused()&&buffer.currentGeneration()==generation+1,"Explicit pause did not invalidate the generation");
+    buffer.setPaused(true);require(buffer.currentGeneration()==generation+1,"Repeated MCP pause toggled or invalidated frames again");
+    buffer.setPaused(false);require(!buffer.isPaused()&&buffer.currentGeneration()==generation+2,"Explicit resume did not invalidate the paused generation");
+}
+
 void pauseResumeInvalidatesQueuedMoves()
 {
     resetFixture();
@@ -889,10 +898,11 @@ void applicationReloadPreservesGraphSettings()
     resetFixture();Config current=config;current.capture_method="duplication_api";current.ai_model="graph.onnx";current.capture_fps=91;current.arduino_port="COM4";
     const auto path=std::filesystem::temp_directory_path()/("sunone_app_reload_"+std::to_string(Clock::now().time_since_epoch().count())+".ini");
     struct Cleanup{std::filesystem::path path;~Cleanup(){std::error_code error;std::filesystem::remove(path,error);}} cleanup{path};
-    {std::ofstream file(path);file<<"capture_method = udp_capture\ndetection_resolution = 640\ncapture_fps = 30\nai_model = unrelated.onnx\nfovX = 120\narduino_port = COM99\ninput_method = ARDUINO\nbutton_exit = F10\n[Games]\nOTHER = 10,0.05,0.05\n";}
+    {std::ofstream file(path);file<<"capture_method = udp_capture\ndetection_resolution = 640\ncapture_fps = 30\nai_model = unrelated.onnx\nfovX = 120\narduino_port = COM99\ninput_method = ARDUINO\nbutton_exit = F10\nlocal_mcp_enabled = false\n[Games]\nOTHER = 10,0.05,0.05\n";}
     const auto previous=current;require(current.reloadApplicationSettings(path.string()),"Application reload failed");
     require(current.capture_method=="duplication_api"&&current.detection_resolution==320&&current.capture_fps==91&&current.ai_model=="graph.onnx"&&current.fovX==previous.fovX,"Reload imported old INI values into graph-owned runtime settings");
     require(current.arduino_port=="COM99"&&current.button_exit==std::vector<std::string>{"F10"}&&!current.sameInputDeviceSettings(previous),"Application reload lost device/hotkey changes");
+    require(!current.local_mcp_enabled,"Application reload re-enabled disabled MCP access");
     auto uiOnly=current;uiOnly.overlay_opacity=252;require(uiOnly.sameInputDeviceSettings(current),"An appearance change requires a device reconnect");
 }
 void physicalKeyNodesRejectInjectedMouseButtons()
@@ -927,6 +937,7 @@ int main()
         { "auto-shoot hold and disable", autoShootHoldsThenReleasesWhenDisabled },
         { "loop exit releases button", loopExitReleasesButton },
         { "pause rejects late inference", pauseRejectsLateResultsAndReleasesButton },
+        { "explicit pause is idempotent", explicitPauseIsIdempotent },
         { "pause/resume cancels queued moves", pauseResumeInvalidatesQueuedMoves },
         { "publication independent of slow input", publicationDoesNotWaitForSlowInput },
         { "graph output releases button", graphOutputReleasesButton },

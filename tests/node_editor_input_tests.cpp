@@ -25,6 +25,21 @@ OverlayWindowGeometry::Mode Overlay_GetWindowMode() { return testWindowPresentat
 void Overlay_ToggleMaximized() { testWindowPresentation.toggleMaximized({80,60,1100,740}); }
 void Overlay_ToggleFullscreen() { testWindowPresentation.toggleFullscreen({80,60,1100,740}); }
 void Overlay_Hide() { testOverlayHidden=true; }
+int testMcpFocusedGraph=-1,testMcpFocusedNode=0;
+void Overlay_OpenGraphNode(int graph,int node){testMcpFocusedGraph=graph;testMcpFocusedNode=node;}
+#include "../sunone_aimbot_2/mcp/application_control.h"
+#include "../sunone_aimbot_2/mcp/client_setup.h"
+#include "../sunone_aimbot_2/overlay/model_export_control.h"
+int testApplicationNotifications=0;
+AgentApplicationState Overlay_AgentState(){return {true,false,true,"windowed","workflow",1};}
+bool Overlay_AgentAction(const std::string& action,const std::string&,std::string& error){if(action=="select_tab"||action=="pause"||action=="resume")return true;error="Unsupported test action";return false;}
+void Overlay_ApplicationSettingsChanged(const Config&){++testApplicationNotifications;}
+namespace ModelExport
+{
+Result status(){return {};}
+bool start(const std::string&,bool,const Options&,std::string& error){error="Export unavailable in the input test";return false;}
+void cancel(){}
+}
 #include "../sunone_aimbot_2/overlay/source_choices.h"
 namespace SourceChoices {std::vector<Choice> enumerate(bool camera){return camera?std::vector<Choice>{{"Test camera","Camera"}}:std::vector<Choice>{{"Test window","Window"}};}}
 #include "../sunone_aimbot_2/overlay/node_editor.cpp"
@@ -1955,6 +1970,7 @@ void testDisplayCacheRefreshesAfterRevisionAndReopen()
 #include "node_editor_workflow_tests.h"
 #include "node_editor_migration_audit_tests.h"
 #include "node_group_connection_tests.h"
+#include "node_mcp_tests.h"
 
 namespace
 {
@@ -1998,6 +2014,7 @@ void testWindowButtonsStayOrderedAndReachable()
 }
 }
 
+#include "node_reroute_delete_input_tests.h"
 int main(int argc,char** argv)
 {
     try
@@ -2005,6 +2022,11 @@ int main(int argc,char** argv)
         if(argc>1&&std::string(argv[1])=="--benchmark")return benchmarkNodeEditor(argc>2?argv[2]:"benchmark_results/node_editor.csv",argc>3?argv[3]:"");
         const auto run=[&](const char* name,auto test){if(argc>2&&std::string(argv[1])=="--test"&&std::string(argv[2])!=name)return;gestureScenario=name;if(argc>1&&std::string(argv[1])=="--trace")std::cerr<<"Running "<<name<<std::endl;test();};
         run("testWindowButtonsStayOrderedAndReachable",testWindowButtonsStayOrderedAndReachable);
+        run("testMcpEditorTransactions",testMcpEditorTransactions);
+        run("testMcpDiagnosticsLease",testMcpDiagnosticsLease);
+        run("testMcpApplicationSettings",testMcpApplicationSettings);
+        run("testMcpClientPresets",testMcpClientPresets);
+        run("testDeletingReroutesWithDeleteKeepsWiresAcrossZoom",testDeletingReroutesWithDeleteKeepsWiresAcrossZoom);
         run("testSharedCalibrationTemplatesAndLayout",testSharedCalibrationTemplatesAndLayout);
         run("testRuntimeTuningAndReloadUseEditorTransactions",testRuntimeTuningAndReloadUseEditorTransactions);
         run("testWorkflowManagementIsImmediateAndUndoable",testWorkflowManagementIsImmediateAndUndoable);run("testWorkflowUsesCanvasWithoutPageTabs",testWorkflowUsesCanvasWithoutPageTabs);run("testModelExportJobLifecycle",testModelExportJobLifecycle);

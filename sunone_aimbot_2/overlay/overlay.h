@@ -28,6 +28,7 @@ OverlayWindowGeometry::Mode Overlay_GetWindowMode();
 void Overlay_ToggleMaximized();
 void Overlay_ToggleFullscreen();
 void Overlay_Hide();
+bool Overlay_StartMcp();
 void Overlay_OpenGraphNode(int graph,int node);
 
 extern std::atomic<bool> detection_resolution_changed;

@@ -8,6 +8,7 @@
 #include "overlay/draw_settings.h"
 #include "overlay/ui_sections.h"
 #include "overlay/export_job.h"
+#include "overlay/model_export_control.h"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -89,6 +90,26 @@ std::vector<ModelFile> onnxFiles(bool depth)
     std::sort(files.begin(),files.end(),[](const auto& a,const auto& b){return a.label<b.label;});return files;
 }
 }
+ModelExport::Result ModelExport::status(){return exportJob.snapshot();}
+void ModelExport::cancel(){cancelExport();}
+bool ModelExport::start(const std::string& input,bool depth,const Options& settings,std::string& error)
+{
+#ifndef USE_CUDA
+    error="TensorRT export requires the CUDA build. DML/CPU nodes use ONNX directly.";return false;
+#else
+    std::error_code ec;const auto path=std::filesystem::u8path(input);auto extension=path.extension().u8string();
+    std::transform(extension.begin(),extension.end(),extension.begin(),[](unsigned char c){return static_cast<char>(std::tolower(c));});
+    if(extension!=".onnx"||!std::filesystem::is_regular_file(path,ec)){error="Choose an existing ONNX model.";return false;}
+    if(!depth&&(settings.resolution<32||settings.resolution>8192||settings.minimum<32||settings.maximum>8192||settings.minimum>settings.optimal||settings.optimal>settings.maximum))
+    {error="Use dimensions from 32 to 8192, with minimum <= optimal <= maximum.";return false;}
+    const auto absolute=std::filesystem::absolute(path,ec).u8string();if(ec){error="Cannot resolve the model path.";return false;}
+    TrtBuildOptions options;options.fixedInputSize=settings.fixed;options.enableFp16=settings.fp16;options.enableFp8=settings.fp8;
+    options.inputWidth=options.inputHeight=settings.resolution;options.minProfileSize=settings.minimum;options.optProfileSize=settings.optimal;options.maxProfileSize=settings.maximum;
+    if(!exportJob.start(absolute,[absolute,depth,settings,options](const auto& cancel){return buildModel(absolute,depth,settings.rebuild,options,cancel);}))
+    {error="A model export is already running. Query its status or cancel it first.";return false;}
+    error.clear();return true;
+#endif
+}
 void draw_model_export()
 {
     static int type=0,lastType=-1;static std::vector<ModelFile> files;static std::string selected,error;
@@ -130,18 +151,8 @@ void draw_model_export()
         if(ImGui::Button("Build engine"))
         {
 #ifdef USE_CUDA
-            const std::string input=customPath[0]?customPath:selected;std::error_code ec;const auto path=std::filesystem::u8path(input);
-            auto extension=path.extension().u8string();std::transform(extension.begin(),extension.end(),extension.begin(),[](unsigned char c){return static_cast<char>(std::tolower(c));});
-            if(extension!=".onnx"||!std::filesystem::is_regular_file(path,ec))error="Choose an existing ONNX model.";
-            else if(type==0&&(resolution<32||resolution>8192||minimum<32||maximum>8192||minimum>optimal||optimal>maximum))error="Use positive dimensions from 32 to 8192, with minimum <= optimal <= maximum.";
-            else
-            {
-                TrtBuildOptions options;options.fixedInputSize=fixed;options.enableFp16=fp16;options.enableFp8=fp8;
-                options.inputWidth=options.inputHeight=resolution;options.minProfileSize=minimum;options.optProfileSize=optimal;options.maxProfileSize=maximum;
-                const bool depth=type==1,force=rebuild;const auto absolute=std::filesystem::absolute(path,ec).u8string();
-                if(ec)error="Cannot resolve the model path.";
-                else{error.clear();exportJob.start(absolute,[absolute,depth,force,options](const auto& cancel){return buildModel(absolute,depth,force,options,cancel);});}
-            }
+            ModelExport::Options options;options.fixed=fixed;options.fp16=fp16;options.fp8=fp8;options.rebuild=rebuild;options.resolution=resolution;options.minimum=minimum;options.optimal=optimal;options.maximum=maximum;
+            ModelExport::start(customPath[0]?customPath:selected,type==1,options,error);
 #endif
         }
         ImGui::EndDisabled();OverlayUI::EndSection();

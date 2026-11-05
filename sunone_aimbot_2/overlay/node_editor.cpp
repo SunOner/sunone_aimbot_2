@@ -986,17 +986,6 @@ void history(bool redo)
     for (int i=0;i<static_cast<int>(MaxGraphs);++i) { clearSelection(i); editor.selectedGroup[i]=0; }
     edited();
 }
-void removeNode(Graph& graph, int id)
-{
-    remember();
-    graph.links.erase(std::remove_if(graph.links.begin(), graph.links.end(), [id](const Link& link) {
-        return link.fromNode == id || link.toNode == id;
-    }), graph.links.end());
-    graph.nodes.erase(std::remove_if(graph.nodes.begin(), graph.nodes.end(), [id](const Node& node) { return node.id == id; }), graph.nodes.end());
-    for (auto& group : graph.groups)
-        group.nodes.erase(std::remove(group.nodes.begin(), group.nodes.end(), id), group.nodes.end());
-    edited();
-}
 void selectAll(Graph& graph, int tab)
 {
     clearSelection(tab); editor.selectedGroup[tab]=0;
@@ -1022,11 +1011,7 @@ void deleteSelection(Graph& graph, int tab)
     }
     remember();
     for(const int id:editor.tieSelection[tab])detachTie(graph,id);
-    const auto selected=[tab](int id) {return isSelected(tab,id);};
-    graph.links.erase(std::remove_if(graph.links.begin(),graph.links.end(),[&](const Link& l) {return selected(l.fromNode)||selected(l.toNode);}),graph.links.end());
-    graph.nodes.erase(std::remove_if(graph.nodes.begin(),graph.nodes.end(),[&](const Node& n) {return selected(n.id);}),graph.nodes.end());
-    for (auto& group:graph.groups)
-        group.nodes.erase(std::remove_if(group.nodes.begin(),group.nodes.end(),selected),group.nodes.end());
+    removeNodes(graph,editor.selection[tab]);
     clearSelection(tab); cancelGestures(); edited();
 }
 void groupSelection(Graph& graph, int tab)
@@ -5164,4 +5149,5 @@ void draw_node_workflow(int workflow)
 void draw_node_aim() { draw_node_workflow(1); }
 void draw_node_auto_shoot() { draw_node_workflow(2); }
 void draw_node_recoil() { draw_node_workflow(3); }
+#include "overlay/node_mcp.inl"
 void draw_node_vision() { draw_node_workflow(4); }

@@ -45,6 +45,14 @@ struct DetectionBuffer
         clearLocked();
     }
 
+    void setPaused(bool value)
+    {
+        std::unique_lock<std::shared_mutex> generationLock(generationMutex);
+        std::lock_guard<std::mutex> lock(mutex);
+        if(paused==value)return;
+        paused=value;++generation;generationStartedAt=std::chrono::steady_clock::now();clearLocked();
+    }
+
     // The callback must not re-enter the generation gate. Shared access keeps
     // frame submission/publication independent of device I/O. Pause takes the
     // exclusive lock, waits for in-flight input, and invalidates frames/moves.

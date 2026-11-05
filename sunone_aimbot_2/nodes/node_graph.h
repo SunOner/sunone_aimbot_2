@@ -330,6 +330,9 @@ bool migrateStarterLayout(Graph& graph);
 bool validate(const Workspace& workspace, std::string& error);
 // Checks link types and cycles without requiring a complete output node.
 bool canConnect(const Graph& graph, const Link& link, std::string& error);
+// Deleting routing points reconnects each surviving destination to the original
+// source. Ordinary deleted nodes still disconnect their branches.
+void removeNodes(Graph& graph,const std::vector<int>& ids);
 struct Context
 {
     bool inputCaptured = false;
@@ -429,6 +432,7 @@ public:
     bool hasDynamicProviders() const;
     Telemetry telemetry() const;
     void setTelemetryEnabled(bool enabled);
+    void requestTelemetry(std::chrono::milliseconds duration);
     void setPreviewNodes(std::vector<int> nodes);
     std::shared_ptr<const std::vector<int>> previewNodes() const;
     bool load(const std::string& path, std::string& error);
@@ -441,12 +445,13 @@ private:
     mutable std::mutex telemetryMutex_;
     Telemetry telemetry_;
     std::atomic<bool> telemetryEnabled_{true};
+    std::atomic<std::int64_t> remoteTelemetryUntil_{0};
     std::shared_ptr<const std::vector<int>> previewNodes_;
     std::atomic<std::int64_t> previewTouched_{0};
     std::shared_ptr<const ConfigurationSnapshot> configurationSnapshot_;
     std::mutex configurationMutex_;
     std::map<int,std::string> configurationErrors_;
-    struct EventState { bool previous = false; bool toggled = false; bool reseed = false; };
+    struct EventState { bool previous = false; bool toggled = false; bool reseed = false; std::uint64_t tick=0; };
     struct FilterState
     {
         DetectionStream input,output;
@@ -463,6 +468,8 @@ private:
             bool available = false, active = false, signalActive = false;
         };
         std::map<int,EventState> events;
+        std::shared_ptr<const Program> eventProgram;
+        std::uint64_t eventTick=0;
         std::map<int,FilterState> filters;
         std::map<int,Node> configurations;
         struct SettingsState

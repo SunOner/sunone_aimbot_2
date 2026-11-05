@@ -258,6 +258,7 @@ Use `None` to disable a button where supported.
 | `overlay_opacity` | `225` | Overlay opacity, `0..255`. |
 | `overlay_ui_scale` | `1.0` | Overlay UI scale. |
 | `overlay_sidebar_collapsed` | `false` | Show only sidebar icons. The sidebar chevron toggles this preference; changes save automatically. |
+| `local_mcp_enabled` | `true` | Allow local workflow agents; controlled in System → Agent access. |
 | `overlay_exclude_from_capture` | `true` | Attempts to keep overlay out of captured frames. |
 | `overlay_x` | `0` | Overlay editor window X position. Auto-saved after moving. |
 | `overlay_y` | `0` | Overlay editor window Y position. Auto-saved after moving. |

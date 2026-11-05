@@ -5,6 +5,7 @@ void NodeEditor_Load();
 void NodeEditor_RequestReload(const std::string& applicationWarning = {});
 void NodeEditor_RequestTuning(int offsetDirection,int recoilDirection,bool head);
 void NodeEditor_ProcessPendingActions();
+std::string NodeEditor_McpCall(const std::string& request,bool userEditing=false);
 void NodeEditor_SetPreview(bool preview);
 void NodeEditor_Flush();
 void NodeEditor_EndInteraction(bool preserveViewport = false);

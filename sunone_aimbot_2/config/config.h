@@ -151,6 +151,7 @@ public:
     int overlay_opacity;
     float overlay_ui_scale;
     bool overlay_sidebar_collapsed = false;
+    bool local_mcp_enabled = true;
     bool overlay_exclude_from_capture;
     int overlay_x;
     int overlay_y;

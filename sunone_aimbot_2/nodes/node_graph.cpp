@@ -472,6 +472,12 @@ bool providerMayBeEnabled(const CompiledNode& node)
         if(inputs[pin].defaultParameter&&std::strcmp(inputs[pin].defaultParameter,"enabled")==0&&node.inputs[pin]>=0)return true;
     return isSink(node.node.kind)&&node.inputs[0]>=0;
 }
+bool sameNodeExecution(const Node& a,const Node& b)
+{
+    return a.kind==b.kind&&a.value==b.value&&a.bypassed==b.bypassed&&a.disabled==b.disabled&&
+        a.parameters==b.parameters&&a.textParameters==b.textParameters&&a.inputValues==b.inputValues&&a.inputTexts==b.inputTexts;
+}
+bool eventNode(K kind){return kind==K::KeyHeld||kind==K::KeyPressed||kind==K::KeyReleased||kind==K::Toggle;}
 bool sameExecution(const Workspace& a,const Workspace& b)
 {
     if(a.graphs.size()!=b.graphs.size())return false;
@@ -479,7 +485,7 @@ bool sameExecution(const Workspace& a,const Workspace& b)
     {
         const Graph& first = a.graphs[g];
         const Graph& second = b.graphs[g];
-        if (first.kind != second.kind || first.active!=second.active || first.enabled!=second.enabled || first.nodes.size() != second.nodes.size() || first.links.size() != second.links.size()) return false;
+        if (workflowId(first,g)!=workflowId(second,g)||first.kind != second.kind || first.active!=second.active || first.enabled!=second.enabled || first.nodes.size() != second.nodes.size() || first.links.size() != second.links.size()) return false;
         std::unordered_map<int,const Node*> nodes;
         for (const Node& node : first.nodes) nodes.emplace(node.id,&node);
         for (const Node& node : second.nodes)
@@ -487,9 +493,7 @@ bool sameExecution(const Workspace& a,const Workspace& b)
             const auto found = nodes.find(node.id);
             if (found == nodes.end()) return false;
             const Node& other = *found->second;
-            if (node.kind != other.kind || node.value != other.value || node.bypassed != other.bypassed || node.disabled!=other.disabled ||
-                node.parameters!=other.parameters || node.textParameters!=other.textParameters ||
-                node.inputValues!=other.inputValues || node.inputTexts!=other.inputTexts) return false;
+            if (!sameNodeExecution(node,other)) return false;
         }
         using Edge = std::tuple<int,int,int,int>;
         std::vector<Edge> left,right;
@@ -1744,10 +1748,13 @@ int activePage(const Workspace& workspace,int workflow)
     return -1;
 }
 int previewKey(int graph,int node){return graph==3?node:(graph+1)*NodeKeyStride+node;}
-bool validate(const Workspace& workspace, std::string& error)
+namespace
+{
+bool compileWorkspace(const Workspace& workspace, std::string& error,std::vector<CompiledGraph>* output)
 {
     error.clear();
     if(workspace.graphs.size()>MaxGraphs){error="Workspace supports at most "+std::to_string(MaxGraphs)+" workflows.";return false;}
+    if(output){output->clear();output->reserve(workspace.graphs.size());}
     struct WorkflowInfo{GraphKind kind;std::string name;int icon;bool enabled;int active=0;std::set<std::string> pages;};
     std::map<int,WorkflowInfo> workflows;std::vector<CompiledNode> captures;bool sharedFrame=false;
     for (std::size_t i = 0; i < workspace.graphs.size(); ++i)
@@ -1772,6 +1779,7 @@ bool validate(const Workspace& workspace, std::string& error)
             sharedFrame|=node.potentiallyActive&&node.node.kind==K::CurrentFrame&&!node.node.disabled&&!node.node.bypassed;
             if(node.node.kind==K::CaptureSource&&!node.node.disabled&&!node.node.bypassed)captures.push_back(node);
         }
+        if(output)output->push_back(std::move(compiled));
     }
     if(workflows.size()>MaxWorkflows){error="Workspace supports at most "+std::to_string(MaxWorkflows)+" workflows.";return false;}
     for(const auto& workflow:workflows)if(workflow.second.active!=1){error="Each workflow requires exactly one active page.";return false;}
@@ -1781,6 +1789,8 @@ bool validate(const Workspace& workspace, std::string& error)
     if(captureSources>1){error="Only one reachable Capture source is supported across active workflows.";return false;}
     return true;
 }
+}
+bool validate(const Workspace& workspace, std::string& error){return compileWorkspace(workspace,error,nullptr);}
 bool canConnect(const Graph& graph, const Link& link, std::string& error)
 {
     Graph draft = graph;
@@ -1791,6 +1801,46 @@ bool canConnect(const Graph& graph, const Link& link, std::string& error)
     CompiledGraph compiled;
     error.clear();
     return compileGraph(draft, compiled, error);
+}
+
+void removeNodes(Graph& graph,const std::vector<int>& ids)
+{
+    if(ids.empty())return;
+    const std::unordered_set<int> removed(ids.begin(),ids.end());
+    std::unordered_map<int,const Node*> nodes;
+    std::unordered_map<int,const Link*> incoming;
+    for(const auto& node:graph.nodes)nodes.emplace(node.id,&node);
+    for(const auto& link:graph.links)if(link.toPort==0)incoming.emplace(link.toNode,&link);
+    std::vector<Link> retained;retained.reserve(graph.links.size());
+    for(const auto& outgoing:graph.links)
+    {
+        if(removed.count(outgoing.toNode))continue;
+        Link link=outgoing;std::vector<const Link*> route{&outgoing};std::unordered_set<int> visited;
+        bool connected=true;
+        while(removed.count(link.fromNode))
+        {
+            const auto node=nodes.find(link.fromNode);const auto input=incoming.find(link.fromNode);
+            if(node==nodes.end()||!Layout::isReroute(node->second->kind)||input==incoming.end()||!visited.insert(link.fromNode).second)
+            {connected=false;break;}
+            route.push_back(input->second);link.fromNode=input->second->fromNode;link.fromPort=input->second->fromPort;
+        }
+        if(!connected)continue;
+        if(route.size()>1)
+        {
+            link.ties.clear();std::unordered_set<int> seen;
+            for(auto part=route.rbegin();part!=route.rend();++part)for(const int tie:(*part)->ties)
+                if(seen.insert(tie).second)link.ties.push_back(tie);
+            if(link.ties.size()>MaxTiesPerLink)
+            {
+                const auto all=std::move(link.ties);link.ties.clear();link.ties.reserve(MaxTiesPerLink);
+                for(std::size_t i=0;i<MaxTiesPerLink;++i)link.ties.push_back(all[(i*(all.size()-1)+(MaxTiesPerLink-1)/2)/(MaxTiesPerLink-1)]);
+            }
+        }
+        retained.push_back(std::move(link));
+    }
+    graph.links=std::move(retained);
+    graph.nodes.erase(std::remove_if(graph.nodes.begin(),graph.nodes.end(),[&](const Node& node){return removed.count(node.id)!=0;}),graph.nodes.end());
+    for(auto& group:graph.groups)group.nodes.erase(std::remove_if(group.nodes.begin(),group.nodes.end(),[&](int id){return removed.count(id)!=0;}),group.nodes.end());
 }
 
 struct Service::Program
@@ -1828,14 +1878,12 @@ Workspace Service::workspaceMetadata() const
 std::uint64_t Service::revision() const { return std::atomic_load(&program_)->revision; }
 bool Service::publish(const Workspace& workspace, std::string& error)
 {
-    if (!validate(workspace, error)) return false;
     auto next = std::make_shared<Program>();
+    if (!compileWorkspace(workspace, error,&next->graphs)) return false;
     next->workspace = workspace;
     for(std::size_t i=0;i<next->workspace.graphs.size();++i)if(!next->workspace.graphs[i].workflow)next->workspace.graphs[i].workflow=static_cast<int>(i)+1;
-    next->graphs.resize(workspace.graphs.size());
     for(std::size_t i=0;i<workspace.graphs.size();++i)
     {
-        if(!compileGraph(workspace.graphs[i],next->graphs[i],error))return false;
         for(auto& entry:next->graphs[i].nodes)
         {
             entry.node.runtimeKey=static_cast<int>(i)*NodeKeyStride+entry.node.id;
@@ -1907,6 +1955,7 @@ std::vector<Node> Service::evaluateConfiguration(const Context& context)
 }
 Actions Service::evaluateDomain(const Context& context,bool vision,bool configurationOnly)
 {
+    const auto now = std::chrono::steady_clock::now();
     const auto program = std::atomic_load(&program_);
     const auto previews=vision?previewNodes():nullptr;
     const bool sharedFrame=program->sharedFrame||(program->potentialFrame&&previews&&!previews->empty());
@@ -1914,13 +1963,55 @@ Actions Service::evaluateDomain(const Context& context,bool vision,bool configur
     // One control worker and one Vision worker own separate mutable state.
     // Neither holds a mutex while running provider callbacks.
     auto& domain=configurationOnly?configurationDomain_:domains_[vision?1:0];
-    const bool monitorSignals = !configurationOnly&&telemetryEnabled_.load(std::memory_order_relaxed);
+    ++domain.eventTick;
+    const bool monitorSignals = !configurationOnly&&(telemetryEnabled_.load(std::memory_order_relaxed)||
+        now.time_since_epoch().count()<remoteTelemetryUntil_.load(std::memory_order_relaxed));
     const auto configuration=context.useConfigurationSnapshot&&!configurationOnly&&vision?std::atomic_load(&configurationSnapshot_):nullptr;
     auto nextConfiguration=configurationOnly?std::make_shared<ConfigurationSnapshot>():nullptr;
     if(nextConfiguration)nextConfiguration->revision=program->revision;
     if(domain.revision!=program->revision)
     {
-        domain.events.clear();domain.filters.clear();domain.configurations.clear();domain.settings.clear();domain.calibrations.clear();domain.previews.clear();domain.revision=program->revision;domain.sampledAt={};
+        // Latches belong to workflow/node identities, not vector slots or the
+        // whole document revision. Only rebuild dependency comparisons on edits.
+        std::map<int,EventState> retained;
+        if(domain.eventProgram)
+        {
+            const auto& before=*domain.eventProgram;
+            std::map<std::pair<int,std::string>,std::size_t> previousGraphs;
+            for(std::size_t g=0;g<before.graphs.size();++g)previousGraphs.emplace(std::pair{workflowId(before.workspace.graphs[g],g),pageTitle(before.workspace.graphs[g])},g);
+            for(std::size_t g=0;g<program->graphs.size();++g)
+            {
+                const auto& page=program->workspace.graphs[g];
+                if(!page.active||!page.enabled||(page.kind==GraphKind::Vision)!=vision)continue;
+                const auto found=previousGraphs.find({workflowId(page,g),pageTitle(page)});if(found==previousGraphs.end())continue;
+                const auto previousGraph=found->second;const auto& previousPage=before.workspace.graphs[previousGraph];
+                if(page.kind!=previousPage.kind)continue;
+                const auto& oldNodes=before.graphs[previousGraph].nodes;const auto& nodes=program->graphs[g].nodes;
+                std::unordered_map<int,std::size_t> oldIndices;
+                for(std::size_t i=0;i<oldNodes.size();++i)oldIndices.emplace(oldNodes[i].node.id,i);
+                std::vector<bool> unchanged(nodes.size(),false);
+                for(std::size_t i=0;i<nodes.size();++i)
+                {
+                    const auto& next=nodes[i];const auto oldIndex=oldIndices.find(next.node.id);if(oldIndex==oldIndices.end())continue;
+                    const auto& old=oldNodes[oldIndex->second];bool same=sameNodeExecution(next.node,old.node);
+                    const auto dependency=[&](int nextIndex,int oldIndex){return nextIndex<0||oldIndex<0?nextIndex==oldIndex:
+                        nodes[nextIndex].node.id==oldNodes[oldIndex].node.id&&unchanged[nextIndex];};
+                    for(std::size_t pin=0;pin<next.inputs.size()&&same;++pin)same=dependency(next.inputs[pin],old.inputs[pin]);
+                    same=same&&dependency(next.variableSource,old.variableSource);
+                    // Cross-workflow calibration changes are conservatively
+                    // reseeded; their live values must not synthesize edges.
+                    unchanged[i]=same&&next.sharedGraph<0&&old.sharedGraph<0;
+                    if(!eventNode(next.node.kind)||next.node.kind!=old.node.kind||next.node.disabled||next.node.bypassed||!next.potentiallyActive)continue;
+                    EventState state;state.reseed=true;
+                    const auto previous=domain.events.find(static_cast<int>(previousGraph)*NodeKeyStride+next.node.id);
+                    if(previousPage.active&&previousPage.enabled&&previous!=domain.events.end())state=previous->second;
+                    if(!unchanged[i])state.reseed=true;
+                    retained.emplace(static_cast<int>(g)*NodeKeyStride+next.node.id,state);
+                }
+            }
+        }
+        domain.events=std::move(retained);domain.eventProgram=program;
+        domain.filters.clear();domain.configurations.clear();domain.settings.clear();domain.calibrations.clear();domain.previews.clear();domain.revision=program->revision;domain.sampledAt={};
         for(auto& signals:domain.signals)signals.clear();domain.signalProgram.reset();
     }
     if(monitorSignals&&!domain.telemetryWasEnabled)
@@ -1948,7 +2039,6 @@ Actions Service::evaluateDomain(const Context& context,bool vision,bool configur
     inputIsCaptured();
     Actions actions;
     actions.revision = program->revision;
-    const auto now = std::chrono::steady_clock::now();
     bool sample = monitorSignals && now - domain.sampledAt >= std::chrono::milliseconds(33);
     auto completedAt=now;
     Telemetry telemetry;
@@ -2063,7 +2153,7 @@ Actions Service::evaluateDomain(const Context& context,bool vision,bool configur
             const Node& settings = *resolved;
             if(resolved!=&n.node)for(const auto pin:n.bindings)readInputs[i]|=std::uint64_t{1}<<pin;
             if(settings.disabled)
-            {values[i].type=def.outputs.empty()?T::Boolean:def.outputs.front().type;values[i].valid=false;return values[i];}
+            {values[i]=Value{};values[i].type=def.outputs.empty()?T::Boolean:def.outputs.front().type;values[i].valid=false;return values[i];}
             if (settings.bypassed)
             {
                 if (isSink(settings.kind))
@@ -2350,7 +2440,7 @@ Actions Service::evaluateDomain(const Context& context,bool vision,bool configur
             case K::IntegerSubtract: out=integer(static_cast<std::int64_t>(inputs[0].integer)-inputs[1].integer); break;
             case K::IntegerMultiply: out=integer(static_cast<std::int64_t>(inputs[0].integer)*inputs[1].integer); break;
             case K::IntegerDivide:
-                if(inputs[1].integer==0){out.type=T::Integer;out.valid=false;out.error="Int division by zero.";}
+                if(inputs[1].integer==0){out.type=T::Integer;out.valid=false;if(valid)out.error="Int division by zero.";}
                 else out=integer(static_cast<std::int64_t>(inputs[0].integer)/inputs[1].integer);
                 break;
             case K::IntegerClamp: out=integer(std::clamp(inputs[0].integer,std::min(inputs[1].integer,inputs[2].integer),std::max(inputs[1].integer,inputs[2].integer))); break;
@@ -2362,7 +2452,9 @@ Actions Service::evaluateDomain(const Context& context,bool vision,bool configur
             case K::Add: out = number(a + b); break;
             case K::Subtract: out = number(a - b); break;
             case K::Multiply: out = number(a * b); break;
-            case K::Divide: out = number(b != 0.0 ? a / b : std::numeric_limits<double>::quiet_NaN()); break;
+            case K::Divide:
+                out=number(b!=0.0?a/b:std::numeric_limits<double>::quiet_NaN());
+                if(valid){if(b==0.0)out.error="Float division by zero.";else if(!out.valid)out.error="Float result is not finite.";}break;
             case K::Clamp: out = number(std::clamp(a, std::min(b, inputs[2].number), std::max(b, inputs[2].number))); break;
             case K::PointX: out = number(inputs[0].point.x); break;
             case K::PointY: out = number(inputs[0].point.y); break;
@@ -2584,7 +2676,10 @@ Actions Service::evaluateDomain(const Context& context,bool vision,bool configur
             case K::KeyReleased:
             {
                 auto& state=domain.events[nodeKey];
+                if(state.tick&&state.tick!=domain.eventTick-1)state.reseed=true;
+                state.tick=domain.eventTick;
                 if(inputIsCaptured()){state.reseed=true;out=boolean(false);break;}
+                if(!context.keyDown){state.reseed=true;out=boolean(false);out.valid=false;break;}
                 const int key=static_cast<int>(parameter(settings,"virtual_key"));const bool held=key>0&&context.keyDown&&context.keyDown(key);
                 if(inputIsCaptured()){state.reseed=true;out=boolean(false);break;}
                 out=boolean(settings.kind==K::KeyHeld?held:!state.reseed&&
@@ -2594,7 +2689,10 @@ Actions Service::evaluateDomain(const Context& context,bool vision,bool configur
             case K::Toggle:
             {
                 auto& state=domain.events[nodeKey];
+                if(state.tick&&state.tick!=domain.eventTick-1)state.reseed=true;
+                state.tick=domain.eventTick;
                 if(inputIsCaptured()){state.reseed=true;out=boolean(false);break;}
+                if(!valid){state.reseed=true;out=boolean(state.toggled);out.valid=false;break;}
                 if(!state.reseed&&valid&&inputs[0].boolean&&!state.previous)state.toggled=!state.toggled;
                 state.previous=valid&&inputs[0].boolean;state.reseed=false;out=boolean(state.toggled);break;
             }
@@ -2707,7 +2805,10 @@ Actions Service::evaluateDomain(const Context& context,bool vision,bool configur
             catch(const std::exception& error){out.valid=false;out.error=error.what();}
             catch(...){out.valid=false;out.error="Node provider failed.";}
             out.valid = out.valid && valid;
+            if(!valid)for(std::size_t pin=0;pin<def.dataInputs;++pin)
+                if(!inputs[pin].valid&&!inputs[pin].error.empty()){out.error=inputs[pin].error;break;}
             if(context.nodeError){const auto error=context.nodeError(nodeKey);if(!error.empty()){out.error=error;out.valid=false;}}
+            if(!out.valid&&eventNode(settings.kind))domain.events[nodeKey].reseed=true;
             if(!out.valid&&out.boolean)
             {
                 if(settings.kind==K::VisionOutput)actions.visionDetections.reset();
@@ -2871,6 +2972,11 @@ void Service::setTelemetryEnabled(bool enabled)
 {
     telemetryEnabled_.store(enabled,std::memory_order_relaxed);
     if(!enabled)setPreviewNodes({});
+}
+void Service::requestTelemetry(std::chrono::milliseconds duration)
+{
+    duration=std::clamp(duration,std::chrono::milliseconds(0),std::chrono::milliseconds(5000));
+    remoteTelemetryUntil_.store((std::chrono::steady_clock::now()+duration).time_since_epoch().count(),std::memory_order_relaxed);
 }
 void Service::setPreviewNodes(std::vector<int> nodes)
 {

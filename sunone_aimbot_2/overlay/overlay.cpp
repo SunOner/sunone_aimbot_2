@@ -32,6 +32,8 @@
 #include "overlay/node_editor.h"
 #include "overlay/window_geometry.h"
 #include "overlay/window_controls.h"
+#include "mcp/workflow_host.h"
+#include "mcp/application_control.h"
 #include "nodes/node_graph.h"
 #include "nodes/vision_runtime.h"
 #include "nodes/preview_image.h"
@@ -107,7 +109,8 @@ static RECT g_sidebarToggleRect{};
 static OverlayWindowControls::Strip g_windowControls;
 static bool g_pendingOverlayGeometryDirty = false;
 static OverlayWindowGeometry::Presentation g_windowPresentation;
-enum class WindowAction { None, Maximize, Fullscreen, Hide };
+enum class WindowAction { None, Maximize, Fullscreen, Hide, Show, Windowed, SetMaximized, SetFullscreen };
+static int g_agentPause=-1;
 static WindowAction g_windowAction = WindowAction::None;
 static bool g_applyingWindowMode = false;
 
@@ -921,6 +924,7 @@ static void ApplyOverlayPresentation(HWND hwnd)
 static void ApplyPendingWindowAction()
 {
     const auto action = g_windowAction; g_windowAction = WindowAction::None;
+    if(action==WindowAction::Show){SetOverlayVisible(true);return;}
     if (action == WindowAction::Hide) { SetOverlayVisible(false); return; }
     RECT current{};
     if (action == WindowAction::None || !g_hwnd || !::GetWindowRect(g_hwnd, &current)) return;
@@ -928,7 +932,13 @@ static void ApplyPendingWindowAction()
     if (g_windowPresentation.mode == OverlayWindowGeometry::Mode::Windowed)
         StoreOverlayWindowGeometry(g_hwnd, true);
     if (action == WindowAction::Maximize) g_windowPresentation.toggleMaximized(GeometryRect(current));
-    else g_windowPresentation.toggleFullscreen(GeometryRect(current));
+    else if(action==WindowAction::Fullscreen) g_windowPresentation.toggleFullscreen(GeometryRect(current));
+    else
+    {
+        const auto desired=action==WindowAction::Windowed?OverlayWindowGeometry::Mode::Windowed:action==WindowAction::SetMaximized?OverlayWindowGeometry::Mode::Maximized:OverlayWindowGeometry::Mode::Fullscreen;
+        if(g_windowPresentation.mode==desired)return;
+        g_windowPresentation.setMode(desired,GeometryRect(current));
+    }
     g_autoResizeEnabled = false;
     ApplyOverlayPresentation(g_hwnd);
     StoreOverlayWindowGeometry(g_hwnd, true);
@@ -1863,6 +1873,10 @@ void OverlayThread()
 
     SetupImGui();
 
+    bool mcpEnabled=false;
+    {std::lock_guard<std::mutex> lock(configMutex);mcpEnabled=config.local_mcp_enabled;}
+    if(mcpEnabled)Overlay_StartMcp();else WorkflowMcp::stop();
+
     SetOverlayVisible(g_overlayPreview);
 
     for (const auto& pair : KeyCodes::key_code_map)
@@ -1895,7 +1909,14 @@ void OverlayThread()
         }
         if (shouldExit) break;
 
-        {std::lock_guard<std::mutex> lock(configMutex);NodeEditor_ProcessPendingActions();}
+        {
+            std::lock_guard<std::mutex> lock(configMutex);NodeEditor_ProcessPendingActions();
+            if(mcpEnabled!=config.local_mcp_enabled)
+            {mcpEnabled=config.local_mcp_enabled;if(mcpEnabled)Overlay_StartMcp();else WorkflowMcp::stop();}
+            WorkflowMcp::process();
+        }
+        if(g_agentPause>=0){detectionBuffer.setPaused(g_agentPause!=0);g_agentPause=-1;}
+        ApplyPendingWindowAction();
         overlayCfg = SnapshotOverlayThreadConfig();
 
         // Preview has no keyboard listener. Keep its configured exit hotkey
@@ -1933,6 +1954,7 @@ void OverlayThread()
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 
+    WorkflowMcp::stop();
     NodeEditor_EndInteraction();
     NodeGraph::service().setTelemetryEnabled(false);
     editorInputCaptured.store(false);
@@ -1966,6 +1988,41 @@ OverlayWindowGeometry::Mode Overlay_GetWindowMode() { return g_windowPresentatio
 void Overlay_ToggleMaximized() { g_windowAction = WindowAction::Maximize; }
 void Overlay_ToggleFullscreen() { g_windowAction = WindowAction::Fullscreen; }
 void Overlay_Hide() { g_windowAction = WindowAction::Hide; }
+AgentApplicationState Overlay_AgentState()
+{
+    AgentApplicationState state;state.visible=g_overlayVisible;state.preview=g_overlayPreview;state.paused=detectionBuffer.isPaused();state.workflow=ActiveWorkflowId();
+    state.windowMode=g_windowPresentation.mode==OverlayWindowGeometry::Mode::Windowed?"windowed":g_windowPresentation.mode==OverlayWindowGeometry::Mode::Maximized?"maximized":"fullscreen";
+    const char* tabs[]={"input","hotkeys","overlay","system","export","stats","debug"};
+    state.tab=state.workflow?"workflow":tabs[std::clamp(g_activeOverlayTab-4,0,6)];return state;
+}
+bool Overlay_AgentAction(const std::string& action,const std::string& tab,std::string& error)
+{
+    if(action=="show")g_windowAction=WindowAction::Show;
+    else if(action=="hide")g_windowAction=WindowAction::Hide;
+    else if(action=="windowed")g_windowAction=WindowAction::Windowed;
+    else if(action=="maximized")g_windowAction=WindowAction::SetMaximized;
+    else if(action=="fullscreen")g_windowAction=WindowAction::SetFullscreen;
+    else if(action=="pause"||action=="resume")g_agentPause=action=="pause"?1:0;
+    else if(action=="reconnect_input")input_method_changed=true;
+    else if(action=="select_tab")
+    {
+        const std::vector<std::string> tabs={"input","hotkeys","overlay","system","export","stats","debug"};const auto found=std::find(tabs.begin(),tabs.end(),tab);
+        if(found==tabs.end()){error="Unknown application tab. Use get_application.tabs.";return false;}
+        NodeEditor_EndInteraction();g_activeOverlayTab=4+static_cast<int>(found-tabs.begin());
+    }
+    else{error="Unknown application action.";return false;}return true;
+}
+void Overlay_ApplicationSettingsChanged(const Config& before)
+{
+    if(!config.sameInputDeviceSettings(before))input_method_changed=true;
+    if(config.overlay_opacity!=before.overlay_opacity)Overlay_SetOpacity(config.overlay_opacity);
+    OverlayConfig_MarkDirty();
+}
+bool Overlay_StartMcp()
+{
+    return WorkflowMcp::start([](const std::string& request){return NodeEditor_McpCall(request,g_overlayVisible&&
+        (ImGui::IsAnyItemActive()||ImGui::IsPopupOpen(nullptr,ImGuiPopupFlags_AnyPopupId|ImGuiPopupFlags_AnyPopupLevel)));});
+}
 
 int APIENTRY _tWinMain(_In_ HINSTANCE hInstance,
     _In_opt_ HINSTANCE hPrevInstance,

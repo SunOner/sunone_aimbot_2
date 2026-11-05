@@ -603,9 +603,15 @@ void testDisableIsDistinctFromBypassAndPersists()
 #include "node_workflow_tests.h"
 #include "node_migration_audit_tests.h"
 #include "node_shared_calibration_tests.h"
+#include "node_runtime_audit_tests.h"
+#include "node_reroute_delete_tests.h"
 int main()
 {
     const auto run=[](const char* name,auto test){try{test();}catch(const std::exception& error){throw std::runtime_error(std::string(name)+": "+error.what());}};
+    try{run("testRerouteDeletionPreservesBranchesAndRoutes",testRerouteDeletionPreservesBranchesAndRoutes);run("testRerouteDeletionSupportsEveryTypeAndRouteLimits",testRerouteDeletionSupportsEveryTypeAndRouteLimits);}
+    catch(const std::exception& error){std::cerr<<"Reroute deletion test failed: "<<error.what()<<'\n';return 1;}
+    try{run("testEventStateSurvivesUnrelatedLogicEdits",testEventStateSurvivesUnrelatedLogicEdits);run("testUnavailableTriggersDoNotCreateRecoveryEdges",testUnavailableTriggersDoNotCreateRecoveryEdges);run("testErrorCausesPropagateAndRecover",testErrorCausesPropagateAndRecover);run("testDormantBranchesDoNotReplayKeyEdges",testDormantBranchesDoNotReplayKeyEdges);}
+    catch(const std::exception& error){std::cerr<<"Node runtime audit failed: "<<error.what()<<'\n';return 1;}
     try{run("testSharedCalibrationAcrossWorkflows",testSharedCalibrationAcrossWorkflows);run("testProcessingMigrationPreservesScopeAndFullGraphs",testProcessingMigrationPreservesScopeAndFullGraphs);run("testRecoilCalibrationAndMigration",testRecoilCalibrationAndMigration);}
     catch(const std::exception& error){std::cerr<<"Recoil calibration test failed: "<<error.what()<<'\n';return 1;}
     try{run("testLayoutFitsExpandedNodesAndNestedGroups",testLayoutFitsExpandedNodesAndNestedGroups);run("testHistoricalStarterLayoutMigrationPreservesWiring",testHistoricalStarterLayoutMigrationPreservesWiring);run("testSplitStarterWorkflowMigratesWithoutChangingLogic",testSplitStarterWorkflowMigratesWithoutChangingLogic);run("testManualDimensionsAreDurablePresentationOnly",testManualDimensionsAreDurablePresentationOnly);run("testIntegerArithmeticAndConversions",testIntegerArithmeticAndConversions);run("testIntegerTargetPropertiesKeepLegacyConnections",testIntegerTargetPropertiesKeepLegacyConnections);run("testNodeBindings",testNodeBindings);run("testOutputLayers",testOutputLayers);run("testWireBendsArePersistentVisualMetadata",testWireBendsArePersistentVisualMetadata);}

@@ -110,6 +110,12 @@ void testPresentationModesRestoreWithoutDrift()
     require(state.mode==Mode::Maximized&&equal(state.restored,saved),"Switching directly from fullscreen to maximize lost the original window");
     state.toggleMaximized(work);
     require(equal(state.bounds(work,screen,96),saved),"Restoring after a direct mode change lost the normal window");
+    for(const auto next:{Mode::Fullscreen,Mode::Maximized,Mode::Fullscreen,Mode::Windowed})
+    {
+        const auto current=state.bounds(work,screen,96);state.setMode(next,current);state.setMode(next,state.bounds(work,screen,96));
+        require(state.mode==next&&equal(state.restored,saved),"An explicit/repeated MCP mode change overwrote the restore rectangle");
+    }
+    require(equal(state.bounds(work,screen,96),saved),"MCP fullscreen/maximize transitions did not restore the original window");
 }
 
 void testPresentationFollowsMonitorChanges()

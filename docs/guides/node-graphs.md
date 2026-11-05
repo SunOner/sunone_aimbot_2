@@ -33,7 +33,7 @@ Logic workflows can use Aim, Auto Shoot and Recoil outputs together. Vision work
 - **Read defaults:** a dash means required data is missing; Center, Local and None identify contextual or optional inputs. Hover for details. Changed values and consumed connections briefly highlight; stable data does not create pulses.
 - **Resize and arrange:** select a card and drag its edges/corners. Card positions and dimensions align to the 32-pixel grid, including automatic sizes and collapsed cards. The Size menu offers automatic, compact, wide and fit-height presets. Arrange graph wraps long chains and fits their stage groups. RMB/Esc cancels a resize.
 - **Groups:** group selected nodes into a named, colored frame. Drag its header to move its nodes and nested frames; resize or remove the frame without deleting its nodes. Drag a node outside to detach it, or fully inside to attach it to the innermost frame. Node-only moves do not carry the frame.
-- **Reroute:** double-click empty canvas to add a point, or right-click a wire → Insert reroute. A loose point adopts its first connection's type; connected points keep their type. Drag the dot to move it; side handles appear near the pointer. Points created inside a group join that group.
+- **Reroute:** double-click empty canvas to add a point, or right-click a wire → Insert reroute. A loose point adopts its first connection's type; connected points keep their type. Drag the dot to move it; side handles appear near the pointer. Deleting points reconnects their source to all surviving destinations, including when deleting a chain at once. Points created inside a group join that group.
 - **Wire ties:** hold Z and drag across wires to gather their routes under a strap. Shift+drag rotates it in 15-degree steps. Double-click/Delete removes the strap while keeping its connections.
 - **Bypass and disable:** bypass passes through a compatible input; bypassing an output stops its action. Disable makes the output unavailable. Unused upstream branches stop executing.
 - **Collapse and zoom:** the header chevron folds a card. Zooming out shows large node names and group titles while preserving card dimensions and port positions. Group titles appear above their frames and remain draggable. View options include Automatic, Detailed and Compact.
@@ -69,9 +69,13 @@ Speed curve and Scope check accept a Center input; unwired centers use the captu
 
 String, Join Text, Int to String and Float to String build paths and textual settings. Select nodes evaluate only the chosen branch. Dead Zone, Lerp Point, Scale/Limit Movement, Pulse, Key Held/Pressed/Released and Toggle provide common transforms and conditions; key 0 means None.
 
+Toggle keeps its latch when unrelated options or workflows change. Rebinding a trigger, restoring an unavailable input, or resuming an unchosen branch samples the current input without inventing a key edge. A new observed edge rearms the event. Runtime errors retain their original cause through dependent nodes and clear when the input recovers.
+
 For a named dependency, give a Set and its Gets the same name within one graph. One writer is allowed per name; types must match. Gets read the current evaluation, not a value retained between ticks. Copying a Set with its Gets creates an independent pair; copying a Get alone keeps its reference.
 
 ## Persistence and runtime
+
+[Workflow MCP](workflow-mcp.md) lets local agents inspect, validate and edit complete workflows through atomic, versioned transactions with Undo and autosave.
 
 Edits apply immediately and autosave to `node_graphs.ini` beside `ai.exe`. Undo/Redo restores edits. Unconfirmed move/resize previews are cancelled when leaving the editor. Restore Default replaces only the current graph.
 

@@ -201,6 +201,7 @@ bool Config::loadConfig(const std::string& filename)
         overlay_opacity = 225;
         overlay_ui_scale = 1.0f;
         overlay_sidebar_collapsed = false;
+        local_mcp_enabled = true;
         overlay_exclude_from_capture = true;
         overlay_x = 0;
         overlay_y = 0;
@@ -523,6 +524,7 @@ bool Config::loadConfig(const std::string& filename)
     overlay_opacity = get_long("overlay_opacity", 225);
     overlay_ui_scale = (float)get_double("overlay_ui_scale", 1.0);
     overlay_sidebar_collapsed = get_bool("overlay_sidebar_collapsed", false);
+    local_mcp_enabled = get_bool("local_mcp_enabled", true);
     overlay_exclude_from_capture = get_bool("overlay_exclude_from_capture", true);
     overlay_x = get_long("overlay_x", 0);
     overlay_y = get_long("overlay_y", 0);
@@ -825,6 +827,7 @@ bool Config::saveConfig(const std::string& filename)
         << std::fixed << std::setprecision(2)
         << "overlay_ui_scale = " << overlay_ui_scale << "\n"
         << "overlay_sidebar_collapsed = " << (overlay_sidebar_collapsed ? "true" : "false") << "\n"
+        << "local_mcp_enabled = " << (local_mcp_enabled ? "true" : "false") << "\n"
         << "overlay_exclude_from_capture = " << (overlay_exclude_from_capture ? "true" : "false") << "\n"
         << std::setprecision(0)
         << "overlay_x = " << overlay_x << "\n"
@@ -951,7 +954,7 @@ bool Config::reloadApplicationSettings(const std::string& filename)
     COPY(kmbox_net_ip);COPY(kmbox_net_port);COPY(kmbox_net_uuid);COPY(kmbox_a_pidvid);
     COPY(makcu_baudrate);COPY(makcu_port);COPY(makcu_enable_keys);
     COPY(button_targeting);COPY(button_shoot);COPY(button_zoom);COPY(button_exit);COPY(button_pause);COPY(button_reload_config);COPY(button_open_overlay);COPY(enable_arrows_settings);
-    COPY(overlay_opacity);COPY(overlay_ui_scale);COPY(overlay_sidebar_collapsed);COPY(overlay_exclude_from_capture);
+    COPY(overlay_opacity);COPY(overlay_ui_scale);COPY(overlay_sidebar_collapsed);COPY(overlay_exclude_from_capture);COPY(local_mcp_enabled);
     COPY(overlay_x);COPY(overlay_y);COPY(overlay_width);COPY(overlay_height);
     COPY(cpuCoreReserveCount);COPY(systemMemoryReserveMB);COPY(verbose);
 #ifdef USE_CUDA
