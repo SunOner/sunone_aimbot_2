@@ -25,6 +25,7 @@
 #include "config.h"
 #include "nodes/vision_outputs.h"
 #include "nodes/vision_runtime.h"
+#include "overlay/drawing_renderer.h"
 
 extern std::string g_iconLastError;
 
@@ -132,9 +133,14 @@ void updateDepthImage(const NodeVision::OverlayPacket& packet,ImageResources& re
     }
     else if(resource.mask){gameOverlayPtr->UnloadImage(resource.mask);resource.mask=0;resource.maskStorage=nullptr;}
 }
-void drawPacket(const NodeVision::OverlayPacket& packet,int screenWidth,int screenHeight)
+void drawPacket(const NodeVision::OverlayPacket& packet,int screenWidth,int screenHeight,std::size_t& drawingBudget)
 {
     if(!packet.frame||packet.frame->width<=0||packet.frame->height<=0)return;
+    if(packet.drawing)
+    {
+        GraphDrawing::render(*gameOverlayPtr,*packet.drawing,GraphDrawing::viewport({static_cast<double>(packet.frame->width),static_cast<double>(packet.frame->height)},
+            screenWidth,screenHeight,integer(packet.style,"coordinate_space")),drawingBudget);return;
+    }
     const auto& node=packet.style;auto& resource=images[packet.nodeKey];
     const float width=static_cast<float>(std::min(packet.frame->width,screenWidth)),height=static_cast<float>(std::min(packet.frame->height,screenHeight));
     const float baseX=(screenWidth-width)*0.5f,baseY=(screenHeight-height)*0.5f;
@@ -248,7 +254,8 @@ void gameOverlayRenderLoop()
         for(auto it=images.begin();it!=images.end();)
         {if(std::none_of(packets.begin(),packets.end(),[&](const auto& packet){return packet->nodeKey==it->first;})){unload(it->second);demos.erase(it->first);it=images.erase(it);}else++it;}
         gameOverlayPtr->BeginFrame();
-        for(const auto& packet:packets)try{drawPacket(*packet,width,height);}catch(const std::exception& error){g_iconLastError=error.what();}
+        std::size_t drawingBudget=8192;
+        for(const auto& packet:packets)try{drawPacket(*packet,width,height,drawingBudget);}catch(const std::exception& error){g_iconLastError=error.what();}
         gameOverlayPtr->EndFrame();
         std::this_thread::sleep_for(std::chrono::milliseconds(unlimited?8:std::max(1u,1000u/fps)));
     }

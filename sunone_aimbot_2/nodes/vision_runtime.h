@@ -35,6 +35,7 @@ cv::Mat cpuImage(const NodeGraph::FrameStream& frame);
 cv::Mat sourceImage(const NodeGraph::FrameStream& frame);
 std::string resolveModelPath(const NodeGraph::Node& node);
 void reportError(int nodeKey,const std::string& error);
+std::string nodeError(int nodeKey);
 
 // Called without configMutex. Applies node settings to the physical capture
 // service and returns false when the graph has no active capture source.

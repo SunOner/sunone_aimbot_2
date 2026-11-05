@@ -77,6 +77,9 @@ NodeKind rerouteKind(ValueType type)
     case ValueType::LabelOptions:return NodeKind::RerouteLabels;
     case ValueType::Motion:return NodeKind::RerouteMotion;
     case ValueType::Calibration:return NodeKind::RerouteCalibration;
+    case ValueType::Points:return NodeKind::ReroutePoints;
+    case ValueType::Drawing:return NodeKind::RerouteDrawing;
+    case ValueType::DrawingStyle:return NodeKind::RerouteDrawingStyle;
     }
     return NodeKind::RerouteBoolean;
 }
@@ -406,6 +409,9 @@ ImU32 pinColor(ValueType type)
     case ValueType::Monitors:return IM_COL32(215,225,160,255);
     case ValueType::OverlayStyle:return IM_COL32(255,164,106,255);
     case ValueType::LabelOptions:return IM_COL32(151,190,122,255);
+    case ValueType::Points:return IM_COL32(64,188,232,255);
+    case ValueType::Drawing:return IM_COL32(248,166,80,255);
+    case ValueType::DrawingStyle:return IM_COL32(209,159,255,255);
     }
     return IM_COL32(180,180,180,255);
 }
@@ -1998,6 +2004,9 @@ bool modelPathInput(NodeKind kind,const char* key)
 std::string valueText(const Value* value)
 {
     if (!value || !value->valid) return value&&!value->error.empty()?"ERROR":"";
+    if(value->type==ValueType::Points)return std::to_string(value->points?value->points->size():0)+" points";
+    if(value->type==ValueType::Drawing)return std::to_string(value->drawing?value->drawing->commands.size():0)+" primitives";
+    if(value->type==ValueType::DrawingStyle)return "Drawing style";
     if(value->preview)return std::string(typeName(value->preview->sourceType))+(value->preview->width>0?"  "+std::to_string(value->preview->sourceWidth)+" x "+std::to_string(value->preview->sourceHeight):"");
     if (value->type == ValueType::Boolean) return value->boolean ? "TRUE" : "FALSE";
     if (value->type == ValueType::Integer) return std::to_string(value->integer);
@@ -2078,6 +2087,9 @@ const InputDefaultDisplay& inputDefault(NodeDisplay& display,const Node& node,st
     else if(node.kind==NodeKind::RecoilOutput&&pin==2)
     {kind=InputDefaultKind::Local;source="1 px / count";}
     else if(node.kind==NodeKind::PointDelta&&pin==1&&parameter(node,"implicit_center")!=0)kind=InputDefaultKind::Center;
+    else if(node.kind==NodeKind::RenderDrawing&&pin==2){kind=InputDefaultKind::Local;source="Capture dimensions";}
+    else if(((node.kind>=NodeKind::DrawPoint&&node.kind<=NodeKind::DrawTextPrimitive)&&(pin==0||pin==def.dataInputs-1))||
+        node.kind==NodeKind::DrawingStyle||node.kind==NodeKind::MergeDrawings||node.kind==NodeKind::MergePoints||(node.kind==NodeKind::AppendPoint&&pin==0))kind=InputDefaultKind::Empty;
     else if(node.kind==NodeKind::MouseDelta&&pin==2)
     {
         bool wired=false;
@@ -2424,6 +2436,11 @@ CatalogPath catalogPath(const Definition& def)
     case K::VisionOutput:return {"Outputs","Observations"};
     case K::CollectDataset:case K::DatasetOutput:case K::DatasetLabels:case K::ScreenshotOutput:return {"Outputs","Recording"};
     case K::RenderOverlay:case K::OverlayOutput:return {"Outputs","Rendering"};
+    case K::RenderDrawing:return {"Drawing","Output"};
+    case K::DrawingStyle:return {"Drawing","Style"};
+    case K::DrawPoint:case K::DrawLine:case K::DrawBox:case K::DrawCircle:case K::DrawPolyline:case K::DrawTextPrimitive:case K::MergeDrawings:return {"Drawing","Primitives"};
+    case K::AppendPoint:case K::MergePoints:case K::PointAt:case K::PredictPath:case K::PointTrail:return {"Drawing","Point lists"};
+    case K::ReroutePoints:case K::RerouteDrawing:case K::RerouteDrawingStyle:return {"Routing","Drawing"};
     case K::ImagePreview:return {"Utilities","Inspection"};
     case K::OverlayBoxes:case K::OverlayFrame:case K::OverlayMotion:case K::OverlayIcon:case K::OverlayDepth:case K::OverlayCorrection:return {"Outputs","Overlay layers"};
     case K::RerouteOverlay:case K::RerouteLabels:return {"Routing","Settings"};
@@ -3767,7 +3784,7 @@ void shortcutsPopup()
     if(ImGui::BeginTable("signal_colors",3))
     {
         for(const auto type:{ValueType::Boolean,ValueType::Float,ValueType::Integer,ValueType::Point,ValueType::Detections,
-            ValueType::Target,ValueType::Movement,ValueType::Frame,ValueType::Depth,ValueType::Mask,ValueType::String,ValueType::Monitor,ValueType::Monitors,ValueType::OverlayStyle,ValueType::LabelOptions,ValueType::Motion,ValueType::Calibration})
+            ValueType::Target,ValueType::Movement,ValueType::Frame,ValueType::Depth,ValueType::Mask,ValueType::String,ValueType::Monitor,ValueType::Monitors,ValueType::OverlayStyle,ValueType::LabelOptions,ValueType::Motion,ValueType::Calibration,ValueType::Points,ValueType::Drawing,ValueType::DrawingStyle})
         {
             ImGui::TableNextColumn();ImGui::PushStyleColor(ImGuiCol_Text,pinColor(type));
             ImGui::TextWrapped("%s",typeName(type));ImGui::PopStyleColor();
@@ -5202,7 +5219,7 @@ void NodeEditor_ProcessPendingActions()
 int NodeEditor_CreateWorkflow(const std::string& title,int kind,std::string& error,int icon,bool filledTemplate)
 {
     NodeEditor_EndInteraction(true);auto workspace=service().workspace();const auto name=cleanWorkflowName(title);
-    if(name.empty()||kind<0||kind>3){error="Enter a workflow name and type.";return -1;}
+    if(name.empty()||kind<0||kind>4){error="Enter a workflow name and type.";return -1;}
     if(workspace.graphs.size()>=MaxGraphs){error="The workspace already has "+std::to_string(MaxGraphs)+" workflows.";return -1;}
     int id=5;std::vector<int> ids;
     for(std::size_t i=0;i<workspace.graphs.size();++i)
@@ -5212,8 +5229,10 @@ int NodeEditor_CreateWorkflow(const std::string& title,int kind,std::string& err
         if(workflowTitle(workspace.graphs[i])==name){error="A workflow with this name already exists.";return -1;}
     }
     if(ids.size()>=MaxWorkflows){error="The workspace already has "+std::to_string(MaxWorkflows)+" workflows.";return -1;}
-    Workspace templates;if(filledTemplate)templates=defaults();
-    Graph graph=filledTemplate?templates.graphs[kind]:Graph{};graph.kind=static_cast<GraphKind>(kind);graph.workflow=id;graph.workflowName=name;graph.workflowIcon=icon;graph.pageName="Default";
+    const bool drawingExample=kind==4;
+    Workspace templates;if(filledTemplate&&!drawingExample)templates=defaults();
+    Graph graph=drawingExample?predictionDrawingExample():filledTemplate?templates.graphs[kind]:Graph{};
+    graph.kind=drawingExample?GraphKind::Aim:static_cast<GraphKind>(kind);graph.workflow=id;graph.workflowName=name;graph.workflowIcon=icon;graph.pageName="Default";
     if(filledTemplate&&graph.kind==GraphKind::Vision)
     {
         const bool existingCapture=std::any_of(workspace.graphs.begin(),workspace.graphs.end(),[](const Graph& page){

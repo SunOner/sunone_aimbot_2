@@ -609,9 +609,12 @@ void testDisableIsDistinctFromBypassAndPersists()
 #include "node_reroute_delete_tests.h"
 #include "node_universal_preview_tests.h"
 #include "node_starter_layout_tests.h"
+#include "node_drawing_tests.h"
 int main()
 {
     const auto run=[](const char* name,auto test){try{test();}catch(const std::exception& error){throw std::runtime_error(std::string(name)+": "+error.what());}};
+    try{run("testPredictionDrawingExampleAndRetainedMotion",testPredictionDrawingExampleAndRetainedMotion);run("testDrawingPredictionGeometryCachingAndGates",testDrawingPredictionGeometryCachingAndGates);run("testDrawingListsLimitsNamedValuesAndPersistence",testDrawingListsLimitsNamedValuesAndPersistence);run("testPointTrailSamplingResetAndKey",testPointTrailSamplingResetAndKey);run("testDrawingNativeProjectionStyleAndBudget",testDrawingNativeProjectionStyleAndBudget);}
+    catch(const std::exception& error){std::cerr<<error.what()<<'\n';return 1;}
     try{run("testStarterLayoutsAreExactAndPortable",testStarterLayoutsAreExactAndPortable);}
     catch(const std::exception& error){std::cerr<<error.what()<<'\n';return 1;}
     try{run("testUniversalPreviewAcceptsValuesInEveryWorkflow",testUniversalPreviewAcceptsValuesInEveryWorkflow);run("testUniversalPreviewNumbersStructuresAndImageCompatibility",testUniversalPreviewNumbersStructuresAndImageCompatibility);}

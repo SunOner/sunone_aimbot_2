@@ -21,6 +21,8 @@
 #include "keyboard/graph_key_state.h"
 #include "runtime/thread_loops.h"
 #include "nodes/node_graph.h"
+#include "nodes/vision_outputs.h"
+#include "nodes/vision_runtime.h"
 
 namespace
 {
@@ -91,9 +93,9 @@ void mouseThreadFunction(MouseThread& mouseThread)
     int appliedDetectionResolution = -1;
     std::uint64_t controlGeneration = detectionBuffer.currentGeneration();
     std::uint64_t graphRevision = 0;
-    struct PredictionCache { NodeGraph::Point input; NodeGraph::Point output; };
+    struct PredictionCache { NodeGraph::Point input; NodeGraph::Point output; std::int64_t version=-1; };
     std::unordered_map<int, PredictionCache> predictionCache;
-    struct MotionCache {NodeGraph::Point input;NodeGraph::MotionData output;};
+    struct MotionCache {NodeGraph::Point input;NodeGraph::MotionData output;std::int64_t version=-1;};
     std::unordered_map<int,MotionCache> motionCache;
     double observationDelaySeconds=0;
     std::unordered_map<int, NodeGraph::Movement> windCache;
@@ -191,13 +193,13 @@ void mouseThreadFunction(MouseThread& mouseThread)
             resetSelections();
             inputWasCaptured=inputCaptured;
         }
-        if (pausedNow || inputCaptured)
+        if (pausedNow)
         {
             graphAimActive = false;
             NodeGraph::Context pausedContext;
             pausedContext.inputCaptured = inputCaptured;
             pausedContext.captureFps = captureFps.load();
-            NodeGraph::service().evaluate(pausedContext);
+            NodeGraph::service().evaluate(pausedContext);NodeVision::retainControlDrawings({});
             mouseThread.clearQueuedMoves();
             mouseThread.releaseMouse();
             continue;
@@ -313,10 +315,13 @@ void mouseThreadFunction(MouseThread& mouseThread)
                 std::abs(target.y+target.height*0.5-center.y)<target.height*multiplier*0.5;
         };
         context.predict = [&](int nodeKey,NodeGraph::Point point,const NodeGraph::Node& node,double lookahead,bool reset) {
-            if(hasNewDetection)
+            // A drawing branch may sample after the iteration that received
+            // this observation. Consume each node's latest unseen version.
+            const auto cached=predictionCache.find(nodeKey);
+            if(lastVersion>=0&&(cached==predictionCache.end()||cached->second.version!=lastVersion))
             {
                 auto predicted=mouseThread.graphPredict(nodeKey,point.x,point.y,detectionTimestamp,node,lookahead,reset);
-                predictionCache[nodeKey]={point,{predicted.first,predicted.second}};
+                predictionCache[nodeKey]={point,{predicted.first,predicted.second},lastVersion};
                 if(NodeGraph::parameter(node,"draw_futurePositions")!=0)
                     mouseThread.storeFuturePositions(mouseThread.graphFuturePositions(nodeKey,static_cast<int>(NodeGraph::parameter(node,"prediction_futurePositions"))));
             }
@@ -334,7 +339,8 @@ void mouseThreadFunction(MouseThread& mouseThread)
             return mouseThread.graphSpeedCurve(point.x,point.y,center,maximumDistance,node);
         };
         context.estimateMotion=[&](int key,NodeGraph::Point point,const NodeGraph::Node& node,bool reset){
-            if(hasNewDetection)motionCache[key]={point,mouseThread.graphEstimateMotion(key,point,detectionTimestamp,node,reset)};
+            const auto cached=motionCache.find(key);
+            if(lastVersion>=0&&(cached==motionCache.end()||cached->second.version!=lastVersion))motionCache[key]={point,mouseThread.graphEstimateMotion(key,point,detectionTimestamp,node,reset),lastVersion};
             else if(reset){motionCache.erase(key);mouseThread.graphEstimateMotion(key,point,detectionTimestamp,node,true);}
             const auto found=motionCache.find(key);
             if(found==motionCache.end())return NodeGraph::MotionData{point,{},NodeGraph::parameter(node,"kalman_velocity_damping"),false,false};
@@ -361,8 +367,13 @@ void mouseThreadFunction(MouseThread& mouseThread)
             return NodeGraph::Point{point.x-delta.first,point.y-delta.second};
         };
         context.keyDown = GraphInput::keyDown;
+        context.draw=[&](int key,const NodeGraph::Drawing& drawing,NodeGraph::Point size,const NodeGraph::Node& node){
+            return NodeVision::publishDrawingAtRevision(key,drawing,size,node,observationGeneration,graphRevision,true);
+        };
+        context.drawError=NodeVision::nodeError;
 
         const auto actions = NodeGraph::service().evaluate(context);
+        NodeVision::retainControlDrawings(actions.activeRenderKeys);
         if(editorInputCaptured.load())
         {
             graphAimActive=false;mouseThread.clearQueuedMoves();mouseThread.releaseMouse();continue;
@@ -412,5 +423,6 @@ void mouseThreadFunction(MouseThread& mouseThread)
             mouseThread.dispatchGraphRecoil(compensation,pixelsPerCount);
         }
     }
+    NodeVision::retainControlDrawings({});
 }
 

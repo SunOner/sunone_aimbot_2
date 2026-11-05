@@ -1,15 +1,29 @@
 #pragma once
 namespace
 {
-int snapshotUniversalPreview(const std::string& filename)
+int snapshotUniversalPreview(const std::string& filename,bool drawingExample=false,int focusGroup=0)
 {
-    EditorHarness h;EditorBenchmarkGpu gpu;gpu.resize(1200,800);
+    EditorHarness h;EditorBenchmarkGpu gpu;
+    if(drawingExample){h.windowWidth=1960;ImGui::GetIO().DisplaySize=ImVec2(2000,800);}
+    gpu.resize(drawingExample?2000:1200,800);
     require(ImGui_ImplDX11_Init(gpu.device.Get(),gpu.context.Get()),"Preview snapshot renderer initialization failed");
     ImGui::GetIO().Fonts->Clear();
     if(!ImGui::GetIO().Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\seguisb.ttf",16.5f))ImGui::GetIO().Fonts->AddFontDefault();
-    g_pd3dDevice=gpu.device.Get();g_pd3dDeviceContext=gpu.context.Get();h.graphIndex=3;
-    auto& graph=h.graph();graph.nodes={defaultNode(NodeKind::String,1,-600,32),defaultNode(NodeKind::ImagePreview,2,32,32),defaultNode(NodeKind::CurrentFrame,3,-600,320),defaultNode(NodeKind::ImagePreview,4,448,32)};
-    graph.links={{1,0,2,1},{3,0,4,1}};graph.groups.clear();graph.ties.clear();graph.panX=graph.panY=0;graph.zoom=1;edited();
+    g_pd3dDevice=gpu.device.Get();g_pd3dDeviceContext=gpu.context.Get();h.graphIndex=drawingExample?0:3;
+    auto& graph=h.graph();
+    if(drawingExample)graph=predictionDrawingExample();
+    else
+    {
+        graph.nodes={defaultNode(NodeKind::String,1,-600,32),defaultNode(NodeKind::ImagePreview,2,32,32),defaultNode(NodeKind::CurrentFrame,3,-600,320),defaultNode(NodeKind::ImagePreview,4,448,32)};
+        graph.links={{1,0,2,1},{3,0,4,1}};graph.groups.clear();graph.ties.clear();graph.panX=graph.panY=0;graph.zoom=1;
+    }
+    edited();require(!editor.error,editor.message.c_str());if(drawingExample)editor.fit[0]=true;
+    if(drawingExample&&focusGroup>0)
+    {
+        const auto group=std::find_if(graph.groups.begin(),graph.groups.end(),[&](const Group& group){return group.id==focusGroup;});
+        require(group!=graph.groups.end(),"Snapshot group not found");graph.zoom=focusGroup==5?0.75f:1;
+        graph.panX=48-group->x*graph.zoom;graph.panY=80-group->y*graph.zoom;editor.fit[0]=false;
+    }
     auto text=std::make_shared<PreviewImage>();text->sourceType=ValueType::String;text->text="Universal data preview\n\nFull precision: 0.005555555555555556\n\nText wraps inside the node and stays complete. Use the mouse wheel to scroll. Ctrl + wheel zooms the graph.\n\n{\n  \"frame\": 120,\n  \"ready\": true,\n  \"confidence\": 0.9725\n}\n\nLong text remains available through Copy preview value.\n\n";
     for(int i=0;i<20;++i)text->text+="Additional line "+std::to_string(i)+"\n";
     auto image=std::make_shared<PreviewImage>();image->width=320;image->height=180;image->sourceWidth=1280;image->sourceHeight=720;image->rgba.resize(320*180*4);
@@ -17,7 +31,7 @@ int snapshotUniversalPreview(const std::string& filename)
     for(int frame=0;frame<3;++frame)
     {
         editor.live.graphs[3].clear();editor.liveIndex[3].clear();
-        for(const auto entry:{std::pair{2,Preview(text)},std::pair{4,Preview(image)}}){NodeValue value;value.nodeId=entry.first;value.value.preview=entry.second;value.value.boolean=true;editor.liveIndex[3].emplace_back(entry.first,editor.live.graphs[3].size());editor.live.graphs[3].push_back(std::move(value));}
+        if(!drawingExample)for(const auto entry:{std::pair{2,Preview(text)},std::pair{4,Preview(image)}}){NodeValue value;value.nodeId=entry.first;value.value.preview=entry.second;value.value.boolean=true;editor.liveIndex[3].emplace_back(entry.first,editor.live.graphs[3].size());editor.live.graphs[3].push_back(std::move(value));}
         editor.live.graphRevisions[3]=service().revision();editor.live.graphSampledAt[3]=std::chrono::steady_clock::now();editor.telemetryAt=1000000;
         ImGui_ImplDX11_NewFrame();h.frame();gpu.render();
     }

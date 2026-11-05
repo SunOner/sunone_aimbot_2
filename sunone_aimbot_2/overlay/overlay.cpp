@@ -1818,8 +1818,8 @@ static HRESULT RenderOverlayFrame(bool allowAutoResize, bool allowConfigSave)
         {
             if(ImGui::IsWindowAppearing())ImGui::SetKeyboardFocusHere();
             const bool enter=ImGui::InputTextWithHint("##name","Workflow name",workflowName,sizeof(workflowName),ImGuiInputTextFlags_EnterReturnsTrue);
-            const char* presets[]={"Empty logic","Empty vision","Aim template","Auto Shoot template","Recoil template","Vision template"};
-            ImGui::Combo("Start with",&workflowPreset,presets,6);WorkflowIconPicker(workflowIcon);
+            const char* presets[]={"Empty logic","Empty vision","Aim template","Auto Shoot template","Recoil template","Vision template","Prediction overlay"};
+            ImGui::Combo("Start with",&workflowPreset,presets,7);WorkflowIconPicker(workflowIcon);
             const int kind=workflowPreset==1?3:workflowPreset>=2?workflowPreset-2:0;
             if(ImGui::Button("Create")||enter){const int id=NodeEditor_CreateWorkflow(workflowName,kind,workflowError,workflowIcon,workflowPreset>=2);if(id>0){g_activeOverlayTab=-id;ImGui::CloseCurrentPopup();}}
             if(!workflowError.empty())ImGui::TextWrapped("%s",workflowError.c_str());ImGui::EndPopup();

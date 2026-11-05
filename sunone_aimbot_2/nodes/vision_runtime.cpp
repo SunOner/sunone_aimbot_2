@@ -92,6 +92,7 @@ std::string resolveModelPath(const NodeGraph::Node& node)
     return (std::filesystem::path("models")/model).u8string();
 }
 void reportError(int nodeKey,const std::string& error){errors[nodeKey]=error;}
+std::string nodeError(int nodeKey){const auto found=errors.find(nodeKey);return found==errors.end()?std::string{}:found->second;}
 
 bool syncCaptureConfiguration(bool force)
 {
@@ -223,6 +224,10 @@ NodeGraph::Actions processFrame(const NodeGraph::FrameStream& frame,const Infer&
         const NodeGraph::MaskStream& mask,const NodeGraph::FrameStream& depth,const NodeGraph::Node& node){
         return current()&&publishOverlayAtRevision(key,input,detections,mask,depth,node,evaluatedRevision);
     };
+    context.draw=[&](int key,const NodeGraph::Drawing& drawing,NodeGraph::Point size,const NodeGraph::Node& node){
+        return current()&&publishDrawingAtRevision(key,drawing,size,node,frame->generation,evaluatedRevision,false);
+    };
+    context.drawError=NodeVision::nodeError;
     context.keyDown=GraphInput::keyDown;
     context.nodeError=[](int key){const auto found=errors.find(key);return found==errors.end()?std::string{}:found->second;};
     const auto actions=NodeGraph::service().evaluateVision(context);

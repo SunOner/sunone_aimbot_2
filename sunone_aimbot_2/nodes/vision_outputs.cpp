@@ -324,6 +324,26 @@ bool publishOverlayAtRevision(int nodeKey,const FrameStream& frame,const Detecti
     std::lock_guard<std::mutex> lock(statesMutex);renderPackets[nodeKey]=std::move(packet);return true;
 }
 
+bool publishDrawingAtRevision(int nodeKey,const Drawing& drawing,Point canvasSize,const Node& node,std::uint64_t generation,std::uint64_t evaluatedRevision,bool controlDomain)
+{
+    if(evaluatedRevision!=NodeGraph::service().revision())return false;
+    if(!drawing||drawing->commands.empty())
+    {reportError(nodeKey,{});std::lock_guard<std::mutex> lock(statesMutex);renderPackets.erase(nodeKey);return true;}
+    if(drawing->commands.size()>MaxDrawingCommands||drawing->vertices>MaxDrawingVertices){reportError(nodeKey,"Drawing budget exceeded.");return false;}
+    if(parameter(node,"coordinate_space")!=0)canvasSize={1,1};
+    if(!std::isfinite(canvasSize.x)||!std::isfinite(canvasSize.y)||canvasSize.x<1||canvasSize.y<1||canvasSize.x>65536||canvasSize.y>65536)
+    {reportError(nodeKey,"Connect a valid Canvas size or start capture.");return false;}
+    auto frame=std::make_shared<FrameData>();frame->width=static_cast<int>(std::lround(canvasSize.x));frame->height=static_cast<int>(std::lround(canvasSize.y));frame->generation=generation;
+    auto packet=std::make_shared<OverlayPacket>();packet->nodeKey=nodeKey;packet->graphRevision=evaluatedRevision;packet->frame=std::move(frame);
+    packet->style=node;packet->drawing=drawing;packet->controlDrawing=controlDomain;packet->publishedAt=Clock::now();
+    reportError(nodeKey,{});std::lock_guard<std::mutex> lock(statesMutex);renderPackets[nodeKey]=std::move(packet);return true;
+}
+void retainControlDrawings(const std::vector<int>& keys)
+{
+    std::lock_guard<std::mutex> lock(statesMutex);
+    for(auto it=renderPackets.begin();it!=renderPackets.end();)
+        if(it->second->controlDrawing&&std::find(keys.begin(),keys.end(),it->first)==keys.end())it=renderPackets.erase(it);else++it;
+}
 std::vector<std::shared_ptr<const OverlayPacket>> overlayPackets()
 {
     std::vector<std::shared_ptr<const OverlayPacket>> packets;const auto now=Clock::now();
@@ -349,7 +369,7 @@ void retainVisionOutputs(const std::vector<int>& depthKeys,const std::vector<int
     cvm::RetainDataCollectionNodes(collectorKeys);
     std::lock_guard<std::mutex> lock(statesMutex);
     for(auto it=depthStates.begin();it!=depthStates.end();)if(std::find(depthKeys.begin(),depthKeys.end(),it->first)==depthKeys.end())it=depthStates.erase(it);else++it;
-    for(auto it=renderPackets.begin();it!=renderPackets.end();)if(std::find(renderKeys.begin(),renderKeys.end(),it->first)==renderKeys.end())it=renderPackets.erase(it);else++it;
+    for(auto it=renderPackets.begin();it!=renderPackets.end();)if(!it->second->controlDrawing&&std::find(renderKeys.begin(),renderKeys.end(),it->first)==renderKeys.end())it=renderPackets.erase(it);else++it;
 }
 void retainVisionOutputs(const Actions& actions)
 {

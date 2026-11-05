@@ -75,6 +75,16 @@ Toggle keeps its latch when unrelated options or workflows change. Rebinding a t
 
 For a named dependency, give a Set and its Gets the same name within one graph. One writer is allowed per name; types must match. Gets read the current evaluation, not a value retained between ticks. Copying a Set with its Gets creates an independent pair; copying a Get alone keeps its reference.
 
+## Drawing on the game overlay
+
+**+ → Start with → Prediction overlay** creates an editable example: target center → estimated velocity → projected position/path → drawing. It renders a box, future trajectory, fading history, predicted marker, connecting line and label. Change the horizon Float to adjust both the path and marker. The example only draws; it has no mouse or button output.
+
+In any workflow, chain **Draw point / line / box / circle / polyline / text → Render drawing**. Each primitive appends to its Drawing input; leave it empty to start a list. **Merge drawings** combines branches. Connect **Drawing style** for RGBA, line width, fill, text size and trail fade. A box takes a top-left Position and Size; a line takes Position and End.
+
+**Predict path** samples Position and Velocity over a horizon. **Point trail** stores recent points at its Sample FPS; Reset or a changed Key clears the history. Use Track ID as Key to keep different targets' trails separate. **Append point, Merge points and Point at** build and inspect custom paths. Universal Preview accepts these values too.
+
+Render drawing supports capture pixels (centered on the overlay monitor), screen pixels and normalized screen coordinates. Canvas size defaults to current capture dimensions. Output FPS limits evaluation of the drawing branch; immutable geometry is reused when unchanged. Drawings use metadata without downloading or copying captured images. Limits: 256 points per list, 256 commands / 4096 vertices per drawing, and 8192 primitive calls per overlay frame. Disabled outputs and lost Enable conditions disappear immediately; visual drawing remains active while editing.
+
 ## Persistence and runtime
 
 [Workflow MCP](workflow-mcp.md) lets local agents inspect, validate and edit complete workflows through atomic, versioned transactions with Undo and autosave.

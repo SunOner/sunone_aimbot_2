@@ -83,7 +83,8 @@ JsonObject catalog()
         put(item,L"parameters",numbers);put(item,L"text_parameters",texts);nodes.Append(item);
     }
     JsonObject result,limits;put(result,L"ok",true);put(result,L"nodes",nodes);put(result,L"format_version",CurrentFormatVersion);
-    put(limits,L"nodes_per_workflow",MaxNodes);put(limits,L"links_per_workflow",MaxLinks);put(limits,L"groups_per_workflow",MaxGroups);put(limits,L"workflows",MaxGraphs);put(limits,L"file_bytes",MaxWorkspaceBytes);put(limits,L"grid",GridSize);put(result,L"limits",limits);return result;
+    put(limits,L"nodes_per_workflow",MaxNodes);put(limits,L"links_per_workflow",MaxLinks);put(limits,L"groups_per_workflow",MaxGroups);put(limits,L"workflows",MaxGraphs);put(limits,L"file_bytes",MaxWorkspaceBytes);put(limits,L"grid",GridSize);
+    put(limits,L"path_points",MaxPathPoints);put(limits,L"drawing_commands",MaxDrawingCommands);put(limits,L"drawing_vertices",MaxDrawingVertices);put(result,L"limits",limits);return result;
 }
 JsonObject liveValue(const Value& value)
 {
@@ -101,6 +102,14 @@ JsonObject liveValue(const Value& value)
     case ValueType::Integer:put(result,L"value",value.integer);break;
     case ValueType::String:put(result,L"value",value.text);break;
     case ValueType::Point:put(result,L"x",value.point.x);put(result,L"y",value.point.y);break;
+    case ValueType::Points:
+    {
+        JsonArray points;if(value.points)for(std::size_t i=0;i<std::min<std::size_t>(64,value.points->size());++i)
+        {JsonObject point;put(point,L"x",(*value.points)[i].x);put(point,L"y",(*value.points)[i].y);points.Append(point);}
+        put(result,L"count",value.points?value.points->size():0);put(result,L"points",points);break;
+    }
+    case ValueType::Drawing:
+        put(result,L"commands",value.drawing?value.drawing->commands.size():0);put(result,L"vertices",value.drawing?value.drawing->vertices:0);break;
     case ValueType::Detections:if(value.detections){put(result,L"count",value.detections->objects.size());put(result,L"frame_version",value.detections->version);put(result,L"timestamp_seconds",value.detections->timestampSeconds);}break;
     case ValueType::Frame:case ValueType::Depth:if(value.frame){put(result,L"width",value.frame->width);put(result,L"height",value.frame->height);put(result,L"frame_version",value.frame->version);put(result,L"timestamp_seconds",value.frame->timestampSeconds);put(result,L"gpu",value.frame->gpu);}break;
     case ValueType::Mask:if(value.mask){put(result,L"width",value.mask->width);put(result,L"height",value.mask->height);put(result,L"frame_version",value.mask->version);}break;

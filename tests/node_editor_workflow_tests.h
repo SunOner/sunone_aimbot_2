@@ -31,6 +31,8 @@ void testFilledTemplatesKeepDefaultGeometry()
         const int id=NodeEditor_CreateWorkflow("Template "+std::to_string(kind),kind,error,-1,true);require(id>0,error.c_str());
         const auto workspace=service().workspace();check(workspace.graphs[activePage(workspace,id)],templates.graphs[kind],false);
     }
+    const int drawing=NodeEditor_CreateWorkflow("Prediction overlay",4,error,3,true);require(drawing>0,error.c_str());
+    check(service().workspace().graphs[activePage(service().workspace(),drawing)],predictionDrawingExample(),false);
     const int copiedVision=NodeEditor_CreateWorkflow("Template shared frame",3,error,-1,true);require(copiedVision>0,error.c_str());
     auto workspace=service().workspace();check(workspace.graphs[activePage(workspace,copiedVision)],templates.graphs[3],true);
     require(kindAllowed(workspace.graphs[activePage(workspace,copiedVision)],NodeKind::DatasetOutput)&&

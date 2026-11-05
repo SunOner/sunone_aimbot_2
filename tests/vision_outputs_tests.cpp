@@ -254,6 +254,28 @@ void screenshotsUseConnectedPixelsAndIndependentCadence()
     require(!NodeVision::screenshot(VisionBase+registered.id,image,registered),"Releasing the trigger erased a registered screenshot node's cooldown");
 }
 
+void graphDrawingsUseMetadataAndSeparateWorkerLifetimes()
+{
+    NodeVision::retainVisionOutputs({}, {}, {});NodeVision::retainControlDrawings({});
+    auto data=std::make_shared<DrawingData>();data->commands.push_back({});data->vertices=1;
+    const auto node=defaultNode(NodeKind::RenderDrawing,71);const auto revision=NodeGraph::service().revision();
+    const auto generation=detectionBuffer.currentGeneration();
+    require(NodeVision::publishDrawingAtRevision(71,data,{320,320},node,generation,revision,true),"Control drawing did not publish without copying a frame");
+    auto packets=NodeVision::overlayPackets();
+    require(packets.size()==1&&packets[0]->drawing==data&&!packets[0]->frame->storage&&packets[0]->controlDrawing,"Drawing acquired image storage or lost its immutable commands");
+    NodeVision::retainVisionOutputs(Actions{});require(NodeVision::overlayPackets().size()==1,"The Vision worker deleted a live control drawing");
+    NodeVision::retainControlDrawings({});require(NodeVision::overlayPackets().empty(),"A disabled control drawing remained visible");
+    require(NodeVision::publishDrawingAtRevision(72,data,{640,480},node,generation,revision,false),"Vision drawing did not publish");
+    NodeVision::retainControlDrawings({});require(NodeVision::overlayPackets().size()==1,"The control worker deleted a Vision drawing");
+    NodeVision::retainVisionOutputs(Actions{});require(NodeVision::overlayPackets().empty(),"A disabled Vision drawing remained visible");
+    require(!NodeVision::publishDrawingAtRevision(71,data,{320,320},node,generation,revision+1,true),"An obsolete graph revision published a drawing");
+    require(!NodeVision::publishDrawingAtRevision(71,data,{0,0},node,generation,revision,true)&&NodeVision::testErrors[71].find("Canvas")!=std::string::npos,"Invalid canvas dimensions did not expose a diagnostic");
+    require(NodeVision::publishDrawingAtRevision(71,data,{320,320},node,generation,revision,true),"Drawing did not recover from invalid dimensions");
+    detectionBuffer.togglePaused();require(NodeVision::overlayPackets().empty(),"Paused capture kept a graph drawing visible");detectionBuffer.togglePaused();
+    require(NodeVision::overlayPackets().empty(),"A drawing from the previous capture generation became visible again");
+    require(NodeVision::publishDrawingAtRevision(71,data,{320,320},node,detectionBuffer.currentGeneration(),revision,true),"Drawing did not publish after capture resumed");
+    auto empty=std::make_shared<DrawingData>();require(NodeVision::publishDrawingAtRevision(71,empty,{320,320},node,detectionBuffer.currentGeneration(),revision,true)&&NodeVision::overlayPackets().empty(),"An empty drawing did not immediately clear its output");
+}
 void unsupportedDepthHasVisibleError()
 {
     const auto result=NodeVision::inferDepth(VisionBase+50,frame(cv::Mat(2,2,CV_8UC3)),defaultNode(NodeKind::DepthInference,50));
@@ -294,6 +316,7 @@ int main()
         previewsConvertPixelsWithoutChangingSources();
         masksOperateOnRealPixels();depthMaskCadenceIsPerNodeAndEditsAreImmediate();maskStateIsIndependentAndPruned();collectorUsesIndependentCadenceAndConnectedModel();
         packetsKeepIndependentImmutableStyles();screenshotsUseConnectedPixelsAndIndependentCadence();unsupportedDepthHasVisibleError();overlaySafetyRejectsOldFramesAndGraphs();NodeVision::retainVisionOutputs(NodeGraph::Actions{});
+        graphDrawingsUseMetadataAndSeparateWorkerLifetimes();
         std::cout<<"Vision output regressions passed\n";return 0;
     }
     catch(const std::exception& error){std::cerr<<"Vision output regression failed: "<<error.what()<<'\n';return 1;}

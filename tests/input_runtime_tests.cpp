@@ -6,6 +6,7 @@
 #include "runtime/thread_loops.h"
 #include "nodes/node_graph.h"
 #include "nodes/node_config_bridge.h"
+#include "nodes/vision_outputs.h"
 #include "keyboard/graph_key_state.h"
 
 #include <algorithm>
@@ -39,6 +40,21 @@ int g_trackerLockedId = -1;
 
 void createInputDevices() { throw std::runtime_error("Unexpected real device creation"); }
 void assignInputDevices() { throw std::runtime_error("Unexpected real device assignment"); }
+
+// Drawing publication is covered by vision_outputs_tests; keep this worker
+// fixture independent of native rendering and image/data-collection services.
+namespace NodeVision
+{
+std::mutex drawingMutex;
+std::condition_variable drawingChanged;
+NodeGraph::Drawing testDrawing;
+int drawingCalls=0;
+bool publishDrawingAtRevision(int,const NodeGraph::Drawing& drawing,NodeGraph::Point,const NodeGraph::Node&,std::uint64_t,std::uint64_t,bool)
+{std::lock_guard<std::mutex> lock(drawingMutex);testDrawing=drawing;++drawingCalls;drawingChanged.notify_all();return true;}
+void retainControlDrawings(const std::vector<int>& keys)
+{if(keys.empty()){std::lock_guard<std::mutex> lock(drawingMutex);testDrawing.reset();}}
+std::string nodeError(int){return {};}
+}
 
 namespace
 {
@@ -134,6 +150,7 @@ struct MouseLoop
 
 void resetFixture()
 {
+    {std::lock_guard<std::mutex> lock(NodeVision::drawingMutex);NodeVision::drawingCalls=0;NodeVision::testDrawing.reset();}
     shouldExit = false;
     aiming = true;
     graphAimActive = false;
@@ -647,6 +664,28 @@ void editorCaptureReleasesAndBlocksInput()
     lock.unlock();shooting=false;zooming=false;editorInputCaptured=false;publishTarget();
     waitFor(state,[&]{return state->downs==2;},"Control must resume after the editor releases input");
 }
+void drawingSamplesLatestMotionWhileEditorOwnsInput()
+{
+    resetFixture();using namespace NodeGraph;
+    auto workspace=service().workspace();for(auto& graph:workspace.graphs){graph.nodes.clear();graph.links.clear();graph.groups.clear();graph.ties.clear();}
+    auto& graph=workspace.graphs[0];graph.nodes={defaultNode(NodeKind::Detections,1),defaultNode(NodeKind::ChooseTarget,2),defaultNode(NodeKind::TargetPosition,3),
+        defaultNode(NodeKind::MotionEstimate,4),defaultNode(NodeKind::MotionVelocity,5),defaultNode(NodeKind::DrawPoint,6),defaultNode(NodeKind::RenderDrawing,7)};
+    graph.nodes[3].parameters["kalman_enabled"]=1;graph.nodes[3].parameters["kalman_warmup_frames"]=0;graph.nodes[6].parameters["game_overlay_max_fps"]=30;
+    graph.links={{1,0,2,0},{2,0,3,0},{3,0,4,0},{4,0,5,0},{5,0,6,1},{6,0,7,1}};
+    std::string error;require(service().publish(workspace,error),error.c_str());editorInputCaptured=true;
+    auto state=std::make_shared<FakeState>();FakeInput device(state);auto mouse=makeMouse(&device);MouseLoop loop(*mouse);publishTarget();
+    {
+        std::unique_lock<std::mutex> lock(NodeVision::drawingMutex);
+        require(NodeVision::drawingChanged.wait_for(lock,2s,[]{return NodeVision::drawingCalls>=1;}),"Opening the editor stopped the graph drawing worker");
+    }
+    require(detectionBuffer.setForGeneration(detectionBuffer.currentGeneration(),{cv::Rect(180,120,40,80)},{0},{0.9f},Clock::now()),"Drawing observation was rejected");
+    {
+        std::unique_lock<std::mutex> lock(NodeVision::drawingMutex);
+        require(NodeVision::drawingChanged.wait_for(lock,2s,[]{return NodeVision::drawingCalls>=2;}),"Throttled drawing did not refresh");
+        require(NodeVision::testDrawing&&NodeVision::testDrawing->commands[0].from.x>0,"A drawing sampled after frame arrival failed to update estimated velocity");
+    }
+    std::lock_guard<std::mutex> lock(state->mutex);require(state->moves==0&&state->downs==0,"Visual drawing injected physical controls while editing");
+}
 
 void explicitScopeNodeControlsShooting()
 {
@@ -948,6 +987,7 @@ int main()
         { "graph coordinates drive movement", graphCoordinatesDriveMovement },
         { "recoil graph without target", recoilGraphWorksWithoutTarget },
         { "editor capture releases and blocks input", editorCaptureReleasesAndBlocksInput },
+        { "drawing samples latest motion while editing", drawingSamplesLatestMotionWhileEditorOwnsInput },
         { "explicit scope node controls shooting", explicitScopeNodeControlsShooting },
         { "graph apply keeps expired target invalid", graphApplyDoesNotResurrectExpiredTarget },
         { "prediction nodes keep independent state", predictionNodesKeepIndependentState }

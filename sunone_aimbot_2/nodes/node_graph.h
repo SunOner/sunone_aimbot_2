@@ -30,7 +30,7 @@ constexpr std::size_t MaxWorkspaceBytes = 4 * 1024 * 1024;
 constexpr int CurrentFormatVersion = 20;
 constexpr std::int32_t MinInteger = -2147483647 - 1, MaxInteger = 2147483647;
 enum class GraphKind { Aim, AutoShoot, Recoil, Vision };
-enum class ValueType { Boolean, Float, Point, Detections, Target, Movement, Frame, Depth, Mask, Integer, String, Monitor, Monitors, OverlayStyle, LabelOptions, Motion, Calibration, Any, Number = Float };
+enum class ValueType { Boolean, Float, Point, Detections, Target, Movement, Frame, Depth, Mask, Integer, String, Monitor, Monitors, OverlayStyle, LabelOptions, Motion, Calibration, Any, Points, Drawing, DrawingStyle, Number = Float };
 enum class NodeKind
 {
     AimHeld, ShootHeld, ZoomHeld, TargetValid, TargetObserved,
@@ -65,7 +65,9 @@ enum class NodeKind
     MotionEstimate, MotionPosition, MotionVelocity, MotionDamping, MotionReady, PredictionTime, ProjectPoint, FutureTrail,
     RerouteMotion, GetMotion, SetMotion,
     MouseProfile, SharedCalibration, CalibrationScale, PointDelta, PixelsToCounts, ApplyMouseSpeed,
-    SharedMouseDelta, SharedRecoilOutput, RerouteCalibration, GetCalibration, SetCalibration, SharedCalibrationScale, Count,
+    SharedMouseDelta, SharedRecoilOutput, RerouteCalibration, GetCalibration, SetCalibration, SharedCalibrationScale,
+    DrawingStyle, DrawPoint, DrawLine, DrawBox, DrawCircle, DrawPolyline, DrawTextPrimitive, MergeDrawings, RenderDrawing,
+    AppendPoint, MergePoints, PointAt, PredictPath, PointTrail, ReroutePoints, RerouteDrawing, GetPoints, SetPoints, GetDrawing, SetDrawing, RerouteDrawingStyle, GetDrawingStyle, SetDrawingStyle, Count,
     Float = Number, RerouteFloat = RerouteNumber
 };
 struct Point { double x = 0.0; double y = 0.0; };
@@ -170,6 +172,20 @@ struct SettingsData
     std::map<std::string,std::string> texts;
 };
 using Settings=std::shared_ptr<const SettingsData>;
+constexpr std::size_t MaxPathPoints=256,MaxDrawingCommands=256,MaxDrawingVertices=4096;
+using PointList=std::shared_ptr<const std::vector<Point>>;
+struct DrawingCommand
+{
+    enum class Kind { Point, Line, Box, Circle, Polyline, Text } kind=Kind::Point;
+    Point from,to;
+    double radius=3;
+    PointList points;
+    Settings style;
+    std::shared_ptr<const std::string> text;
+    bool closed=false;
+};
+struct DrawingData { std::vector<DrawingCommand> commands;std::size_t vertices=0; };
+using Drawing=std::shared_ptr<const DrawingData>;
 struct Value
 {
     ValueType type = ValueType::Boolean;
@@ -191,6 +207,8 @@ struct Value
     Settings settings;
     MotionData motion;
     Calibration calibration;
+    PointList points;
+    Drawing drawing;
 };
 struct PreviewImage
 {
@@ -327,6 +345,7 @@ std::string pageTitle(const Graph& graph);
 int activePage(const Workspace& workspace,int workflow);
 int previewKey(int graph,int node);
 Workspace defaults();
+Graph predictionDrawingExample();
 // Recognize historical starter geometry without replacing settings or wiring.
 bool migrateStarterLayout(Graph& graph);
 bool validate(const Workspace& workspace, std::string& error);
@@ -371,6 +390,8 @@ struct Context
     std::function<DetectionStream(const DetectionStream&,const MaskStream&,const Node&)> filterMask;
     std::function<bool(int nodeKey,const FrameStream&,const DetectionStream&,const Node&)> collect;
     std::function<bool(int nodeKey,const FrameStream&,const DetectionStream&,const MaskStream&,const FrameStream& depth,const Node&)> render;
+    std::function<bool(int nodeKey,const Drawing&,Point canvasSize,const Node&)> draw;
+    std::function<std::string(int nodeKey)> drawError;
     std::function<bool(int nodeKey,const FrameStream&,const Node&)> screenshot;
     std::function<Preview(const Value&,const DetectionStream&,const Node&)> preview;
     std::function<std::string(int nodeKey)> nodeError;
@@ -483,6 +504,23 @@ private:
             bool resolvedOnce=false;
         };
         std::map<int,SettingsState> settings;
+        struct DrawingState
+        {
+            Value output;
+            std::uint64_t stamp=0;
+            bool built=false,hasKey=false;
+            int key=0;
+            double sampledAt=-1;
+            std::vector<std::pair<Point,double>> trail;
+            std::chrono::steady_clock::time_point renderedAt{};
+            bool rendered=false;
+            // Keep upstream runtime histories alive between drawing samples.
+            std::array<std::vector<int>,6> retainedKeys;
+            std::array<PointList,MaxDataPins> pointInputs;
+            std::array<Drawing,MaxDataPins> drawingInputs;
+            std::array<Settings,MaxDataPins> styleInputs;
+        };
+        std::map<int,DrawingState> drawings;
         struct CalibrationState
         {
             std::map<std::string,double> numbers;

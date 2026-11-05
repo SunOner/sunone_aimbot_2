@@ -16,6 +16,8 @@ struct OverlayPacket
     NodeGraph::DetectionStream detections;
     NodeGraph::MaskStream mask;
     NodeGraph::Node style;
+    NodeGraph::Drawing drawing;
+    bool controlDrawing=false;
     std::vector<std::pair<double,double>> futurePositions;
     std::vector<std::pair<double,double>> windTrail;
     std::vector<TrackDebugInfo> tracks;
@@ -31,6 +33,8 @@ bool collectDataset(int nodeKey,const NodeGraph::FrameStream& frame,const NodeGr
 bool screenshot(int nodeKey,const NodeGraph::FrameStream& frame,const NodeGraph::Node& node);
 bool publishOverlay(int nodeKey,const NodeGraph::FrameStream& frame,const NodeGraph::DetectionStream& detections,const NodeGraph::MaskStream& mask,const NodeGraph::FrameStream& depth,const NodeGraph::Node& node);
 bool publishOverlayAtRevision(int nodeKey,const NodeGraph::FrameStream& frame,const NodeGraph::DetectionStream& detections,const NodeGraph::MaskStream& mask,const NodeGraph::FrameStream& depth,const NodeGraph::Node& node,std::uint64_t evaluatedRevision);
+bool publishDrawingAtRevision(int nodeKey,const NodeGraph::Drawing& drawing,NodeGraph::Point canvasSize,const NodeGraph::Node& node,std::uint64_t generation,std::uint64_t evaluatedRevision,bool controlDomain);
+void retainControlDrawings(const std::vector<int>& keys);
 std::vector<std::shared_ptr<const OverlayPacket>> overlayPackets();
 void retainVisionOutputs(const std::vector<int>& depthKeys,const std::vector<int>& collectorKeys,const std::vector<int>& renderKeys);
 void retainVisionOutputs(const NodeGraph::Actions& actions);

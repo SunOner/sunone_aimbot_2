@@ -14,6 +14,7 @@ bool NodeEditor_ToolbarContainsPoint(float x, float y);
 void NodeEditor_PrepareFrame();
 void NodeEditor_RunFileActions();
 void NodeEditor_FocusNode(int graph,int node);
+// Kinds 0..3 select the standard graph types; 4 creates the prediction drawing example.
 int NodeEditor_CreateWorkflow(const std::string& name,int kind,std::string& error,int icon=-1,bool filledTemplate=false);
 bool NodeEditor_ConfigureWorkflow(int workflow,const std::string& name,int icon,std::string& error);
 bool NodeEditor_RenameWorkflow(int workflow,const std::string& name,std::string& error);

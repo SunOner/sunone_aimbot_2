@@ -22,7 +22,7 @@ inline bool isReroute(NodeKind kind)
 {
     return (kind>=NodeKind::RerouteBoolean&&kind<=NodeKind::RerouteMovement)||
         kind==NodeKind::RerouteFrame||kind==NodeKind::RerouteDepth||kind==NodeKind::RerouteMask||kind==NodeKind::RerouteInteger||
-        kind==NodeKind::RerouteString||kind==NodeKind::RerouteMonitor||kind==NodeKind::RerouteMonitors||kind==NodeKind::RerouteOverlay||kind==NodeKind::RerouteLabels||kind==NodeKind::RerouteMotion||kind==NodeKind::RerouteCalibration;
+        kind==NodeKind::RerouteString||kind==NodeKind::RerouteMonitor||kind==NodeKind::RerouteMonitors||kind==NodeKind::RerouteOverlay||kind==NodeKind::RerouteLabels||kind==NodeKind::RerouteMotion||kind==NodeKind::RerouteCalibration||kind==NodeKind::ReroutePoints||kind==NodeKind::RerouteDrawing||kind==NodeKind::RerouteDrawingStyle;
 }
 // Cards snap by their top-left corner; point nodes snap by their visible center.
 inline float snapNodeX(NodeKind kind,float x){const float anchor=isReroute(kind)?RerouteCenterX:0;return snap(x+anchor)-anchor;}
