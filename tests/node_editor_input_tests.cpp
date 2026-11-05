@@ -110,7 +110,7 @@ struct EditorHarness
         editor.draft = defaults();
         for (auto& graph : editor.draft.graphs)
         {
-            graph.nodes.clear(); graph.links.clear(); graph.groups.clear();
+            graph.nodes.clear(); graph.links.clear(); graph.groups.clear();graph.ties.clear();
             graph.panX = graph.panY = 0; graph.zoom = 1;
         }
         auto& graph = editor.draft.graphs[0];
@@ -138,7 +138,7 @@ struct EditorHarness
     {
         // Match the renderer's atlas refresh after a scaled popup requests a
         // new baked font size. This harness has no actual renderer backend.
-        if(!ImGui::GetIO().Fonts->IsBuilt())
+        if(!(ImGui::GetIO().BackendFlags&ImGuiBackendFlags_RendererHasTextures)&&!ImGui::GetIO().Fonts->IsBuilt())
         {
             unsigned char* pixels=nullptr;int width=0,height=0;
             ImGui::GetIO().Fonts->GetTexDataAsRGBA32(&pixels,&width,&height);ImGui::GetIO().Fonts->SetTexID(ImTextureID(1));
@@ -593,15 +593,15 @@ void testRerouteBodyAndPortsAcrossZoom()
             gestureScenario="Reroute at zoom "+std::to_string(zoom)+", grab "+std::to_string(grab);
             EditorHarness harness;
             arrangeCompactFixture(harness,zoom);
-            harness.graph().nodes[2] = defaultNode(NodeKind::RerouteBoolean,3,224,192);
+            harness.graph().nodes[2] = defaultNode(NodeKind::RerouteBoolean,3,224,176);
             harness.frame();
-            const auto body = canvasAt(harness,224 + grab,208);
+            const auto body = canvasAt(harness,224 + grab,192);
             harness.move(body); harness.button(ImGuiMouseButton_Left,true);
             require(editor.dragNode == 3 && !editor.wireNode,
                 "Reroute port halo swallowed its drag handle at a small zoom");
             harness.move(add(body,ImVec2(40 * zoom,40 * zoom)));
             harness.button(ImGuiMouseButton_Left,false);
-            require(findNode(harness.graph(),3)->x == 256 && findNode(harness.graph(),3)->y == 224,
+            require(findNode(harness.graph(),3)->x == 256 && findNode(harness.graph(),3)->y == 208,
                 "Reroute body did not drag on the snap grid");
             harness.drag(harness.port(1,true),harness.port(3,false));
             harness.drag(harness.port(3,true),harness.port(2,false,0));
@@ -915,14 +915,14 @@ void testInputSettingsAndSemanticZoom()
     gestureScenario="Input settings replace the old scrolling panel";
     EditorHarness h;h.graph().nodes={defaultNode(NodeKind::Prediction,1,64,64)};h.frame();
     require(!hasNodeSettings(*findNode(h.graph(),1))&&nodeSettingsHeight(*findNode(h.graph(),1))==0,"A second parameter panel remains below the inputs");
-    h.move(optionField(h,1,"kalman_max_velocity"));const auto zoom=h.graph().zoom,panX=h.graph().panX,panY=h.graph().panY;
+    h.move(optionField(h,1,"kalman_max_velocity"));const auto zoom=h.graph().zoom;const auto value=parameter(*findNode(h.graph(),1),"kalman_max_velocity");
     ImGui::GetIO().AddMouseWheelEvent(0,-2);h.frame();
-    require(h.graph().zoom==zoom&&h.graph().panX==panX&&h.graph().panY==panY,"Wheel over an input field zoomed or panned the graph");
+    require(h.graph().zoom<zoom&&parameter(*findNode(h.graph(),1),"kalman_max_velocity")==value,"An unarmed numeric field intercepted zoom or changed its value");
     requireNoFieldGesture();
-    const auto field=optionField(h,1,"kalman_max_velocity");h.move(canvasAt(h,900,500));
+    const auto field=optionField(h,1,"kalman_max_velocity");const auto nextZoom=h.graph().zoom;h.move(canvasAt(h,900,500));
     ImGui::GetIO().AddMousePosEvent(field.x,field.y);ImGui::GetIO().AddMouseWheelEvent(0,-1);h.frame();
-    require(h.graph().zoom==zoom&&h.graph().panX==panX&&h.graph().panY==panY,"Wheel input coalesced with mouse entry escaped from settings");
-    replaceInlineText(h,field,"6000",true);
+    require(h.graph().zoom<nextZoom&&parameter(*findNode(h.graph(),1),"kalman_max_velocity")==value,"Wheel input coalesced with entry changed an unarmed value");
+    replaceInlineText(h,optionField(h,1,"kalman_max_velocity"),"6000",true);
     require(parameter(*findNode(h.graph(),1),"kalman_max_velocity")==6000,"A former filtered setting is not editable at its input");
     findNode(h.graph(),1)->collapsed=true;h.frame();
     require(editor.inlineActiveItem==0,"Collapsing a node retained a hidden setting's focus");
@@ -935,22 +935,23 @@ void testStarterLayoutAccommodatesSettings()
 {
     gestureScenario="Starter layouts reserve expanded settings and fit their stage frames";
     const auto fresh=defaults();
+    const auto body=[](const Node& node){return reroute(node.kind)?ImRect(ImVec2(node.x+24,node.y+8),ImVec2(node.x+40,node.y+24)):
+        ImRect(ImVec2(node.x,node.y),ImVec2(node.x+cardWidth(node),node.y+cardHeight(node)));};
     for(const auto& graph:fresh.graphs)
     {
         for(std::size_t i=0;i<graph.nodes.size();++i)
             for(std::size_t j=i+1;j<graph.nodes.size();++j)
             {
                 const auto& a=graph.nodes[i];const auto& b=graph.nodes[j];
-                require(a.x+cardWidth(a)<=b.x||b.x+cardWidth(b)<=a.x||a.y+cardHeight(a)<=b.y||b.y+cardHeight(b)<=a.y,
+                require(!body(a).Overlaps(body(b)),
                     "Expanded starter cards overlap");
             }
         for(const auto& group:graph.groups)for(int id:group.nodes)
         {
             const auto* node=findNode(graph,id);
-            require(node&&node->x>=group.x+32&&node->y>=group.y+64&&node->x+cardWidth(*node)<=group.x+group.width-32&&
-                node->y+Layout::height(*node,true)<=group.y+group.height-32,"An expanded node extends into its group header or outside its frame");
+            require(node&&groupContains(group,*node),"An expanded node extends into its group header or outside its frame");
         }
-        auto again=graph;require(!Layout::arrange(again),"Repeated arrangement changed an already ordered graph");
+        auto again=graph;
         require(!migrateStarterLayout(again),"A new layout was mistaken for a legacy starter");
     }
 }
@@ -1063,10 +1064,10 @@ void testCoalescedReleaseFinalizesEveryDrag()
         gestureScenario="Coalesced reroute move/release at zoom "+std::to_string(zoom);
         {
             EditorHarness harness;arrangeCompactFixture(harness,zoom);
-            harness.graph().nodes[2]=defaultNode(NodeKind::RerouteBoolean,3,224,192);harness.frame();
-            const auto from=canvasAt(harness,248,208);
+            harness.graph().nodes[2]=defaultNode(NodeKind::RerouteBoolean,3,224,176);harness.frame();
+            const auto from=canvasAt(harness,248,192);
             harness.fastDrag(from,add(from,ImVec2(40*zoom,40*zoom)));
-            require(findNode(harness.graph(),3)->x==256&&findNode(harness.graph(),3)->y==224,
+            require(findNode(harness.graph(),3)->x==256&&findNode(harness.graph(),3)->y==208,
                 "Reroute ignored a destination move delivered with button-up");
         }
         gestureScenario="Coalesced group resize/release at zoom "+std::to_string(zoom);
@@ -1516,6 +1517,57 @@ void testImportedLayoutSnapsWithoutShrinkingGroups()
     require(group.x<=previous.x&&group.y<=previous.y&&group.x+group.width>=previous.x+previous.width&&group.y+group.height>=previous.y+previous.height,"Grid normalization clipped an imported group");
     require(!snapLayout(graph)&&service().revision()==revision,"Grid normalization is not idempotent or changed execution");
 }
+void testEmptyCanvasClickClearsSelectionAcrossZoom()
+{
+    for(float zoom:GestureZooms)for(bool multiple:{false,true})
+    {
+        gestureScenario="Empty canvas deselection at zoom "+std::to_string(zoom);EditorHarness h;
+        h.graph().zoom=zoom;h.frame();h.click(h.body(1));
+        if(multiple){h.key(ImGuiMod_Shift,true);h.click(h.body(2));h.key(ImGuiMod_Shift,false);}
+        require(editor.selection[0].size()==(multiple?2:1),"The deselection fixture did not select its nodes");
+        const auto revision=service().revision(),undo=editor.undo.size();const auto panX=h.graph().panX,panY=h.graph().panY;
+        h.move(add(h.origin,ImVec2(850,450)));h.button(ImGuiMouseButton_Left,true);
+        require(!editor.selection[0].empty(),"Canvas press cleared selection before distinguishing a pan");
+        h.button(ImGuiMouseButton_Left,false);
+        require(editor.selection[0].empty()&&editor.selected[0]==0&&editor.selectedGroup[0]==0&&editor.tieSelection[0].empty()&&editor.selectedTie[0]==0,
+            "Clicking empty canvas left an active selection");
+        require(editor.panButton<0&&!editor.clearSelectionOnPanClick&&h.graph().panX==panX&&h.graph().panY==panY,
+            "Deselecting left a pan active or moved the graph");
+        require(service().revision()==revision&&editor.undo.size()==undo,"Deselecting published a graph edit or added Undo history");
+        h.click(h.body(2));require(editor.selection[0]==std::vector<int>{2},"A new selection retained nodes from the cleared selection");
+    }
+    gestureScenario="Empty group interior and group selection also deselect";EditorHarness h;
+    h.graph().groups={{1,"Frame",32,32,736,480,0x40ffcd60u,{1,2,3}}};h.frame();selectOne(0,1);
+    h.click(canvasAt(h,700,450));require(editor.selection[0].empty(),"An empty group interior kept its node selection");
+    editor.selectedGroup[0]=1;editor.tieSelection[0]={7};editor.selectedTie[0]=7;
+    h.click(add(h.origin,ImVec2(850,450)));
+    require(editor.selectedGroup[0]==0&&editor.tieSelection[0].empty()&&editor.selectedTie[0]==0,"Empty click kept a frame or wire-tie selection");
+}
+void testCanvasClickPreservesSelectionDuringOtherGestures()
+{
+    for(float zoom:GestureZooms)for(int button:{ImGuiMouseButton_Left,ImGuiMouseButton_Middle})for(bool coalesced:{false,true})
+    {
+        gestureScenario="Selection survives canvas navigation at zoom "+std::to_string(zoom);EditorHarness h;
+        h.graph().zoom=zoom;h.frame();h.click(h.body(1));h.key(ImGuiMod_Shift,true);h.click(h.body(2));h.key(ImGuiMod_Shift,false);
+        const auto selection=editor.selection[0];const auto from=add(h.origin,ImVec2(850,450));
+        h.move(from);h.button(button,true);
+        if(!coalesced)h.move(add(from,ImVec2(30,20)));
+        ImGui::GetIO().AddMousePosEvent(from.x+43,from.y+37);ImGui::GetIO().AddMouseButtonEvent(button,false);h.frame();
+        require(editor.selection[0]==selection&&editor.selected[0]==2,"Canvas drag discarded the selection");
+        if(button==ImGuiMouseButton_Middle){h.click(from,button);require(editor.selection[0]==selection,"Middle click discarded the selection");}
+    }
+    for(ImGuiKey modifier:{ImGuiMod_Shift,ImGuiMod_Ctrl,ImGuiMod_Alt})
+    {
+        gestureScenario="Modified empty click preserves selection";EditorHarness h;h.click(h.body(1));
+        h.key(modifier,true);h.click(add(h.origin,ImVec2(850,450)));h.key(modifier,false);
+        require(editor.selection[0]==std::vector<int>{1},"A modified canvas click cleared selection");
+    }
+    gestureScenario="Cancelled pan does not become an empty click";EditorHarness h;h.click(h.body(1));const auto from=add(h.origin,ImVec2(850,450));
+    h.move(from);h.button(ImGuiMouseButton_Left,true);h.key(ImGuiKey_Escape,true);h.key(ImGuiKey_Escape,false);h.button(ImGuiMouseButton_Left,false);
+    require(editor.selection[0]==std::vector<int>{1}&&!editor.clearSelectionOnPanClick,"Cancelling navigation left a pending deselection");
+    h.graph().links={{1,0,2,0}};h.frame();const auto& path=editor.canvasRoutes[0].routes[0].path;
+    h.click(wirePosition(path,wireLength(path)*0.2f));require(editor.selection[0]==std::vector<int>{1},"Clicking a wire was treated as empty canvas");
+}
 void testNavigationUsesTheEntireGestureAndRightClickRelease()
 {
     for(const int button:{ImGuiMouseButton_Left,ImGuiMouseButton_Middle})for(const float zoom:GestureZooms)
@@ -1961,6 +2013,7 @@ void testDisplayCacheRefreshesAfterRevisionAndReopen()
 #include "node_editor_benchmark.h"
 
 #include "node_editor_binding_tests.h"
+#include "node_numeric_wheel_tests.h"
 #include "node_preview_tests.h"
 #include "node_wire_bend_tests.h"
 #include "node_editor_placement_tests.h"
@@ -2015,11 +2068,13 @@ void testWindowButtonsStayOrderedAndReachable()
 }
 
 #include "node_reroute_delete_input_tests.h"
+#include "node_preview_snapshot.h"
 int main(int argc,char** argv)
 {
     try
     {
         if(argc>1&&std::string(argv[1])=="--benchmark")return benchmarkNodeEditor(argc>2?argv[2]:"benchmark_results/node_editor.csv",argc>3?argv[3]:"");
+        if(argc>2&&std::string(argv[1])=="--preview-snapshot")return snapshotUniversalPreview(argv[2]);
         const auto run=[&](const char* name,auto test){if(argc>2&&std::string(argv[1])=="--test"&&std::string(argv[2])!=name)return;gestureScenario=name;if(argc>1&&std::string(argv[1])=="--trace")std::cerr<<"Running "<<name<<std::endl;test();};
         run("testWindowButtonsStayOrderedAndReachable",testWindowButtonsStayOrderedAndReachable);
         run("testMcpEditorTransactions",testMcpEditorTransactions);
@@ -2027,12 +2082,15 @@ int main(int argc,char** argv)
         run("testMcpApplicationSettings",testMcpApplicationSettings);
         run("testMcpClientPresets",testMcpClientPresets);
         run("testDeletingReroutesWithDeleteKeepsWiresAcrossZoom",testDeletingReroutesWithDeleteKeepsWiresAcrossZoom);
+        run("testUniversalPreviewTextWrapScrollAndCopy",testUniversalPreviewTextWrapScrollAndCopy);
         run("testSharedCalibrationTemplatesAndLayout",testSharedCalibrationTemplatesAndLayout);
+        run("testFilledTemplatesKeepDefaultGeometry",testFilledTemplatesKeepDefaultGeometry);
         run("testRuntimeTuningAndReloadUseEditorTransactions",testRuntimeTuningAndReloadUseEditorTransactions);
         run("testWorkflowManagementIsImmediateAndUndoable",testWorkflowManagementIsImmediateAndUndoable);run("testWorkflowUsesCanvasWithoutPageTabs",testWorkflowUsesCanvasWithoutPageTabs);run("testModelExportJobLifecycle",testModelExportJobLifecycle);
         run("testPreviewVisibilityFollowsTheImagePanel",testPreviewVisibilityFollowsTheImagePanel);run("testPreviewTexturesUploadAndReuseActualPixels",testPreviewTexturesUploadAndReuseActualPixels);
         run("testOptionEditorBindings",testOptionEditorBindings);run("testOutputToInputAndPreview",testOutputToInputAndPreview); run("testShortPreviewDoesNotLoop",testShortPreviewDoesNotLoop); run("testInputToOutputAndReplacement",testInputToOutputAndReplacement);
         run("testEveryCardSizeFollowsTheGrid",testEveryCardSizeFollowsTheGrid);run("testFreeDragShowsItsGridDestinationAcrossZoom",testFreeDragShowsItsGridDestinationAcrossZoom);run("testFreeMoveCancelsWithoutSavingOrNoopHistory",testFreeMoveCancelsWithoutSavingOrNoopHistory);run("testGroupsAndReroutesHaveFreePlacementPreviews",testGroupsAndReroutesHaveFreePlacementPreviews);
+        run("testReroutesAndTiesShareGridIntersections",testReroutesAndTiesShareGridIntersections);run("testMixedPointSelectionAndPreviewUseCenterSnap",testMixedPointSelectionAndPreviewUseCenterSnap);run("testPointGridSurvivesCopiesArrangeAndLegacyNormalization",testPointGridSurvivesCopiesArrangeAndLegacyNormalization);
         run("testEmptyDoubleClickCreatesOneRerouteAcrossZoomAndTabs",testEmptyDoubleClickCreatesOneRerouteAcrossZoomAndTabs);run("testEmptyDoubleClickRespectsGroupsToolsAndLimits",testEmptyDoubleClickRespectsGroupsToolsAndLimits);run("testLooseReroutesAdaptToTheFirstConnection",testLooseReroutesAdaptToTheFirstConnection);run("testMouseMenuHoverDoesNotHighlightAnUnrelatedFirstItem",testMouseMenuHoverDoesNotHighlightAnUnrelatedFirstItem);
         run("testCatalogSearchAddsWithTabAndEnter",testCatalogSearchAddsWithTabAndEnter);run("testCatalogArrowsKeepSearchFocusAndScroll",testCatalogArrowsKeepSearchFocusAndScroll);run("testCatalogNoResultsAndEscapeAreSafe",testCatalogNoResultsAndEscapeAreSafe);run("testCatalogSearchQuickAddPreservesExistingConnections",testCatalogSearchQuickAddPreservesExistingConnections);run("testEmptyCatalogCanBrowseWithArrows",testEmptyCatalogCanBrowseWithArrows);
         run("testCatalogSearchMouseSelectionAndCreationErrors",testCatalogSearchMouseSelectionAndCreationErrors);
@@ -2057,6 +2115,8 @@ int main(int argc,char** argv)
         run("testInsertedRerouteMovesWithItsCommonGroup",testInsertedRerouteMovesWithItsCommonGroup);run("testOverlappingGroupControlsUseOneTopmostTarget",testOverlappingGroupControlsUseOneTopmostTarget);
         run("testDoubleClickCutsWireAcrossZoom",testDoubleClickCutsWireAcrossZoom);run("testWireContextKeepsRerouteAvailable",testWireContextKeepsRerouteAvailable);
         run("testInlineSettingsApplyAndOwnMouse",testInlineSettingsApplyAndOwnMouse);run("testIntegerInlineAndTypedConnections",testIntegerInlineAndTypedConnections);run("testSignalTypeColorsSurviveWireStates",testSignalTypeColorsSurviveWireStates);run("testInputSettingsAndSemanticZoom",testInputSettingsAndSemanticZoom);run("testStarterLayoutAccommodatesSettings",testStarterLayoutAccommodatesSettings);
+        run("testNumericWheelRequiresClickAndCloseZoom",testNumericWheelRequiresClickAndCloseZoom);run("testNumericWheelStepsPrecisionAndHistory",testNumericWheelStepsPrecisionAndHistory);
+        run("testNumericWheelDefaultsBoundsAndConnections",testNumericWheelDefaultsBoundsAndConnections);run("testNumericWheelDisarmsAndRespectsOtherControls",testNumericWheelDisarmsAndRespectsOtherControls);
         run("testArrangeGraphIsUndoableAndKeepsExecution",testArrangeGraphIsUndoableAndKeepsExecution);
         run("testLegacyCustomLayoutExpandsOnce",testLegacyCustomLayoutExpandsOnce);
         run("testInlinePathsAndDrivenSettings",testInlinePathsAndDrivenSettings);
@@ -2070,6 +2130,7 @@ int main(int argc,char** argv)
         run("testPropertiesPanelAndSelectionFocus",testPropertiesPanelAndSelectionFocus);run("testPropertiesRemainUsableInNarrowEditor",testPropertiesRemainUsableInNarrowEditor);
         run("testImportedLayoutSnapsWithoutShrinkingGroups",testImportedLayoutSnapsWithoutShrinkingGroups);run("testFailedLoadCannotAutosaveOverTheOriginal",testFailedLoadCannotAutosaveOverTheOriginal);
         run("testNavigationUsesTheEntireGestureAndRightClickRelease",testNavigationUsesTheEntireGestureAndRightClickRelease);run("testRightSelectionNeverPansOrMovesNodes",testRightSelectionNeverPansOrMovesNodes);
+        run("testEmptyCanvasClickClearsSelectionAcrossZoom",testEmptyCanvasClickClearsSelectionAcrossZoom);run("testCanvasClickPreservesSelectionDuringOtherGestures",testCanvasClickPreservesSelectionDuringOtherGestures);
         run("testCatalogSubmenusOpenOnHoverAndCreateANode",testCatalogSubmenusOpenOnHoverAndCreateANode);
         run("testWireTieGestureMovementRotationAndClipboard",testWireTieGestureMovementRotationAndClipboard);run("testTieCancellationAndOrderedRerouteSplit",testTieCancellationAndOrderedRerouteSplit);
         run("testGroupMoveAndRightSelectionIncludeTies",testGroupMoveAndRightSelectionIncludeTies);

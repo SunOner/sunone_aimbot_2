@@ -30,7 +30,7 @@ constexpr std::size_t MaxWorkspaceBytes = 4 * 1024 * 1024;
 constexpr int CurrentFormatVersion = 20;
 constexpr std::int32_t MinInteger = -2147483647 - 1, MaxInteger = 2147483647;
 enum class GraphKind { Aim, AutoShoot, Recoil, Vision };
-enum class ValueType { Boolean, Float, Point, Detections, Target, Movement, Frame, Depth, Mask, Integer, String, Monitor, Monitors, OverlayStyle, LabelOptions, Motion, Calibration, Number = Float };
+enum class ValueType { Boolean, Float, Point, Detections, Target, Movement, Frame, Depth, Mask, Integer, String, Monitor, Monitors, OverlayStyle, LabelOptions, Motion, Calibration, Any, Number = Float };
 enum class NodeKind
 {
     AimHeld, ShootHeld, ZoomHeld, TargetValid, TargetObserved,
@@ -199,6 +199,8 @@ struct PreviewImage
     std::int64_t version=-1;
     std::uint64_t generation=0;
     std::vector<std::uint8_t> rgba;
+    // Non-image previews keep their full display text here; no GPU texture is needed.
+    std::string text;
 };
 struct Pin { const char* name; ValueType type; const char* defaultParameter = nullptr; bool option=false; };
 enum class ParameterKind { Number, Integer, Boolean };

@@ -244,7 +244,11 @@ void screenshotsUseConnectedPixelsAndIndependentCadence()
     require(NodeVision::screenshot(VisionBase+first.id,image,first),"Deleted screenshot node retained its cooldown state");
     Node invalid=first;invalid.id=63;invalid.textParameters["format"]="invalid";
     require(!NodeVision::screenshot(VisionBase+invalid.id,image,invalid)&&!NodeVision::testErrors[VisionBase+invalid.id].empty(),"Screenshot save failure did not publish a node error");
-    Node registered=first;registered.id=14;
+    Node registered=first;registered.id=64;
+    auto workspace=NodeGraph::service().workspace();auto& graph=workspace.graphs[3];
+    graph.nodes.push_back(registered);auto gate=defaultNode(NodeKind::Boolean,65);gate.value=0;graph.nodes.push_back(gate);
+    graph.links.push_back({65,0,64,0});graph.links.push_back({1,0,64,1});std::string error;
+    require(NodeGraph::service().publish(workspace,error),error.c_str());
     require(NodeVision::screenshot(VisionBase+registered.id,image,registered),"Registered screenshot output did not save");
     NodeVision::retainVisionOutputs(Actions{});
     require(!NodeVision::screenshot(VisionBase+registered.id,image,registered),"Releasing the trigger erased a registered screenshot node's cooldown");

@@ -1,0 +1,417 @@
+#pragma once
+#include "nodes/node_graph.h"
+#include <stdexcept>
+
+namespace NodeTestData
+{
+inline NodeGraph::Workspace previousStarters()
+{
+    // Previous default workflows used for migration regressions.
+    static constexpr const char* document=R"graph(SUNONE_NODE_GRAPH 20
+PAGES 4
+GRAPH 0 40 40 1 37 45 7 0
+PAGE 1 1 1 "Aim Graph" "" -1
+NODE 1 0 32 64 0 0 0 0 0 0 0 0 0 0
+NODE 2 3 672 384 0 0 0 0 0 0 0 0 0 0
+NODE 3 14 992 1632 0 0 0 0 0 0 0 0 0 0
+NODE 4 166 1536 64 0 0 0 3 0 0 0 0 0 0
+PARAM "class_head" 1
+PARAM "class_player" 0
+PARAM "max_missed_frames" 6
+NODE 5 177 1504 672 0 0 0 3 0 0 0 0 0 0
+PARAM "draw_futurePositions" 0
+PARAM "prediction_futurePositions" 20
+PARAM "seconds" 0
+NODE 6 30 32 2144 0 0 0 0 0 0 0 0 0 0
+NODE 7 33 672 64 0 0 0 0 0 0 0 0 0 0
+NODE 8 167 2624 64 0 0 0 0 0 0 0 0 0 0
+NODE 9 36 32 1632 0 0 0 7 0 0 0 0 0 0
+PARAM "exponent" 1
+PARAM "max_distance" 0
+PARAM "max_speed" 1
+PARAM "min_speed" 1
+PARAM "near_radius" 0
+PARAM "snap_boost" 1
+PARAM "snap_radius" 0
+NODE 10 186 416 1632 0 0 0 0 0 0 0 0 1 0
+INPUT 1 0
+NODE 11 38 992 1824 0 0 0 5 0 0 0 0 0 0
+PARAM "enabled" 1
+PARAM "wind_D" 12
+PARAM "wind_G" 9
+PARAM "wind_M" 10
+PARAM "wind_W" 3
+NODE 12 39 32 224 0 0 0 1 0 0 0 0 0 0
+PARAM "enabled" 0
+NODE 13 15 320 64 0 0 0 0 0 0 0 0 0 0
+NODE 30 51 960 64 0 0 0 3 0 0 0 0 0 0
+PARAM "class_a" 0
+PARAM "class_b" 1
+PARAM "class_b_enabled" 1
+NODE 31 55 1248 64 0 0 0 2 0 0 0 0 0 0
+PARAM "class_id" 1
+PARAM "enabled" 1
+NODE 32 66 32 672 0 0 0 1 0 0 0 0 0 0
+PARAM "enabled" 1
+NODE 33 67 704 1632 0 0 0 3 0 0 0 0 0 0
+PARAM "base_fps" 30
+PARAM "enabled" 1
+PARAM "preserve_fraction" 0
+NODE 34 11 416 1824 0 0 0 0 0 0 0 0 0 0
+NODE 35 9 1856 896 0 0 0 0 0 0 0 0 0 0
+NODE 14 170 320 672 0 0 0 8 0 0 0 0 0 0
+PARAM "kalman_enabled" 1
+PARAM "kalman_max_velocity" 20000
+PARAM "kalman_measurement_noise" 35
+PARAM "kalman_process_noise_position" 40
+PARAM "kalman_process_noise_velocity" 1800
+PARAM "kalman_reset_timeout_sec" 0.5
+PARAM "kalman_velocity_damping" 0.5
+PARAM "kalman_warmup_frames" 2
+NODE 15 171 928 672 0 0 0 0 0 0 0 0 0 0
+NODE 16 172 928 832 0 0 0 0 0 0 0 0 0 0
+NODE 17 173 928 992 0 0 0 0 0 0 0 0 0 0
+NODE 18 174 928 1152 0 0 0 0 0 0 0 0 0 0
+NODE 19 175 928 1312 0 0 0 3 0 0 0 0 0 0
+PARAM "kalman_additional_prediction_ms" 0
+PARAM "kalman_compensate_detection_delay" 1
+PARAM "lookahead" 0
+NODE 20 176 1216 672 0 0 0 3 0 0 0 0 0 0
+PARAM "damping" 0
+PARAM "ready" 1
+PARAM "seconds" 0
+NODE 21 64 2336 64 0 0 0 0 0 0 0 0 0 0
+NODE 22 65 2336 224 0 0 0 0 0 0 0 0 0 0
+NODE 23 58 2048 64 0 0 0 0 0 0 0 0 0 0
+NODE 24 168 2336 384 0 0 0 3 0 0 0 0 0 0
+PARAM "body_y_offset" 0.14999999999999999
+PARAM "class_head" 1
+PARAM "head_y_offset" 0.050000000000000003
+NODE 25 49 1888 112 0 0 0 0 0 0 0 0 0 0
+NODE 26 178 768 720 0 0 0 0 0 0 0 0 0 0
+NODE 27 47 1856 784 0 0 0 0 0 0 0 0 0 0
+NODE 28 184 2144 736 0 0 0 1 0 0 0 0 0 0
+PARAM "implicit_center" 0
+NODE 29 185 2432 736 0 0 0 0 0 0 0 0 0 0
+NODE 36 182 2144 928 0 0 0 0 1 0 0 0 0 0
+TEXT "name" "mouse"
+NODE 37 181 2720 736 0 0 0 7 2 0 0 0 0 0
+PARAM "base_fov" 90
+PARAM "fov_scaled" 0
+PARAM "fov_x" 90
+PARAM "fov_y" 90
+PARAM "pitch" 0.021999999999999999
+PARAM "sens" 1
+PARAM "yaw" 0.021999999999999999
+TEXT "name" "mouse"
+TEXT "profile_name" "UNIFIED"
+LINK 1 0 13 0 0 0.57999998331069946 0
+LINK 12 0 13 1 0 0.57999998331069946 0
+LINK 13 0 3 0 0 0.57999998331069946 0
+LINK 13 0 4 1 0 0.57999998331069946 0
+LINK 2 0 3 1 0 0.57999998331069946 0
+LINK 3 0 6 0 0 0.57999998331069946 0
+LINK 31 0 4 0 0 0.57999998331069946 0
+LINK 4 0 2 0 0 0.57999998331069946 0
+LINK 25 0 21 0 0 0.57999998331069946 0
+LINK 32 0 14 0 0 0.57999998331069946 0
+LINK 27 0 9 0 0 0.57999998331069946 0
+LINK 27 0 28 0 0 0.57999998331069946 0
+LINK 9 0 10 1 0 0.57999998331069946 0
+LINK 33 0 11 0 0 0.57999998331069946 0
+LINK 11 0 6 1 0 0.57999998331069946 0
+LINK 7 0 30 0 0 0.57999998331069946 0
+LINK 30 0 31 0 0 0.57999998331069946 0
+LINK 8 0 32 0 0 0.57999998331069946 0
+LINK 10 0 33 0 0 0.57999998331069946 0
+LINK 34 0 33 1 0 0.57999998331069946 0
+LINK 35 0 28 1 0 0.57999998331069946 0
+LINK 26 0 15 0 0 0.57999998331069946 0
+LINK 26 0 16 0 0 0.57999998331069946 0
+LINK 26 0 17 0 0 0.57999998331069946 0
+LINK 26 0 18 0 0 0.57999998331069946 0
+LINK 15 0 20 0 0 0.57999998331069946 0
+LINK 16 0 20 1 0 0.57999998331069946 0
+LINK 19 0 20 2 0 0.57999998331069946 0
+LINK 17 0 20 3 0 0.57999998331069946 0
+LINK 18 0 20 4 0 0.57999998331069946 0
+LINK 20 0 5 0 0 0.57999998331069946 0
+LINK 26 0 5 1 0 0.57999998331069946 0
+LINK 19 0 5 2 0 0.57999998331069946 0
+LINK 25 0 22 0 0 0.57999998331069946 0
+LINK 25 0 23 0 0 0.57999998331069946 0
+LINK 23 0 24 0 0 0.57999998331069946 0
+LINK 21 0 8 0 0 0.57999998331069946 0
+LINK 22 0 8 1 0 0.57999998331069946 0
+LINK 24 0 8 2 0 0.57999998331069946 0
+LINK 4 0 25 0 0 0.57999998331069946 0
+LINK 14 0 26 0 0 0.57999998331069946 0
+LINK 5 0 27 0 0 0.57999998331069946 0
+LINK 28 0 29 0 0 0.57999998331069946 0
+LINK 36 0 29 1 0 0.57999998331069946 0
+LINK 29 0 10 0 0 0.57999998331069946 0
+GROUP 1 "01 Activation" 0 0 544 352 1090506080 3 1 12 13
+GROUP 2 "02 Select a target" 640 0 1120 512 1090491309 5 7 30 31 4 2
+GROUP 3 "03 Aim geometry" 1856 0 992 576 1090506080 6 8 21 22 23 24 25
+GROUP 4 "04 Compensate and filter" 0 608 640 384 1085136486 2 32 14
+GROUP 5 "05 Position + velocity + time" 736 608 992 864 1090491309 8 5 15 16 17 18 19 20 26
+GROUP 6 "07 Speed, FPS and mouse output" 0 1568 1216 736 1090506080 7 9 34 3 10 33 11 6
+GROUP 7 "06 Point to device counts" 1824 672 1248 448 1090491309 6 28 29 36 35 27 37
+GRAPH 1 40 40 1 18 22 5 0
+PAGE 2 1 1 "Auto Shoot" "" -1
+NODE 1 0 32 64 0 0 0 0 0 0 0 0 0 0
+NODE 2 4 320 512 0 0 0 0 0 0 0 0 0 0
+NODE 3 5 608 64 0 0 0 1 0 0 0 0 0 0
+PARAM "enabled" 0
+NODE 4 14 32 960 0 0 0 0 0 0 0 0 0 0
+NODE 5 14 320 960 0 0 0 0 0 0 0 0 0 0
+NODE 6 31 896 960 0 0 0 0 0 0 0 0 0 0
+NODE 7 33 960 64 0 0 0 0 0 0 0 0 0 0
+NODE 8 166 32 512 0 0 0 3 0 0 0 0 0 0
+PARAM "class_head" 1
+PARAM "class_player" 0
+PARAM "max_missed_frames" 6
+NODE 9 110 1408 512 0 0 0 0 0 0 0 0 1 0
+INPUT 2 0
+NODE 10 14 608 960 0 0 0 0 0 0 0 0 0 0
+NODE 11 39 32 224 0 0 0 1 0 0 0 0 0 0
+PARAM "enabled" 0
+NODE 12 15 320 64 0 0 0 0 0 0 0 0 0 0
+NODE 30 51 1248 64 0 0 0 3 0 0 0 0 0 0
+PARAM "class_a" 0
+PARAM "class_b" 1
+PARAM "class_b_enabled" 1
+NODE 31 55 1536 64 0 0 0 2 0 0 0 0 0 0
+PARAM "class_id" 1
+PARAM "enabled" 1
+NODE 13 64 832 512 0 0 0 0 0 0 0 0 0 0
+NODE 14 65 832 672 0 0 0 0 0 0 0 0 0 0
+NODE 15 169 1120 512 0 0 0 1 0 0 0 0 0 0
+PARAM "multiplier" 1
+NODE 16 49 672 560 0 0 0 0 0 0 0 0 0 0
+LINK 1 0 12 0 0 0.57999998331069946 0
+LINK 11 0 12 1 0 0.57999998331069946 0
+LINK 12 0 4 0 0 0.57999998331069946 0
+LINK 12 0 8 1 0 0.57999998331069946 0
+LINK 2 0 4 1 0 0.57999998331069946 0
+LINK 4 0 5 0 0 0.57999998331069946 0
+LINK 3 0 5 1 0 0.57999998331069946 0
+LINK 5 0 10 0 0 0.57999998331069946 0
+LINK 31 0 8 0 0 0.57999998331069946 0
+LINK 8 0 2 0 0 0.57999998331069946 0
+LINK 16 0 13 0 0 0.57999998331069946 0
+LINK 9 0 10 1 0 0.57999998331069946 0
+LINK 10 0 6 0 0 0.57999998331069946 0
+LINK 8 0 6 1 0 0.57999998331069946 0
+LINK 7 0 30 0 0 0.57999998331069946 0
+LINK 30 0 31 0 0 0.57999998331069946 0
+LINK 16 0 14 0 0 0.57999998331069946 0
+LINK 13 0 15 0 0 0.57999998331069946 0
+LINK 14 0 15 1 0 0.57999998331069946 0
+LINK 2 0 9 0 0 0.57999998331069946 0
+LINK 15 0 9 1 0 0.57999998331069946 0
+LINK 8 0 16 0 0 0.57999998331069946 0
+GROUP 1 "01 Activation" 0 0 832 352 1090506080 4 1 11 12 3
+GROUP 2 "02 Detection filters" 928 0 832 256 1090491309 3 7 30 31
+GROUP 3 "03 Select and observe" 0 448 544 288 1085136486 2 8 2
+GROUP 4 "04 Scope geometry" 640 448 992 352 1090506080 5 9 13 14 15 16
+GROUP 5 "05 Fire gate and output" 0 896 1120 224 1090491309 4 4 5 10 6
+GRAPH 2 40 40 1 9 8 2 0
+PAGE 3 1 1 "Recoil" "" -1
+NODE 1 1 32 64 0 0 0 0 0 0 0 0 0 0
+NODE 2 2 32 224 0 0 0 0 0 0 0 0 0 0
+NODE 3 6 672 64 0 0 0 1 0 0 0 0 0 0
+PARAM "enabled" 0
+NODE 4 14 320 64 0 0 0 0 0 0 0 0 0 0
+NODE 5 14 960 64 0 0 0 0 0 0 0 0 0 0
+NODE 6 7 960 256 0 0 0 1 0 0 0 0 0 0
+PARAM "strength" 5
+NODE 7 32 1248 64 0 0 0 0 0 0 0 0 0 0
+NODE 8 183 960 416 0 0 0 0 0 0 0 0 0 0
+NODE 9 182 672 224 0 0 0 0 1 0 0 0 0 0
+TEXT "name" "mouse"
+LINK 1 0 4 0 0 0.57999998331069946 0
+LINK 2 0 4 1 0 0.57999998331069946 0
+LINK 4 0 5 0 0 0.57999998331069946 0
+LINK 3 0 5 1 0 0.57999998331069946 0
+LINK 5 0 7 0 0 0.57999998331069946 0
+LINK 6 0 7 1 0 0.57999998331069946 0
+LINK 8 0 7 2 0 0.57999998331069946 0
+LINK 9 0 8 0 0 0.57999998331069946 0
+GROUP 1 "01 Shoot and zoom" 0 0 544 352 1090506080 3 1 2 4
+GROUP 2 "02 Recoil settings and output" 640 0 832 544 1085136486 6 3 5 6 8 7 9
+GRAPH 3 40 40 1 22 27 6 0
+PAGE 4 1 1 "Vision" "" -1
+NODE 1 72 32 64 0 0 0 10 6 0 0 0 0 0
+PARAM "capture_borders" 0
+PARAM "capture_cursor" 0
+PARAM "capture_fps" 120
+PARAM "capture_use_cuda" 0
+PARAM "detection_resolution" 320
+PARAM "enabled" 1
+PARAM "monitor_idx" 0
+PARAM "udp_port" 1234
+PARAM "virtual_camera_heigth" 1080
+PARAM "virtual_camera_width" 1920
+TEXT "capture_method" "duplication_api"
+TEXT "capture_target" "monitor"
+TEXT "capture_window_title" ""
+TEXT "monitor_device" ""
+TEXT "udp_ip" "127.0.0.1"
+TEXT "virtual_camera_name" ""
+NODE 2 73 1344 64 0 0 0 14 2 0 0 0 0 0
+PARAM "class_count" 0
+PARAM "confidence_threshold" 0.001
+PARAM "dml_device_id" 0
+PARAM "enabled" 1
+PARAM "export_enable_fp16" 1
+PARAM "export_enable_fp8" 0
+PARAM "fixed_input_size" 1
+PARAM "max_detections" 100000
+PARAM "nms_threshold" 1
+PARAM "trt_profile_max_size" 640
+PARAM "trt_profile_min_size" 160
+PARAM "trt_profile_opt_size" 320
+PARAM "use_cuda_graph" 0
+PARAM "use_pinned_memory" 0
+TEXT "backend" "DML"
+TEXT "model_path" ""
+NODE 3 74 416 64 0 0 0 2 1 0 0 0 0 0
+PARAM "depth_fps" 30
+PARAM "enabled" 0
+TEXT "model_path" ""
+NODE 4 75 704 64 0 0 0 5 0 0 0 0 0 0
+PARAM "depth_mask_expand" 0
+PARAM "depth_mask_fps" 5
+PARAM "depth_mask_invert" 0
+PARAM "depth_mask_near_percent" 25
+PARAM "enabled" 0
+NODE 5 76 1056 64 0 0 0 2 0 0 0 0 0 0
+PARAM "depth_mask_hold_frames" 0
+PARAM "enabled" 0
+NODE 6 52 32 672 0 0 0 1 0 0 0 0 0 0
+PARAM "threshold" 0.10000000000000001
+NODE 7 79 320 672 0 0 0 1 0 0 0 0 0 0
+PARAM "limit" 100
+NODE 8 78 608 672 0 0 0 3 0 0 0 0 0 0
+PARAM "class_agnostic" 0
+PARAM "max_candidates" 1000
+PARAM "threshold" 0.5
+NODE 9 54 896 672 0 0 0 3 0 0 0 0 0 0
+PARAM "enabled" 0
+PARAM "radius" 160
+PARAM "radius_percent" 0
+NODE 10 77 32 992 0 0 0 2 0 0 0 0 0 0
+PARAM "depth_mask_hold_frames" 0
+PARAM "enabled" 0
+NODE 11 82 320 992 0 0 0 1 0 0 0 0 0 0
+PARAM "enabled" 1
+NODE 12 155 1536 672 0 0 0 6 1 0 0 0 0 0
+PARAM "collect_cooldown_ms" 500
+PARAM "collect_jpeg_quality" 90
+PARAM "collect_only_when_aimbot_running" 1
+PARAM "collect_only_when_targets_present" 1
+PARAM "collect_save_every_n_frames" 1
+PARAM "enabled" 0
+TEXT "collect_output_dir" "datasets"
+NODE 13 153 608 1760 0 0 0 2 0 0 0 0 0 0
+PARAM "enabled" 0
+PARAM "game_overlay_max_fps" 120
+NODE 14 87 1728 1152 0 0 0 2 2 0 0 0 0 0
+PARAM "cooldown_ms" 500
+PARAM "quality" 95
+TEXT "format" "png"
+TEXT "output_dir" "screenshots"
+NODE 15 68 1440 1152 0 0 0 1 0 0 0 0 0 0
+PARAM "virtual_key" 0
+NODE 16 147 32 1344 0 0 0 7 0 0 0 0 0 0
+PARAM "game_overlay_box_a" 255
+PARAM "game_overlay_box_b" 255
+PARAM "game_overlay_box_g" 205
+PARAM "game_overlay_box_r" 96
+PARAM "game_overlay_box_thickness" 1
+PARAM "game_overlay_compensate_latency" 1
+PARAM "game_overlay_draw_boxes" 1
+NODE 17 148 320 1344 0 0 0 9 0 0 0 0 0 0
+PARAM "circle_fov_enabled" 0
+PARAM "circle_fov_radius_percent" 100
+PARAM "game_overlay_draw_circle_fov" 0
+PARAM "game_overlay_draw_frame" 0
+PARAM "game_overlay_frame_a" 255
+PARAM "game_overlay_frame_b" 255
+PARAM "game_overlay_frame_g" 205
+PARAM "game_overlay_frame_r" 96
+PARAM "game_overlay_frame_thickness" 1
+NODE 18 149 704 1344 0 0 0 4 0 0 0 0 0 0
+PARAM "game_overlay_draw_future" 1
+PARAM "game_overlay_draw_wind_tail" 0
+PARAM "game_overlay_future_alpha_falloff" 0.90000000000000002
+PARAM "game_overlay_future_point_radius" 2
+NODE 19 150 992 1344 0 0 0 6 2 0 0 0 0 0
+PARAM "game_overlay_icon_class" -1
+PARAM "game_overlay_icon_enabled" 0
+PARAM "game_overlay_icon_height" 32
+PARAM "game_overlay_icon_offset_x" 0
+PARAM "game_overlay_icon_offset_y" 0
+PARAM "game_overlay_icon_width" 32
+TEXT "game_overlay_icon_anchor" "center"
+TEXT "game_overlay_icon_path" ""
+NODE 20 151 32 1760 0 0 0 4 0 0 0 0 0 0
+PARAM "depth_colormap" 2
+PARAM "depth_debug_overlay_enabled" 0
+PARAM "depth_mask_alpha" 100
+PARAM "depth_mask_enabled" 0
+NODE 21 152 320 1760 0 0 0 7 0 0 0 0 0 0
+PARAM "exponent" 1
+PARAM "game_overlay_show_target_correction" 0
+PARAM "max_speed" 1
+PARAM "min_speed" 1
+PARAM "near_radius" 0
+PARAM "snap_boost" 1
+PARAM "snap_radius" 0
+NODE 22 154 1248 672 0 0 0 3 2 0 0 0 0 0
+PARAM "auto_label_data" 0
+PARAM "auto_label_max_boxes" 100
+PARAM "auto_label_min_conf" 0.10000000000000001
+TEXT "auto_label_record_classes" ""
+TEXT "model_name" ""
+LINK 1 0 5 0 0 0.57999998331069946 0
+LINK 1 0 3 0 0 0.57999998331069946 0
+LINK 3 0 4 0 0 0.57999998331069946 0
+LINK 4 0 5 1 0 0.57999998331069946 0
+LINK 5 0 2 0 0 0.57999998331069946 0
+LINK 2 0 6 0 0 0.57999998331069946 0
+LINK 6 0 7 0 0 0.57999998331069946 0
+LINK 7 0 8 0 0 0.57999998331069946 0
+LINK 8 0 9 0 0 0.57999998331069946 0
+LINK 9 0 10 0 0 0.57999998331069946 0
+LINK 4 0 10 1 0 0.57999998331069946 0
+LINK 10 0 11 1 0 0.57999998331069946 0
+LINK 1 0 12 1 0 0.57999998331069946 0
+LINK 10 0 12 2 0 0.57999998331069946 0
+LINK 1 0 13 1 0 0.57999998331069946 0
+LINK 10 0 13 2 0 0.57999998331069946 0
+LINK 4 0 13 3 0 0.57999998331069946 0
+LINK 3 0 13 4 0 0.57999998331069946 0
+LINK 15 0 14 0 0 0.57999998331069946 0
+LINK 1 0 14 1 0 0.57999998331069946 0
+LINK 16 0 17 0 0 0.57999998331069946 0
+LINK 17 0 18 0 0 0.57999998331069946 0
+LINK 18 0 19 0 0 0.57999998331069946 0
+LINK 19 0 20 0 0 0.57999998331069946 0
+LINK 20 0 21 0 0 0.57999998331069946 0
+LINK 21 0 13 5 0 0.57999998331069946 0
+LINK 22 0 12 3 0 0.57999998331069946 0
+GROUP 1 "01 Capture and depth" 0 0 928 512 1090506080 3 1 3 4
+GROUP 2 "02 Model inference" 1024 0 640 512 1090491309 2 5 2
+GROUP 3 "03 Filtered detections" 0 608 1120 576 1085136486 6 6 7 8 9 10 11
+GROUP 4 "04 Dataset recording" 1216 608 640 384 1085136486 2 12 22
+GROUP 5 "05 Overlay layers" 0 1280 1312 736 1090506080 7 13 16 17 18 19 20 21
+GROUP 6 "06 Screenshots" 1408 1088 544 288 1090491309 2 15 14
+END
+)graph";
+    NodeGraph::Workspace workspace;std::string error;
+    if(!NodeGraph::deserialize(document,workspace,error))throw std::runtime_error(error);
+    return workspace;
+}
+}

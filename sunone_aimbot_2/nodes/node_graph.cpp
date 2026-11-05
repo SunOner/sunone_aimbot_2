@@ -77,7 +77,51 @@ std::uint64_t signalStamp(const Value& value)
         if (value.mask) { mix(value.mask->version); mix(value.mask->generation); scalar(value.mask->timestampSeconds); mix(value.mask->width); mix(value.mask->height); }
         break;
     }
+    if(value.preview)mix(reinterpret_cast<std::uintptr_t>(value.preview.get()));
     return stamp;
+}
+bool imageValue(T type){return type==T::Frame||type==T::Depth||type==T::Mask;}
+Preview textPreview(const Value& value)
+{
+    auto result=std::make_shared<PreviewImage>();result->sourceType=value.type;
+    std::ostringstream text;text<<std::setprecision(17);
+    const auto point=[&](const char* label,Point p){text<<label<<"x = "<<p.x<<"\ny = "<<p.y<<'\n';};
+    switch(value.type)
+    {
+    case T::String:result->text=value.text;return result;
+    case T::Boolean:text<<(value.boolean?"true":"false");break;
+    case T::Float:text<<value.number;break;
+    case T::Integer:text<<value.integer;break;
+    case T::Point:point("",value.point);break;
+    case T::Target:
+        if(!value.target.valid){text<<"No target";break;}
+        text<<"Class = "<<value.target.classId<<"\nTrack = "<<value.target.trackId<<"\nConfidence = "<<value.target.confidence<<'\n';
+        point("Position\n",{value.target.x,value.target.y});point("Size\n",{value.target.width,value.target.height});point("Aim point\n",value.target.point);
+        point("Velocity\n",{value.target.velocityX,value.target.velocityY});text<<"Observed = "<<(value.target.observed?"true":"false")<<"\nAge = "<<value.target.ageSeconds;break;
+    case T::Detections:
+        if(!value.detections){text<<"No detections";break;}
+        text<<value.detections->objects.size()<<" detections\nFrame = "<<value.detections->version<<'\n';
+        for(std::size_t i=0;i<std::min<std::size_t>(64,value.detections->objects.size());++i)
+        {const auto& d=value.detections->objects[i];text<<'['<<i<<"] class "<<d.classId<<", confidence "<<d.confidence<<"\n  "<<d.x<<", "<<d.y<<"   "<<d.width<<" x "<<d.height<<'\n';}
+        if(value.detections->objects.size()>64)text<<"... "<<value.detections->objects.size()-64<<" more detections";break;
+    case T::Movement:
+        text<<value.movement.steps.size()<<" movement steps\n";
+        for(std::size_t i=0;i<std::min<std::size_t>(64,value.movement.steps.size());++i)text<<'['<<i<<"] "<<value.movement.steps[i].dx<<", "<<value.movement.steps[i].dy<<'\n';
+        if(value.movement.steps.size()>64)text<<"... "<<value.movement.steps.size()-64<<" more steps\n";
+        if(value.movement.hasPreciseCounts)point("Precise counts\n",value.movement.preciseCounts);break;
+    case T::Motion:point("Position\n",value.motion.position);point("Velocity\n",value.motion.velocity);text<<"Ready = "<<(value.motion.ready?"true":"false");break;
+    case T::Monitor:case T::Monitors:
+    {
+        const auto monitor=[&](const MonitorInfo& m){text<<'['<<m.index<<"] "<<m.name<<(m.primary?" (primary)":"")<<'\n'<<m.device<<'\n'<<m.width<<" x "<<m.height<<" at "<<m.x<<", "<<m.y<<"\n\n";};
+        if(value.monitor)monitor(*value.monitor);if(value.monitors)for(const auto& m:*value.monitors)monitor(m);break;
+    }
+    case T::Calibration:
+        if(value.calibration){text<<value.calibration->profileName<<'\n';point("Degrees per pixel\n",value.calibration->degreesPerPixel);point("Counts per degree\n",value.calibration->countsPerDegree);point("Pixels per count\n",value.calibration->pixelsPerCount);}break;
+    case T::OverlayStyle:case T::LabelOptions:
+        if(value.settings){for(const auto& entry:value.settings->numbers)text<<entry.first<<" = "<<entry.second<<'\n';for(const auto& entry:value.settings->texts)text<<entry.first<<" = "<<entry.second<<'\n';}break;
+    default:return {};
+    }
+    result->text=text.str();return result;
 }
 bool signalIsActive(const Value& value)
 {
@@ -211,7 +255,7 @@ bool isSink(K k) { return k == K::AimOutput || k == K::AutoShootOutput || k == K
 bool isAuxiliarySink(K k){return k==K::CollectDataset||k==K::RenderOverlay||k==K::ScreenshotOutput||k==K::ImagePreview||k==K::OverlayOutput||k==K::DatasetOutput;}
 bool isVisionOnly(K k){return k==K::CurrentFrame||k==K::CaptureSource||k==K::Inference||k==K::DepthInference||k==K::DepthToMask||
     k==K::ApplyMask||k==K::FilterMask||k==K::CollectDataset||k==K::RenderOverlay||k==K::VisionOutput||
-    k==K::RerouteFrame||k==K::RerouteDepth||k==K::RerouteMask||k==K::ScreenshotOutput||k==K::ImagePreview||
+    k==K::RerouteFrame||k==K::RerouteDepth||k==K::RerouteMask||k==K::ScreenshotOutput||
     (k>=K::OverlayBoxes&&k<=K::SetLabels);}
 bool finiteBound(double v, double bound) { return std::isfinite(v) && std::abs(v) <= bound; }
 struct CompiledNode
@@ -309,7 +353,7 @@ bool compileGraph(const Graph& graph, CompiledGraph& compiled, std::string& erro
             {error="Invalid text input default.";return false;}
         if (isSink(n.kind))
         {
-            if ((graph.kind==GraphKind::Vision)!=(n.kind==K::VisionOutput||isAuxiliarySink(n.kind)))
+            if (n.kind!=K::ImagePreview&&(graph.kind==GraphKind::Vision)!=(n.kind==K::VisionOutput||isAuxiliarySink(n.kind)))
             { error="Output node belongs to another execution domain.";return false; }
             if(!isAuxiliarySink(n.kind)&&!sinks.insert(n.kind).second)
             {error="Each graph can have at most one output of each type.";return false;}
@@ -420,6 +464,13 @@ bool compileGraph(const Graph& graph, CompiledGraph& compiled, std::string& erro
             }
             for(std::size_t pin=0;pin<def.inputs.size();++pin)
             {
+                if(node.kind==K::ImagePreview&&pin==4)
+                {
+                    bool dynamic=false;for(std::size_t p=0;p<def.inputs.size();++p)if(def.inputs[p].defaultParameter&&std::strcmp(def.inputs[p].defaultParameter,"mode")==0)dynamic=incoming[*it][p]>=0;
+                    int mode=static_cast<int>(parameter(node,"mode"));if(!mode)for(int p=1;p<=3;++p)if(incoming[*it][p]>=0){mode=p;break;}
+                    const int source=mode>=1&&mode<=3?incoming[*it][mode]:-1;
+                    if(!dynamic&&(source<0||!imageValue(definition(graph.nodes[source].kind).outputs[0].type)))continue;
+                }
                 if(node.kind==K::ImagePreview&&pin>=1&&pin<=3)
                 {
                     bool dynamic=false;for(std::size_t p=0;p<def.inputs.size();++p)if(def.inputs[p].defaultParameter&&std::strcmp(def.inputs[p].defaultParameter,"mode")==0)dynamic=incoming[*it][p]>=0;
@@ -641,9 +692,9 @@ const std::vector<Definition>& definitions()
         defs.push_back({set,setTitles[i],"Named values","Publish a named value in this graph. Get reads the current value through an implicit dependency.",{{"Value",variableTypes[i]}},{{"Value",variableTypes[i]}},{},{{"name","Name","value",128}}});
     }
     using P=ParameterKind;
-    defs.push_back({K::ImagePreview,"Preview","Vision outputs","Preview connected frames, depth or masks while this card is visible.",
-        {{"Enabled",T::Boolean,"enabled"},{"Frame",T::Frame},{"Depth",T::Depth},{"Mask",T::Mask},{"Detections",T::Detections}}, {},
-        {{"enabled","Enabled",1,0,1,P::Boolean},{"mode","View",0,0,3,P::Integer,"Auto|Frame|Depth|Mask"},
+    defs.push_back({K::ImagePreview,"Preview","Inspection","Inspect any connected value: video frames, images, depth, masks, text, numbers or structured data. Updates only while visible, at Preview FPS.",
+        {{"Enabled",T::Boolean,"enabled"},{"Data",T::Any},{"Depth",T::Depth},{"Mask",T::Mask},{"Detections",T::Detections}}, {},
+        {{"enabled","Enabled",1,0,1,P::Boolean},{"mode","View",0,0,3,P::Integer,"Auto|Data|Depth|Mask"},
          {"max_fps","Preview FPS",15,1,30,P::Integer},{"max_size","Image size",320,96,640,P::Integer},
          {"colormap","Depth colors",0,0,2,P::Integer,"Turbo|Gray|Inferno"},{"draw_boxes","Detection boxes",1,0,1,P::Boolean}}});
     for(const auto& item:std::vector<std::pair<K,const char*>>{{K::OverlayBoxes,"Overlay boxes"},{K::OverlayFrame,"Overlay frame / FOV"},
@@ -1015,12 +1066,12 @@ const char* typeName(ValueType type)
         case T::Detections: return "Detections"; case T::Target: return "Target"; case T::Movement: return "Mouse movement";
         case T::Frame:return "Frame";case T::Depth:return "Depth";case T::Mask:return "Mask";
         case T::String:return "String";case T::Monitor:return "Monitor";case T::Monitors:return "Monitors";
-        case T::OverlayStyle:return "Overlay style";case T::LabelOptions:return "Label options";case T::Motion:return "Motion sample";case T::Calibration:return "Mouse calibration"; }
+        case T::OverlayStyle:return "Overlay style";case T::LabelOptions:return "Label options";case T::Motion:return "Motion sample";case T::Calibration:return "Mouse calibration";case T::Any:return "Any"; }
     return "Unknown";
 }
 bool canConnectTypes(ValueType output,ValueType input)
 {
-    return output==input||(output==T::Integer&&input==T::Float);
+    return output!=T::Any&&(input==T::Any||output==input||(output==T::Integer&&input==T::Float));
 }
 bool variableGet(NodeKind kind){return (kind>=K::GetBoolean&&kind<=K::SetMask&&((static_cast<int>(kind)-static_cast<int>(K::GetBoolean))%2)==0)||kind==K::GetOverlay||kind==K::GetLabels||kind==K::GetMotion||kind==K::GetCalibration;}
 bool variableSet(NodeKind kind){return (kind>=K::GetBoolean&&kind<=K::SetMask&&!variableGet(kind))||kind==K::SetOverlay||kind==K::SetLabels||kind==K::SetMotion||kind==K::SetCalibration;}
@@ -1667,7 +1718,9 @@ bool migrateWorkflowPages(Workspace& workspace)
     }
     return changed;
 }
-Workspace defaults()
+#include "nodes/starter_layouts.inl"
+
+static Workspace generatedStarterGraphs()
 {
     auto workspace=previousStarterGraphs();
     workspace.graphs[2].nodes.push_back(defaultNode(K::MouseCalibration,8));
@@ -1683,6 +1736,12 @@ Workspace defaults()
     const auto stage=std::find_if(aim.groups.begin(),aim.groups.end(),[](const Group& group){return group.title=="06 Point to device counts";});
     if(source!=aim.groups.end()&&stage!=aim.groups.end()){stage->nodes.insert(stage->nodes.end(),source->nodes.begin(),source->nodes.end());aim.groups.erase(source);}
     Layout::arrange(aim);
+    return workspace;
+}
+Workspace defaults()
+{
+    auto workspace=generatedStarterGraphs();
+    for(auto& graph:workspace.graphs)applyStarterLayout(graph);
     return workspace;
 }
 bool migrateStarterLayout(Graph& graph)
@@ -1957,7 +2016,7 @@ Actions Service::evaluateDomain(const Context& context,bool vision,bool configur
 {
     const auto now = std::chrono::steady_clock::now();
     const auto program = std::atomic_load(&program_);
-    const auto previews=vision?previewNodes():nullptr;
+    const auto previews=previewNodes();
     const bool sharedFrame=program->sharedFrame||(program->potentialFrame&&previews&&!previews->empty());
     const auto previewWanted=[&](int id){return previews&&std::binary_search(previews->begin(),previews->end(),id);};
     // One control worker and one Vision worker own separate mutable state.
@@ -2019,7 +2078,7 @@ Actions Service::evaluateDomain(const Context& context,bool vision,bool configur
         domain.sampledAt={};for(auto& signals:domain.signals)signals.clear();domain.signalProgram.reset();
     }
     domain.telemetryWasEnabled=monitorSignals;
-    if(vision)for(auto it=domain.previews.begin();it!=domain.previews.end();)
+    for(auto it=domain.previews.begin();it!=domain.previews.end();)
         if(!previewWanted(it->first))it=domain.previews.erase(it);else++it;
     const auto inDomain=[&](int graph){const auto& page=program->workspace.graphs[graph];return page.active&&page.enabled&&((page.kind==GraphKind::Vision)==vision);};
     bool captureObserved=false;
@@ -2199,23 +2258,24 @@ Actions Service::evaluateDomain(const Context& context,bool vision,bool configur
                 const std::array<double,4> options={parameter(settings,"mode"),parameter(settings,"max_size"),parameter(settings,"colormap"),parameter(settings,"draw_boxes")};
                 const auto cached=domain.previews.find(previewKey(g,settings.id));
                 if(!configurationOnly&&cached!=domain.previews.end()&&cached->second.settings==options&&
-                    (!context.frame||!cached->second.image||cached->second.image->generation==context.frame->generation)&&
+                    (!context.frame||!cached->second.image||!imageValue(cached->second.image->sourceType)||cached->second.image->generation==context.frame->generation)&&
                     now-cached->second.updatedAt<std::chrono::duration<double>(1.0/parameter(settings,"max_fps")))
                 {out.preview=cached->second.image;out.valid=static_cast<bool>(out.preview);out.boolean=out.valid;out.error=cached->second.error;return out;}
                 readInputs[i]|=std::uint64_t{1}<<pin;if(!ready(n.inputs[pin]))return out;
                 const auto& image=values[n.inputs[pin]];
                 if(!image.valid&&!configurationOnly){out.error=image.error;domain.previews.erase(previewKey(g,settings.id));return out;}
+                const bool raster=imageValue(image.type);
                 DetectionStream detections;
-                if(parameter(settings,"draw_boxes")!=0&&n.inputs[4]>=0)
+                if(raster&&parameter(settings,"draw_boxes")!=0&&n.inputs[4]>=0)
                 {readInputs[i]|=std::uint64_t{1}<<4;if(!ready(n.inputs[4]))return out;if(values[n.inputs[4]].valid)detections=values[n.inputs[4]].detections;}
-                if(configurationOnly||!context.preview)return out;
+                if(configurationOnly)return out;
+                if(raster&&!context.preview){out.error="Image preview is unavailable in this workflow.";return out;}
                 const auto currentPreviews=previewNodes();
                 if(!currentPreviews||!std::binary_search(currentPreviews->begin(),currentPreviews->end(),previewKey(g,settings.id)))return out;
                 auto& state=domain.previews[previewKey(g,settings.id)];
-                const auto generation=image.mask?image.mask->generation:image.frame->generation;
-                const auto version=image.mask?image.mask->version:image.frame->version;
-                const auto identity=image.mask?image.mask->storage.get():image.frame->storage.get();
-                const std::array<std::uint64_t,5> stamp={generation,static_cast<std::uint64_t>(version),reinterpret_cast<std::uintptr_t>(identity),
+                const auto generation=image.mask?image.mask->generation:image.frame?image.frame->generation:0;
+                const auto identity=image.mask?image.mask->storage.get():image.frame?image.frame->storage.get():nullptr;
+                const std::array<std::uint64_t,5> stamp={generation,signalStamp(image),reinterpret_cast<std::uintptr_t>(identity),
                     detections?static_cast<std::uint64_t>(detections->version):0,detections?detections->generation:0};
                 const bool reset=state.stamp[0]!=generation||state.settings!=options;
                 state.updatedAt=now;
@@ -2224,8 +2284,8 @@ Actions Service::evaluateDomain(const Context& context,bool vision,bool configur
                     state.stamp=stamp;state.settings=options;state.error.clear();state.image.reset();
                     try
                     {
-                        state.image=context.preview(image,detections,settings);
-                        if(state.image&&(state.image->width<1||state.image->height<1||state.image->width>640||state.image->height>640||
+                        state.image=raster?context.preview(image,detections,settings):textPreview(image);
+                        if(raster&&state.image&&(state.image->width<1||state.image->height<1||state.image->width>640||state.image->height>640||
                             state.image->rgba.size()!=static_cast<std::size_t>(state.image->width)*state.image->height*4))
                         {state.image.reset();state.error="Preview returned an invalid image.";}
                     }
@@ -3158,7 +3218,7 @@ bool deserialize(const std::string& text, Workspace& workspace, std::string& err
             graph.ties.push_back(tie);
         }
     }
-    if(version<4)candidate.graphs[3]=defaults().graphs[3];
+    if(version<4)candidate.graphs[3]=generatedStarterGraphs().graphs[3];
     for(std::size_t i=0;i<candidate.graphs.size();++i)if(!candidate.graphs[i].workflow)candidate.graphs[i].workflow=static_cast<int>(i)+1;
     if (!(in >> token) || token != "END" || (in >> token)) return malformed();
     if(version<16)for(auto& graph:candidate.graphs)

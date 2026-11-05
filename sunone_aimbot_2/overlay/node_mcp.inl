@@ -88,6 +88,12 @@ JsonObject catalog()
 JsonObject liveValue(const Value& value)
 {
     JsonObject result;put(result,L"type",typeName(value.type));put(result,L"valid",value.valid);put(result,L"error",value.error);
+    if(value.preview)
+    {
+        JsonObject preview;put(preview,L"type",typeName(value.preview->sourceType));put(preview,L"width",value.preview->sourceWidth);put(preview,L"height",value.preview->sourceHeight);
+        if(value.preview->width==0)put(preview,L"text",value.preview->text);
+        put(result,L"preview",preview);
+    }
     switch(value.type)
     {
     case ValueType::Boolean:put(result,L"value",value.boolean);break;

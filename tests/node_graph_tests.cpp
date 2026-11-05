@@ -1,6 +1,7 @@
 #include "nodes/node_graph.h"
 #include <tuple>
 #include "nodes/node_layout.h"
+#include "node_previous_starters.h"
 #include <algorithm>
 #include <atomic>
 #include <cmath>
@@ -241,7 +242,7 @@ void testVisionExecutionAndLaziness()
     require(vision.captures==1&&vision.inferences==1&&vision.depths==0&&vision.masks==0&&vision.applies==0&&vision.maskFilters==0,"Disabled mask chain must not invoke depth providers");
     require(vision.collections==0&&vision.renders==0,"Disabled auxiliary outputs must not execute callbacks");
     require(action.activeProviderKeys.size()==2&&action.activeDepthKeys.empty()&&action.activeMaskKeys.empty(),"Vision activity must identify actual providers only");
-    Service wiredService;VisionFixture wiredFixture;auto wired=defaults();auto& wiredVision=wired.graphs[3];
+    Service wiredService;VisionFixture wiredFixture;auto wired=NodeTestData::previousStarters();auto& wiredVision=wired.graphs[3];
     auto gate=defaultNode(NodeKind::Boolean,50);gate.value=0;wiredVision.nodes.push_back(gate);wiredVision.links.push_back({50,0,12,0});
     publish(wiredService,wired);require(wiredService.providerNodes(NodeKind::DatasetOutput).size()==1,"Wired auxiliary enables must retain registered providers while the trigger is false");
     wiredService.evaluateVision(wiredFixture.context);require(wiredFixture.collections==0,"A false wired enable must keep its auxiliary output inactive");
@@ -306,7 +307,7 @@ void testConcurrentVisionAndControl()
 }
 void testScreenshotOutput()
 {
-    Service service;VisionFixture vision;auto workspace=defaults();auto& graph=workspace.graphs[3];
+    Service service;VisionFixture vision;auto workspace=NodeTestData::previousStarters();auto& graph=workspace.graphs[3];
     node(graph,11).parameters["enabled"]=0;
     bool held=false;int queries=0;
     vision.context.keyDown=[&](int key){++queries;return key==65&&held;};
@@ -421,7 +422,7 @@ void testIntegerTargetPropertiesKeepLegacyConnections()
 void testWireTiesArePersistentVisualMetadata()
 {
     Service service;Fixture fixture;auto workspace=defaults();const auto original=service.evaluate(fixture.context);const auto revision=service.revision();
-    auto& graph=workspace.graphs[0];graph.ties={{7,352,192,37.5f},{9,640,160,-15}};graph.links[0].ties={7,9};graph.links[1].ties={7};
+    auto& graph=workspace.graphs[0];for(auto& link:graph.links)link.ties.clear();graph.ties={{7,352,192,37.5f},{9,640,160,-15}};graph.links[0].ties={7,9};graph.links[1].ties={7};
     publish(service,workspace);const auto tied=service.evaluate(fixture.context);
     require(service.revision()==revision&&tied.aim==original.aim&&tied.aimPoint.x==original.aimPoint.x&&tied.aimPoint.y==original.aimPoint.y,"Wire ties changed graph execution");
     std::string text,error;Workspace restored;require(serialize(workspace,text,error)&&deserialize(text,restored,error),"Wire tie export/import failed");
@@ -474,7 +475,8 @@ void testLayoutFitsExpandedNodesAndNestedGroups()
         for(std::size_t a=0;a<graph.nodes.size();++a)
         {
             const auto& first=graph.nodes[a];
-            require(first.x==Layout::snap(first.x)&&first.y==Layout::snap(first.y),"Layout left a node off the grid");
+            const float anchorX=first.x+(Layout::isReroute(first.kind)?32:0),anchorY=first.y+(Layout::isReroute(first.kind)?16:0);
+            require(anchorX==Layout::snap(anchorX)&&anchorY==Layout::snap(anchorY),"Layout left a node's visible anchor off the grid");
             for(std::size_t b=a+1;b<graph.nodes.size();++b)
             {
                 const auto& second=graph.nodes[b];
@@ -490,7 +492,7 @@ void testLayoutFitsExpandedNodesAndNestedGroups()
                 member.y+Layout::height(member,true)<=group.y+group.height-32,"An expanded card does not fit its group");
         }
     };
-    for(auto& graph:workspace.graphs){check(graph);require(!Layout::arrange(graph),"Arrangement is not deterministic");}
+    for(auto& graph:workspace.graphs){Layout::arrange(graph);check(graph);require(!Layout::arrange(graph),"Arrangement is not deterministic");}
     Graph nested;nested.kind=GraphKind::Aim;
     nested.nodes={defaultNode(NodeKind::Number,1),defaultNode(NodeKind::Add,2),defaultNode(NodeKind::Number,3),
         defaultNode(NodeKind::RerouteNumber,4),defaultNode(NodeKind::Clamp,5)};
@@ -516,7 +518,7 @@ void testLayoutFitsExpandedNodesAndNestedGroups()
 }
 void testHistoricalStarterLayoutMigrationPreservesWiring()
 {
-    auto workspace=defaults();auto& legacy=workspace.graphs[2];
+    auto workspace=NodeTestData::previousStarters();auto& legacy=workspace.graphs[2];
     legacy.nodes.erase(std::remove_if(legacy.nodes.begin(),legacy.nodes.end(),[](const Node& node){return node.id>7;}),legacy.nodes.end());
     legacy.links.erase(std::remove_if(legacy.links.begin(),legacy.links.end(),[](const Link& link){return link.fromNode>7;}),legacy.links.end());
     for(auto& entry:legacy.nodes)
@@ -540,7 +542,7 @@ void testHistoricalStarterLayoutMigrationPreservesWiring()
 }
 void testSplitStarterWorkflowMigratesWithoutChangingLogic()
 {
-    auto workspace=defaults();auto& graph=workspace.graphs[3];
+    auto workspace=NodeTestData::previousStarters();auto& graph=workspace.graphs[3];
     std::vector<int> outputs{11,12,13};
     for(const auto& entry:graph.nodes)if((entry.kind>=NodeKind::OverlayBoxes&&entry.kind<=NodeKind::OverlayCorrection)||entry.kind==NodeKind::DatasetLabels)outputs.push_back(entry.id);
     graph.groups={{1,"01 Capture and depth",0,0,256,192,0x40ffcd60u,{1,3,4}},
@@ -605,9 +607,15 @@ void testDisableIsDistinctFromBypassAndPersists()
 #include "node_shared_calibration_tests.h"
 #include "node_runtime_audit_tests.h"
 #include "node_reroute_delete_tests.h"
+#include "node_universal_preview_tests.h"
+#include "node_starter_layout_tests.h"
 int main()
 {
     const auto run=[](const char* name,auto test){try{test();}catch(const std::exception& error){throw std::runtime_error(std::string(name)+": "+error.what());}};
+    try{run("testStarterLayoutsAreExactAndPortable",testStarterLayoutsAreExactAndPortable);}
+    catch(const std::exception& error){std::cerr<<error.what()<<'\n';return 1;}
+    try{run("testUniversalPreviewAcceptsValuesInEveryWorkflow",testUniversalPreviewAcceptsValuesInEveryWorkflow);run("testUniversalPreviewNumbersStructuresAndImageCompatibility",testUniversalPreviewNumbersStructuresAndImageCompatibility);}
+    catch(const std::exception& error){std::cerr<<"Universal preview test failed: "<<error.what()<<'\n';return 1;}
     try{run("testRerouteDeletionPreservesBranchesAndRoutes",testRerouteDeletionPreservesBranchesAndRoutes);run("testRerouteDeletionSupportsEveryTypeAndRouteLimits",testRerouteDeletionSupportsEveryTypeAndRouteLimits);}
     catch(const std::exception& error){std::cerr<<"Reroute deletion test failed: "<<error.what()<<'\n';return 1;}
     try{run("testEventStateSurvivesUnrelatedLogicEdits",testEventStateSurvivesUnrelatedLogicEdits);run("testUnavailableTriggersDoNotCreateRecoveryEdges",testUnavailableTriggersDoNotCreateRecoveryEdges);run("testErrorCausesPropagateAndRecover",testErrorCausesPropagateAndRecover);run("testDormantBranchesDoNotReplayKeyEdges",testDormantBranchesDoNotReplayKeyEdges);}

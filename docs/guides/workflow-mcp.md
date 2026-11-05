@@ -73,4 +73,6 @@ Applied changes are live and can activate graph outputs. `dry_run` does not exec
 
 Diagnostics request a one-second telemetry lease without opening the menu or requesting image pixels. Read again after a runtime tick if `current` is false; stale or absent samples are not evidence of successful execution. Preview mode evaluates synthetic data only and stops ticking while its window is hidden.
 
+The universal Preview node has an `Any` Data input (port 1), available in every workflow. Visible text/data previews appear in diagnostics as `value.preview.type` and `value.preview.text`; images expose metadata only. Existing depth/mask ports remain compatible. Preview subscriptions still require a visible, expanded card; the diagnostics lease does not request pixel conversion.
+
 To diagnose a connection, run `python workflow_mcp.py --check` beside the executable (add `--instance NAME` for a custom instance). It reports connection/build/window state and exits. A local stdio client must run on the same Windows host and user as the application; a cloud-only chat cannot reach this pipe directly.

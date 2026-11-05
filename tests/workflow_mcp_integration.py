@@ -16,6 +16,7 @@ import site
 import subprocess
 import sys
 import time
+import uuid
 
 
 def wait_for_preview(process, stage, instance):
@@ -96,11 +97,15 @@ async def exercise(stage, instance):
         boolean, negate = definitions["boolean"]["kind"], definitions["not"]["kind"]
         reroute, strength = definitions["reroute float"]["kind"], definitions["float"]["kind"]
         output = definitions["recoil movement"]["kind"]
+        preview_kind = definitions["preview"]["kind"]
+        assert definitions["preview"]["inputs"][1]["type"] == "Any"
         current = await call("get_workspace")
         for template in range(4):
             preview = await call("validate_workflows", dict(expected_version=current["version"], operations=[dict(op="workflow.create", id=900000+template, kind=template, template=True, fields=dict(name=f"Template {template}"))]))
             assert not preview["applied"]
         identifier = max(graph["id"] for graph in current["workspace"]["graphs"]) + 1
+        universal = await call("validate_workflows", dict(expected_version=current["version"], operations=[dict(op="workflow.create", id=identifier), dict(op="node.add", workflow=identifier, id=1, kind=definitions["string"]["kind"], fields=dict(text_parameters=dict(value="Full preview text"))), dict(op="node.add", workflow=identifier, id=2, kind=preview_kind), dict(op="link.connect", workflow=identifier, link=dict(from_node=1, from_port=0, to_node=2, to_port=1))]))
+        assert not universal["applied"]
         link = dict(from_node=1, from_port=0, to_node=3, to_port=0)
         operations = [dict(op="workflow.create", id=identifier, fields=dict(name="MCP integration"))]
         for node, kind, x, y in ((1, boolean, 64, 64), (2, negate, 448, 64), (3, reroute, 320, 96), (4, output, 640, 64), (5, strength, 64, 256)):
@@ -136,6 +141,19 @@ async def exercise(stage, instance):
         diagnostics = await call("get_diagnostics", dict(workflow=identifier))
         assert diagnostics["graphs"][0]["current"]
         assert next(node for node in diagnostics["graphs"][0]["nodes"] if node["node"] == 2)["value"]["value"] is False
+        preview_text = "Universal preview: полный текст\n0.005555555555555556"
+        current = await call("get_workspace")
+        preview_workflow = identifier + 1
+        inspected = await call("edit_workflows", dict(expected_version=current["version"], operations=[dict(op="workflow.create", id=preview_workflow, fields=dict(name="MCP value preview")), dict(op="node.add", workflow=preview_workflow, id=1, kind=definitions["string"]["kind"], fields=dict(x=32, y=32, text_parameters=dict(value=preview_text))), dict(op="node.add", workflow=preview_workflow, id=2, kind=preview_kind, fields=dict(x=352, y=32)), dict(op="link.connect", workflow=preview_workflow, link=dict(from_node=1, from_port=0, to_node=2, to_port=1))]))
+        await call("editor_action", dict(expected_version=inspected["version"], action="focus", workflow=preview_workflow, node=2))
+        for _ in range(50):
+            visible = await call("get_diagnostics", dict(workflow=preview_workflow, node=2))
+            nodes = visible["graphs"][0]["nodes"]
+            if nodes and nodes[0]["value"].get("preview", {}).get("text") == preview_text:
+                break
+            await asyncio.sleep(0.05)
+        else:
+            raise AssertionError("Visible universal preview did not publish full text through MCP")
         exported = await call("export_workflows")
         assert "SUNONE_NODE_GRAPH 20" in exported["document"]
         assert (stage / "node_graphs.ini").read_text(encoding="utf-8") == exported["document"]
@@ -177,12 +195,13 @@ def main():
     if arguments.sdk_dir:
         site.addsitedir(str(arguments.sdk_dir.resolve()))
     repo = Path(__file__).resolve().parents[1]
-    stage = repo / "build" / f"qa-mcp-{time.time_ns()}"
+    run_id = uuid.uuid4().hex
+    stage = repo / "build" / f"qa-mcp-{run_id}"
     stage.mkdir()
     source = arguments.build_dir.resolve()
     for path in (source / "ai.exe", source / "workflow_mcp.py", *source.glob("*.dll")):
         shutil.copy2(path, stage / path.name)
-    instance = "qa_" + str(time.time_ns())
+    instance = "qa_" + run_id
     environment = dict(os.environ, SUNONE_MCP_INSTANCE=instance)
     with (stage / "preview.log").open("wb") as log:
         process = subprocess.Popen([str(stage / "ai.exe"), "--node-editor-preview"], cwd=stage, env=environment, stdout=log, stderr=log, creationflags=subprocess.CREATE_NO_WINDOW)

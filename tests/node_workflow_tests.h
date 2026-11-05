@@ -54,9 +54,9 @@ void testGeneratedProfileContainerFoldsIntoLogic()
     source.ties={{1,128,128,15}};source.links={{2,0,1,optionPin(NodeKind::MouseProfile,"fov_scaled"),{1}}};
     source.groups={{1,"Shared aiming and recoil calibration",0,0,512,512,0x40ffcd60u,{1,2}}};
     auto alternative=source;alternative.pageName="Second";alternative.active=false;alternative.nodes[0].parameters["sens"]=3;
-    old.graphs.push_back(source);old.graphs.push_back(alternative);const auto nodes=old.graphs[0].nodes.size();
+    old.graphs.push_back(source);old.graphs.push_back(alternative);const auto nodes=old.graphs[0].nodes.size(),ties=old.graphs[0].ties.size();
     require(migrateWorkflowPages(old)&&old.graphs.size()==5,"The generated Profiles workflow was not folded into Logic");
-    require(old.graphs[0].nodes.size()==nodes+2&&old.graphs[0].ties.size()==1,"Calibration migration lost custom upstream nodes or wire ties");
+    require(old.graphs[0].nodes.size()==nodes+2&&old.graphs[0].ties.size()==ties+1,"Calibration migration lost custom upstream nodes or wire ties");
     std::string error;old.sourceVersion=CurrentFormatVersion;require(validate(old,error),"Merged calibration has broken IDs, ports, groups or ties");
     int sources=0;for(const auto& graph:old.graphs){require(graph.active&&graph.pageName.empty()&&workflowTitle(graph).find("Profiles")==std::string::npos,"A profile container or hidden page remains");for(const auto& node:graph.nodes)sources+=node.kind==NodeKind::MouseProfile;}
     require(sources==2&&!old.graphs.back().enabled&&parameter(old.graphs.back().nodes[0],"sens")==3,"Inactive calibration data was discarded or enabled");

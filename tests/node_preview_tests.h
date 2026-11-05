@@ -15,7 +15,31 @@ void testPreviewVisibilityFollowsTheImagePanel()
     edited();selectOne(3,6);h.frame();requests=service().previewNodes();
     require(requests&&requests->size()==MaxLivePreviews&&std::find(requests->begin(),requests->end(),6)!=requests->end(),"The selected preview did not receive priority within the visible image budget");
     NodeEditor_EndInteraction();requests=service().previewNodes();require(!requests||requests->empty(),"Leaving the editor retained preview subscriptions");
-    require(!kindAllowed(editor.draft.graphs[0],NodeKind::ImagePreview),"A Vision preview can be added to a control graph");
+    require(kindAllowed(editor.draft.graphs[0],NodeKind::ImagePreview),"A universal preview is missing from a Logic workflow");
+    auto& graph=editor.draft.graphs[0];graph.nodes={defaultNode(NodeKind::Boolean,1),defaultNode(NodeKind::RerouteFloat,2),defaultNode(NodeKind::ImagePreview,3)};graph.links={{2,0,3,1}};
+    std::string error;require(looseReroute(graph,graph.nodes[1])&&canConnectReroutes(graph,{1,0,2,0},error),"A reroute wired to Any prematurely locked its type");
+    adaptLooseReroutes(graph,{1,0,2,0});require(graph.nodes[1].kind==NodeKind::RerouteBoolean,"The first typed source did not choose the reroute type through Preview");
+}
+void testUniversalPreviewTextWrapScrollAndCopy()
+{
+    gestureScenario="Universal preview wraps full text, scrolls without zooming and keeps a cached layout";
+    EditorHarness h;h.graph().nodes={defaultNode(NodeKind::ImagePreview,1,32,32)};h.graph().links.clear();h.graph().zoom=1;edited();h.frame();
+    auto content=std::make_shared<PreviewImage>();content->sourceType=ValueType::String;
+    for(int i=0;i<100;++i)content->text+="Line "+std::to_string(i)+" with full text and precise value 0.005555555555555556\n";
+    const auto install=[&]{editor.live.graphs[0]={{}};auto& sample=editor.live.graphs[0][0];sample.nodeId=1;sample.value.preview=content;sample.value.valid=true;editor.liveIndex[0]={{1,0}};editor.live.graphRevisions[0]=service().revision();editor.live.graphSampledAt[0]=std::chrono::steady_clock::now();editor.telemetryAt=1000000;};
+    install();h.frame();auto& layout=editor.canvasRoutes[0].displays[0].previewText;
+    require(layout.content==content&&layout.lines.size()>=100,"Full preview text was truncated or not wrapped");const auto builds=layout.builds;
+    h.frame();require(layout.builds==builds,"Preview text layout rebuilt on an unchanged frame");
+    const auto panel=previewRect(h.graph(),h.origin,h.graph().nodes[0]);h.move(panel.GetCenter());const auto zoom=h.graph().zoom;
+    ImGui::GetIO().AddMouseWheelEvent(0,-3);h.frame();require(h.graph().zoom==zoom&&layout.scroll>0,"Scrolling preview text zoomed the graph or did not scroll");
+    h.key(ImGuiMod_Ctrl,true);ImGui::GetIO().AddMouseWheelEvent(0,-1);h.frame();h.key(ImGuiMod_Ctrl,false);
+    require(h.graph().zoom<zoom,"Ctrl+wheel over preview text cannot zoom the graph");
+    auto unicode=std::make_shared<PreviewImage>();unicode->sourceType=ValueType::String;unicode->text="ДлинныйТекстБезПробелов_ТочныйТекст\nsecond line\n";
+    NodePreview::TextLayout wrapped;wrapped.prepare(unicode,ImGui::GetFont(),ImGui::GetFontSize(),18);
+    for(const auto& line:wrapped.lines)
+    {require(line.first<=line.second&&line.second<=unicode->text.size(),"Preview line bounds escaped their text");if(line.second<unicode->text.size())require((static_cast<unsigned char>(unicode->text[line.second])&0xc0)!=0x80,"Wrapping split a UTF-8 character");}
+    // Context-menu copy uses the immutable full value, never the wrapped rows.
+    require(content->text.find("Line 99")!=std::string::npos&&wrapped.content->text==unicode->text,"Preview layout changed or abbreviated source text");
 }
 void testPreviewTexturesUploadAndReuseActualPixels()
 {

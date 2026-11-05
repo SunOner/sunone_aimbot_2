@@ -24,6 +24,7 @@ std::map<int,Texture> textures;
 }
 ImTextureID texture(int node,const NodeGraph::Preview& image,ID3D11Device* device,ID3D11DeviceContext* context)
 {
+    if(image&&image->width==0){textures.erase(node);return ImTextureID(0);}
     if(!device||!context||!image||image->width<1||image->height<1||image->width>640||image->height>640||
         image->rgba.size()!=static_cast<std::size_t>(image->width)*image->height*4)return ImTextureID(0);
     if(textures.size()>=NodeGraph::MaxLivePreviews&&!textures.count(node))return ImTextureID(0);

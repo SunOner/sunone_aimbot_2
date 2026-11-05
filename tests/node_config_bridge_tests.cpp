@@ -1,6 +1,7 @@
 #include "nodes/node_config_bridge.h"
 #include "config/config.h"
 #include "depth/model_path.h"
+#include "node_previous_starters.h"
 #include <iostream>
 #include <stdexcept>
 #include <chrono>
@@ -89,7 +90,7 @@ void testFullLegacyGraphAndZeroProfile()
 }
 void testVersionThreeAddsVisionWithoutResettingControls()
 {
-    auto c=settings();auto w=defaults();w.sourceVersion=3;
+    auto c=settings();auto w=NodeTestData::previousStarters();w.sourceVersion=3;
     for(auto& node:w.graphs[0].nodes)if(node.kind==NodeKind::PredictionTime)node.parameters["lookahead"]=0.42;
     migrateLegacySettings(w,c);
     require(parameter(first(w,NodeKind::PredictionTime),"lookahead")==0.42,"Vision migration reset node-owned control settings");

@@ -151,7 +151,9 @@
     <ClInclude Include="nodes\node_graph.h" />
     <ClInclude Include="nodes\preview_image.h" />
     <ClInclude Include="overlay\node_preview.h" />
+    <ClInclude Include="overlay\preview_text.h" />
     <ClInclude Include="nodes\node_layout.h" />
+    <ClInclude Include="nodes\starter_layouts.inl" />
     <ClInclude Include="nodes\node_config_bridge.h" />
     <ClInclude Include="nodes\vision_runtime.h" />
     <ClInclude Include="nodes\vision_outputs.h" />

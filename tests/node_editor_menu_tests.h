@@ -13,7 +13,7 @@ void testEmptyDoubleClickCreatesOneRerouteAcrossZoomAndTabs()
         doubleClickCanvas(h,point);
         require(h.graph().nodes.size()==1&&reroute(h.graph().nodes[0].kind)&&isSelected(tab,h.graph().nodes[0].id),"Empty double-click did not create and select exactly one reroute");
         const auto& node=h.graph().nodes[0];
-        require(node.x==snap(node.x)&&node.y==snap(node.y)&&distanceSquared(rerouteCenter(h.graph(),h.origin,node),point)<std::pow(32*zoom+2,2),"Reroute placement ignored the cursor or grid");
+        require(node.x+32==snap(node.x+32)&&node.y+16==snap(node.y+16)&&distanceSquared(rerouteCenter(h.graph(),h.origin,node),point)<0.001f,"Reroute center did not land on the clicked grid intersection");
         require(editor.undo.size()==1&&editor.panButton<0&&!editor.pointerMove&&!editor.wireNode&&h.graph().panX==pan.x&&h.graph().panY==pan.y,"Double-click also panned, connected or moved a node");
         history(false);h.frame();require(h.graph().nodes.empty(),"Undo did not remove the new reroute");history(true);h.frame();
         require(h.graph().nodes.size()==1&&reroute(h.graph().nodes[0].kind),"Redo did not restore the reroute");

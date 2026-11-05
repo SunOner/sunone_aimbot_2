@@ -179,6 +179,14 @@ class WorkflowMcpTests(unittest.TestCase):
         mcp.remove_nodes(item, [2, 3], definitions)
         self.assertEqual(item["links"], [])
 
+    def test_any_preview_does_not_lock_a_loose_reroute(self):
+        catalog = copy.deepcopy(CATALOG)
+        catalog["nodes"].append(dict(kind=1000, title="Preview", inputs=[dict(type="Bool"), dict(type="Any")], outputs=[], defaults={}))
+        workspace = dict(format_version=20, graphs=[graph()])
+        commands = [dict(op="node.add", workflow=1, id=1, kind=12), dict(op="node.add", workflow=1, id=2, kind=47), dict(op="node.add", workflow=1, id=3, kind=1000), dict(op="link.connect", workflow=1, link=dict(from_node=2, from_port=0, to_node=3, to_port=1)), dict(op="link.connect", workflow=1, link=dict(from_node=1, from_port=0, to_node=2, to_port=0))]
+        result, _, _ = mcp.edit_workspace(workspace, commands, catalog, None)
+        self.assertEqual(result["graphs"][0]["nodes"][1]["kind"], 46)
+
 
 if __name__ == "__main__":
     unittest.main()

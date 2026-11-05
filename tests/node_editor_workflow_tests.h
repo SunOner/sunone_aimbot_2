@@ -3,6 +3,44 @@
 #include <future>
 namespace
 {
+void testFilledTemplatesKeepDefaultGeometry()
+{
+    gestureScenario="Filled templates retain the default placement and wire routing";TemporaryWorkspace files;EditorHarness h;
+    editor.draft.graphs.clear();edited();const auto templates=defaults();std::string error;
+    const auto check=[&](const Graph& graph,const Graph& expected,bool sharedFrame)
+    {
+        for(const auto& source:expected.nodes)
+        {
+            const auto* copied=findNode(graph,source.id);
+            if(source.kind==NodeKind::MouseProfile&&!copied)continue;
+            require(copied&&(copied->kind==source.kind||(sharedFrame&&source.kind==NodeKind::CaptureSource&&copied->kind==NodeKind::CurrentFrame))&&
+                copied->x==source.x&&copied->y==source.y&&copied->width==source.width&&copied->height==source.height&&copied->collapsed==source.collapsed,
+                "Creating a template rearranged or resized a default node");
+        }
+        require(graph.links.size()==expected.links.size()&&graph.ties.size()==expected.ties.size(),"Creating a template changed its visual wiring");
+        for(std::size_t index=0;index<expected.links.size();++index)
+        {
+            const auto& a=graph.links[index];const auto& b=expected.links[index];
+            require(linkKey(a)==linkKey(b)&&a.ties==b.ties&&sameBend(a.bend,b.bend),"Creating a template replaced a wire, tie order or manual bend");
+        }
+        for(std::size_t index=0;index<expected.ties.size();++index)
+            require(graph.ties[index].x==expected.ties[index].x&&graph.ties[index].y==expected.ties[index].y&&graph.ties[index].angle==expected.ties[index].angle,"Creating a template moved its wire ties");
+    };
+    for(int kind=0;kind<4;++kind)
+    {
+        const int id=NodeEditor_CreateWorkflow("Template "+std::to_string(kind),kind,error,-1,true);require(id>0,error.c_str());
+        const auto workspace=service().workspace();check(workspace.graphs[activePage(workspace,id)],templates.graphs[kind],false);
+    }
+    const int copiedVision=NodeEditor_CreateWorkflow("Template shared frame",3,error,-1,true);require(copiedVision>0,error.c_str());
+    auto workspace=service().workspace();check(workspace.graphs[activePage(workspace,copiedVision)],templates.graphs[3],true);
+    require(kindAllowed(workspace.graphs[activePage(workspace,copiedVision)],NodeKind::DatasetOutput)&&
+        kindAllowed(workspace.graphs[activePage(workspace,copiedVision)],NodeKind::ScreenshotOutput),"Optional output nodes cannot be added to the default Vision workflow");
+    editor.draft.graphs.clear();edited();
+    const int recoil=NodeEditor_CreateWorkflow("Standalone recoil",2,error,-1,true);require(recoil>0,error.c_str());workspace=service().workspace();
+    const auto& graph=workspace.graphs[activePage(workspace,recoil)];check(graph,templates.graphs[2],false);
+    const auto profile=std::find_if(graph.nodes.begin(),graph.nodes.end(),[](const Node& node){return node.kind==NodeKind::MouseProfile;});
+    require(profile!=graph.nodes.end()&&profile->x>templates.graphs[2].groups.back().x+templates.graphs[2].groups.back().width,"Standalone calibration overlaps the default recoil layout");
+}
 void testSharedCalibrationTemplatesAndLayout()
 {
     gestureScenario="Shared calibration templates and overview";TemporaryWorkspace files;EditorHarness harness;std::string error;
@@ -16,11 +54,17 @@ void testSharedCalibrationTemplatesAndLayout()
     require(sources==1,"Adding a recoil template duplicated profile settings");
     std::vector<Node> copies{defaultNode(NodeKind::MouseProfile,1),defaultNode(NodeKind::SharedCalibration,2)};
     remapNamedCopies(editor.draft.graphs[0],copies);require(textParameter(copies[0],"name")!="mouse"&&textParameter(copies[0],"name")==textParameter(copies[1],"name"),"Copying a source with a reader shadowed the global channel or broke their pairing");
-    auto graph=defaults().graphs[0];const ImVec2 size{1034,644};fitGraph(graph,size);
-    for(const auto& node:graph.nodes)
+    for(const ImVec2 size:{ImVec2(1034,644),ImVec2(2600,644)})
     {
-        const auto position=screenPoint(graph,{0,0},node.x,node.y);
-        require(position.x>=0&&position.y>=0&&position.x+cardWidth(node)*graph.zoom<=size.x&&position.y+cardHeight(node)*graph.zoom<=size.y,"The default split workflow is clipped in its initial overview");
+        auto graph=defaults().graphs[0];fitGraph(graph,size);int visible=0;
+        for(const auto& node:graph.nodes)
+        {
+            const auto position=screenPoint(graph,{0,0},node.x,node.y);
+            const bool inside=position.x>=0&&position.y>=0&&position.x+cardWidth(node)*graph.zoom<=size.x&&position.y+cardHeight(node)*graph.zoom<=size.y;
+            visible+=inside;
+            if(graph.zoom>0.25f)require(inside,"A starter that fits within supported zoom levels was clipped");
+        }
+        require(visible>0&&graph.zoom>=0.25f,"A wide workflow fitted to an empty or unreadable view");
     }
 }
 void testWorkflowManagementIsImmediateAndUndoable()

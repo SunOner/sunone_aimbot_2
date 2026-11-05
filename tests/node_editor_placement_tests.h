@@ -82,11 +82,95 @@ void testGroupsAndReroutesHaveFreePlacementPreviews()
         h.button(ImGuiMouseButton_Left,false);
         require(h.graph().groups[0].x==64&&h.graph().groups[0].y==32&&findNode(h.graph(),1)->x==96&&h.graph().ties[0].x==320,"Group completion did not snap contents consistently");
         history(false);h.graph().groups.clear();h.graph().ties.clear();h.graph().links.clear();
-        h.graph().nodes={defaultNode(NodeKind::RerouteBoolean,1,224,160)};h.frame();
+        h.graph().nodes={defaultNode(NodeKind::RerouteBoolean,1,224,144)};h.frame();
         const auto dot=rerouteCenter(h.graph(),h.origin,h.graph().nodes[0]);h.move(dot);h.button(ImGuiMouseButton_Left,true);h.move(add(dot,ImVec2(21*zoom,11*zoom)));
         const float rerouteDx=(ImGui::GetIO().MousePos.x-editor.dragStartMouse.x)/zoom;
         require(std::abs(h.graph().nodes[0].x-224-rerouteDx)<0.001f&&hasSnapPreview(h),"Reroute points lack free movement or a snap preview");
-        h.button(ImGuiMouseButton_Left,false);require(h.graph().nodes[0].x==256&&h.graph().nodes[0].y==160,"Reroute completion ignored the grid");
+        h.button(ImGuiMouseButton_Left,false);require(h.graph().nodes[0].x==256&&h.graph().nodes[0].y==144,"Reroute completion ignored the grid");
     }
+}
+void testReroutesAndTiesShareGridIntersections()
+{
+    for(float zoom:GestureZooms)for(ImVec2 position:{ImVec2(291,273),ImVec2(-17,-49),ImVec2(16,16)})
+    {
+        gestureScenario="Reroute/tie creation at zoom "+std::to_string(zoom);EditorHarness h;arrangeTieFixture(h,zoom);
+        h.graph().panX=13;h.graph().panY=-7;
+        std::vector<TieHit> hits;for(const auto& link:h.graph().links)hits.push_back({linkKey(link),0,{}});
+        std::string error;require(createWireTie(h.graph(),0,hits,position,15,error),error.c_str());
+        const auto tie=h.graph().ties[0];
+        const auto check=[&](const Node& node)
+        {
+            require(node.x+32==tie.x&&node.y+16==tie.y&&onLayoutGrid(tie.x)&&onLayoutGrid(tie.y),
+                "Reroute and tie created at the same position use different visible grid anchors");
+            require(distanceSquared(rerouteCenter(h.graph(),h.origin,node),screenPoint(h.graph(),h.origin,tie.x,tie.y))<0.001f,
+                "Pan or zoom shifted the reroute away from the tie's grid intersection");
+        };
+        addLooseReroute(h.graph(),0,position);check(*findNode(h.graph(),editor.selected[0]));
+        insertReroute(h.graph(),0,position,0);check(*findNode(h.graph(),editor.selected[0]));
+        editor.catalogPosition=position;require(addCatalogNode(h.graph(),0,NodeKind::RerouteInteger,error),error.c_str());
+        check(*findNode(h.graph(),editor.selected[0]));
+    }
+}
+void testMixedPointSelectionAndPreviewUseCenterSnap()
+{
+    for(float zoom:GestureZooms)
+    {
+        gestureScenario="Mixed reroute/tie movement and preview at zoom "+std::to_string(zoom);EditorHarness h;arrangeTieFixture(h,zoom);
+        std::vector<TieHit> hits;for(const auto& link:h.graph().links)hits.push_back({linkKey(link),0,{}});
+        std::string error;require(createWireTie(h.graph(),0,hits,ImVec2(320,192),0,error),error.c_str());
+        h.graph().nodes.push_back(defaultNode(NodeKind::RerouteBoolean,7,416,304));edited();h.frame();
+        selectOne(0,7);editor.tieSelection[0]={h.graph().ties[0].id};editor.selectedTie[0]=h.graph().ties[0].id;
+        const auto from=rerouteCenter(h.graph(),h.origin,*findNode(h.graph(),7));
+        h.move(from);h.button(ImGuiMouseButton_Left,true);
+        require(editor.dragNode==7&&!editor.wireNode,"The point fixture started a wire instead of a move");
+        h.move(add(from,ImVec2(21*zoom,11*zoom)));
+        const auto freeCenter=rerouteCenter(h.graph(),h.origin,*findNode(h.graph(),7));
+        const ImVec2 delta(ImGui::GetIO().MousePos.x-editor.dragStartMouse.x,ImGui::GetIO().MousePos.y-editor.dragStartMouse.y);
+        require(distanceSquared(freeCenter,add(from,delta))<0.01f,"Center snapping introduced a magnet during free dragging");
+        const auto destination=screenPoint(h.graph(),h.origin,480,320);
+        ImVec2 minimum(1e9f,1e9f),maximum(-1e9f,-1e9f);int vertices=0;
+        for(const auto& vertex:h.vertices)if(vertex.col==SnapPreviewFill&&distanceSquared(vertex.pos,destination)<81)
+        {minimum.x=std::min(minimum.x,vertex.pos.x);minimum.y=std::min(minimum.y,vertex.pos.y);maximum.x=std::max(maximum.x,vertex.pos.x);maximum.y=std::max(maximum.y,vertex.pos.y);++vertices;}
+        require(vertices>=8&&distanceSquared(multiply(add(minimum,maximum),0.5f),destination)<0.01f,"Reroute preview is half a grid cell away from its release position");
+        h.button(ImGuiMouseButton_Left,false);
+        const auto& node=*findNode(h.graph(),7);const auto tie=h.graph().ties[0];
+        require(node.x+32==480&&node.y+16==320&&tie.x==352&&tie.y==192,"Mixed point selection did not snap both centers by the same offset");
+        require(editor.undo.size()==2,"Mixed point movement did not create one Undo step");
+        history(false);h.frame();require(findNode(h.graph(),7)->y+16==320&&h.graph().ties[0].x==320,"Undo changed the original point alignment");
+        history(true);h.frame();require(findNode(h.graph(),7)->x+32==480&&h.graph().ties[0].x==352,"Redo lost the shared point placement");
+        selectOne(0,7);editor.tieSelection[0]={tie.id};editor.selectedTie[0]=tie.id;
+        h.key(ImGuiKey_RightArrow,true);h.key(ImGuiKey_RightArrow,false);
+        require(findNode(h.graph(),7)->x+32==512&&findNode(h.graph(),7)->y+16==320&&h.graph().ties[0].x==384&&h.graph().ties[0].y==192,
+            "Keyboard nudging used a different grid for reroutes and ties");
+    }
+}
+void testPointGridSurvivesCopiesArrangeAndLegacyNormalization()
+{
+    gestureScenario="Point-grid normalization, group membership, copies and persistence";EditorHarness h;arrangeTieFixture(h,1);
+    std::vector<TieHit> hits;for(const auto& link:h.graph().links)hits.push_back({linkKey(link),0,{}});
+    std::string error;require(createWireTie(h.graph(),0,hits,ImVec2(320,192),30,error),error.c_str());
+    h.graph().nodes.push_back(defaultNode(NodeKind::RerouteBoolean,7,288,416));
+    h.graph().groups={{1,"Legacy point",256,352,128,96,0x40ffcd60u,{7}}};
+    const auto links=h.graph().links;const auto revision=service().revision();
+    require(snapLayout(h.graph())&&findNode(h.graph(),7)->y+16==448,"An old reroute kept its half-cell offset after normalization");
+    syncGroupMembership(h.graph());
+    require(h.graph().groups[0].nodes==std::vector<int>{7}&&!snapLayout(h.graph()),"Normalizing an old point detached it from its frame or keeps shifting it on reload");
+    require(h.graph().links.size()==links.size()&&h.graph().ties[0].angle==30&&service().revision()==revision,"Snapping point geometry changed execution or tie routing");
+    selectAll(h.graph(),0);std::string clipboard;require(selectionText(h.graph(),0,clipboard,error),error.c_str());
+    require(pasteSelectionText(h.graph(),0,clipboard,ImVec2(32,512),error),error.c_str());
+    duplicateSelection(h.graph(),0);
+    const auto check=[&](const Graph& graph)
+    {
+        for(const auto& node:graph.nodes)if(reroute(node.kind))require(onLayoutGrid(node.x+32)&&onLayoutGrid(node.y+16),"A copied, imported or arranged reroute center ignores the grid");
+        for(const auto& tie:graph.ties)require(onLayoutGrid(tie.x)&&onLayoutGrid(tie.y),"A copied, imported or arranged tie center ignores the grid");
+    };
+    check(h.graph());std::string document;Workspace restored;
+    require(serialize(editor.draft,document,error)&&deserialize(document,restored,error),error.c_str());
+    require(!snapLayout(restored.graphs[0]),"A saved point layout changes when imported again");check(restored.graphs[0]);
+    Layout::arrange(restored.graphs[0]);check(restored.graphs[0]);require(!Layout::arrange(restored.graphs[0]),"Arranging point nodes is not stable");
+    auto& point=*findNode(h.graph(),7);point.y=800;const auto frame=h.graph().groups[0];
+    snapLayout(h.graph());syncGroupMembership(h.graph());
+    require(h.graph().groups[0].nodes.empty()&&h.graph().groups[0].y==frame.y&&h.graph().groups[0].height==frame.height,
+        "Normalizing an explicitly detached reroute expanded its old group to keep it attached");
 }
 }

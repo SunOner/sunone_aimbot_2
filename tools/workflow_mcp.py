@@ -346,6 +346,20 @@ def remove_nodes(graph, identifiers, definitions):
         group["nodes"] = [node for node in group["nodes"] if node not in removed]
 
 
+def loose_reroute(graph, node, definitions):
+    if not definitions[node["kind"]].get("reroute") or node.get("input_values") or node.get("input_texts"):
+        return False
+    for link in graph["links"]:
+        if link["to_node"] == node["id"]:
+            return False
+        if link["from_node"] == node["id"]:
+            target = find(graph["nodes"], link["to_node"], "Target node")
+            pins = definitions[target["kind"]]["inputs"]
+            if not 0 <= link["to_port"] < len(pins) or pins[link["to_port"]]["type"] != "Any":
+                return False
+    return True
+
+
 def edit_workspace(workspace, operations, catalog, templates):
     if not isinstance(operations, list) or not 1 <= len(operations) <= 256:
         raise ToolError("Provide 1..256 operations")
@@ -430,7 +444,7 @@ def edit_workspace(workspace, operations, catalog, templates):
                 # Loose reroutes adopt their first connection, as in the UI.
                 for node, other, side in ((target, source, "outputs"), (source, target, "inputs")):
                     spec = definitions[node["kind"]]
-                    if spec.get("reroute") and not any(node["id"] in (link["from_node"], link["to_node"]) for link in graph["links"]):
+                    if spec.get("reroute") and loose_reroute(graph, node, definitions):
                         pin = key["from_port"] if side == "outputs" else key["to_port"]
                         pins = definitions[other["kind"]][side]
                         if 0 <= pin < len(pins):

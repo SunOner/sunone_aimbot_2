@@ -7,6 +7,7 @@
 #include <Windows.h>
 #include "overlay/node_editor.h"
 #include "overlay/node_preview.h"
+#include "overlay/preview_text.h"
 #include "overlay/window_controls.h"
 #include "overlay/source_choices.h"
 #include "nodes/node_graph.h"
@@ -165,6 +166,7 @@ struct NodeDisplay
     float settingsContent=0;
     std::map<std::string,std::vector<char>> settingsBuffers;
     OverviewCaption caption;
+    NodePreview::TextLayout previewText;
     NodeKind defaultKind=NodeKind::Count;
     std::vector<InputDefaultDisplay> defaults;
 };
@@ -278,6 +280,7 @@ struct Editor
     ImVec2 dragStartSize;
     int panButton = -1;
     bool panned = false;
+    bool clearSelectionOnPanClick = false;
     bool emptyClickCandidate = false;
     ImVec2 panStartMouse;
     ImVec2 panStart;
@@ -349,6 +352,14 @@ struct Editor
     int catalogWirePort = 0;
     bool catalogWireOutput = true;
     ImGuiID parameterUndoItem = 0;
+    struct NumericWheel
+    {
+        int graph=-1,node=0,pin=-1;
+        ImGuiID item=0;
+        double lastTick=-1,remainder=0,step=0.01,lastValue=0;
+        std::chrono::steady_clock::time_point editedAt{};
+        bool remembered=false;
+    } numericWheel;
     ImGuiID inlineActiveItem = 0;
     int inlineActiveNode = 0;
     int inputEditNode = 0,inputEditPin = -1;
@@ -407,6 +418,7 @@ float cardHeight(const Node& node)
     return Layout::height(node);
 }
 void fitContainingGroups(Graph& graph,int id);
+bool groupContains(const Group& group,const Node& node);
 bool normalizeInputPorts(Graph& graph)
 {
     bool changed=false;
@@ -420,7 +432,16 @@ bool snapLayout(Graph& graph)
     bool changed=normalizeInputPorts(graph);
     for(auto& node:graph.nodes)
     {
-        const float x=snap(node.x),y=snap(node.y);changed|=x!=node.x||y!=node.y;node.x=x;node.y=y;
+        const float previousX=node.x,previousY=node.y;
+        const float x=Layout::snapNodeX(node.kind,node.x),y=Layout::snapNodeY(node.kind,node.y);
+        const bool moved=x!=node.x||y!=node.y;changed|=moved;node.x=x;node.y=y;
+        if(moved&&reroute(node.kind))
+        {
+            Node previous;previous.kind=node.kind;previous.x=previousX;previous.y=previousY;
+            for(const auto& group:graph.groups)
+                if(std::find(group.nodes.begin(),group.nodes.end(),node.id)!=group.nodes.end()&&groupContains(group,previous)&&!groupContains(group,node))
+                {fitContainingGroups(graph,node.id);break;}
+        }
         if(node.width>0){const float width=std::clamp(snap(node.width),Layout::MinWidth,Layout::MaxWidth);changed|=width!=node.width;node.width=width;}
         if(node.height>0){const float height=std::clamp(snap(node.height),Layout::up(Layout::minimumHeight(node)),Layout::MaxHeight);changed|=height!=node.height;node.height=height;}
     }
@@ -645,13 +666,22 @@ const WireTie* findTie(const Graph& graph,int id)
 std::array<int,4> linkKey(const Link& link){return {link.fromNode,link.fromPort,link.toNode,link.toPort};}
 bool looseReroute(const Graph& graph,const Node& node)
 {
-    return reroute(node.kind)&&node.inputValues.empty()&&node.inputTexts.empty()&&
-        std::none_of(graph.links.begin(),graph.links.end(),[&](const Link& link){return link.fromNode==node.id||link.toNode==node.id;});
+    if(!reroute(node.kind)||!node.inputValues.empty()||!node.inputTexts.empty())return false;
+    for(const auto& link:graph.links)
+    {
+        if(link.toNode==node.id)return false;
+        if(link.fromNode==node.id)
+        {
+            const auto* target=findNode(graph,link.toNode);
+            if(!target||link.toPort<0||static_cast<std::size_t>(link.toPort)>=definition(target->kind).inputs.size()||definition(target->kind).inputs[link.toPort].type!=ValueType::Any)return false;
+        }
+    }
+    return true;
 }
 ValueType connectionType(const Graph& graph,const Link& link)
 {
     const auto* source=findNode(graph,link.fromNode);const auto* target=findNode(graph,link.toNode);
-    if(source&&target&&looseReroute(graph,*source)&&!looseReroute(graph,*target))return definition(target->kind).inputs[link.toPort].type;
+    if(source&&target&&looseReroute(graph,*source)&&!looseReroute(graph,*target)&&definition(target->kind).inputs[link.toPort].type!=ValueType::Any)return definition(target->kind).inputs[link.toPort].type;
     return source?definition(source->kind).outputs[link.fromPort].type:ValueType::Float;
 }
 void adaptLooseReroutes(Graph& graph,const Link& link)
@@ -700,7 +730,7 @@ bool groupContains(const Group& group,float x,float y,float right,float bottom)
 {return x>=group.x&&y>=group.y+32&&right<=group.x+group.width&&bottom<=group.y+group.height;}
 bool groupContains(const Group& group,const Node& node)
 {
-    if(reroute(node.kind))return groupContains(group,node.x+24,node.y+8,node.x+40,node.y+24);
+    if(reroute(node.kind))return groupContains(group,node.x+Layout::RerouteCenterX-8,node.y+Layout::RerouteCenterY-8,node.x+Layout::RerouteCenterX+8,node.y+Layout::RerouteCenterY+8);
     return groupContains(group,node.x,node.y,node.x+cardWidth(node),node.y+cardHeight(node));
 }
 bool groupContains(const Group& parent,const Group& child)
@@ -768,11 +798,13 @@ void cancelGestures()
 {
     cancelLeftGesture();editor.panButton=-1;editor.panned=false;editor.rightGesture=editor.marquee=false;editor.tieMode=editor.boxSelectMode=editor.cutStroke=false;
     editor.emptyClickCandidate=false;
+    editor.clearSelectionOnPanClick=false;
     editor.portFocus.fill({});
+    editor.numericWheel={};
 }
 void beginPan(const Graph& graph,int button)
 {
-    editor.panButton=button;editor.panned=false;editor.panStartMouse=ImGui::GetIO().MousePos;
+    editor.panButton=button;editor.panned=false;editor.clearSelectionOnPanClick=false;editor.panStartMouse=ImGui::GetIO().MousePos;
     editor.panStart=ImVec2(graph.panX,graph.panY);
 }
 int nextNodeId(const Graph& graph)
@@ -962,7 +994,7 @@ bool primaryOutput(NodeKind kind)
 bool kindAllowed(const Graph& graph,NodeKind kind)
 {
     if(primaryOutput(kind)&&((graph.kind==GraphKind::Vision)!=(kind==NodeKind::VisionOutput)))return false;
-    const bool visionOnly=kind==NodeKind::CurrentFrame||(kind>=NodeKind::CaptureSource&&kind<=NodeKind::VisionOutput)||kind==NodeKind::ScreenshotOutput||kind==NodeKind::ImagePreview||
+    const bool visionOnly=kind==NodeKind::CurrentFrame||(kind>=NodeKind::CaptureSource&&kind<=NodeKind::VisionOutput)||kind==NodeKind::ScreenshotOutput||
         (kind>=NodeKind::OverlayBoxes&&kind<=NodeKind::SetLabels);
     if(visionOnly&&graph.kind!=GraphKind::Vision)return false;
     return !primaryOutput(kind)||std::none_of(graph.nodes.begin(),graph.nodes.end(),[&](const Node& node){return node.kind==kind;});
@@ -1100,7 +1132,7 @@ void duplicateSelection(Graph& graph,int tab,bool recordHistory=true)
     std::vector<std::pair<int,int>> ids;
     for (auto node:nodes)
     {
-        const int old=node.id;node.id=nextNodeId(graph);node.x+=GridSize;node.y+=GridSize;
+        const int old=node.id;node.id=nextNodeId(graph);node.x=Layout::snapNodeX(node.kind,node.x+GridSize);node.y=Layout::snapNodeY(node.kind,node.y+GridSize);
         ids.push_back({old,node.id});editor.selection[tab].push_back(node.id);graph.nodes.push_back(node);
     }
     for (auto& link:links)
@@ -1156,7 +1188,11 @@ void updateLayoutMove(Graph& graph,ImVec2 pointer,bool commit=false)
     if(!rotating)
     {
         for(const auto& start:editor.dragPositions)if(auto* node=findNode(graph,start.id))
-        {assign(node->x,coordinate(start.x,delta.x));assign(node->y,coordinate(start.y,delta.y));}
+        {
+            const float x=start.x+delta.x,y=start.y+delta.y;
+            assign(node->x,commit&&displaced?Layout::snapNodeX(node->kind,x):x);
+            assign(node->y,commit&&displaced?Layout::snapNodeY(node->kind,y):y);
+        }
         for(const auto& start:editor.dragGroupPositions)if(auto* group=findGroup(graph,start.id))
         {assign(group->x,coordinate(start.x,delta.x));assign(group->y,coordinate(start.y,delta.y));}
         if(auto* group=findGroup(graph,editor.dragGroup))
@@ -1396,7 +1432,7 @@ bool pasteSelectionText(Graph& graph,int tab,const std::string& text,ImVec2 posi
     {
         if(!kindAllowed(candidate,node.kind)){error="This selection contains an output or provider that cannot be pasted into this graph.";return false;}
         const int id=nextNodeId(candidate);ids[node.id]=id;node.id=id;
-        node.x=snap(node.x+delta.x);node.y=snap(node.y+delta.y);added.push_back(id);candidate.nodes.push_back(std::move(node));
+        node.x=Layout::snapNodeX(node.kind,node.x+delta.x);node.y=Layout::snapNodeY(node.kind,node.y+delta.y);added.push_back(id);candidate.nodes.push_back(std::move(node));
     }
     auto links=source->links;appendTies(candidate,links,source->ties,delta.x,delta.y);
     for(auto& link:links)
@@ -1443,7 +1479,7 @@ ImVec2 screenPoint(const Graph& graph, ImVec2 origin, float x, float y)
 }
 ImVec2 rerouteCenter(const Graph& graph,ImVec2 origin,const Node& node)
 {
-    return screenPoint(graph,origin,node.x+32,node.y+16);
+    return screenPoint(graph,origin,node.x+Layout::RerouteCenterX,node.y+Layout::RerouteCenterY);
 }
 float rerouteRadius(float zoom){return std::max(3.0f,5.0f*zoom);}
 float visualEase(const char* key,float target)
@@ -1469,7 +1505,7 @@ ImVec2 portPoint(const Graph& graph, ImVec2 origin, const Node& node, bool outpu
     const auto& def=definition(node.kind);
     const auto count=output?def.outputs.size():Layout::inputCount(node);
     const auto row=output?static_cast<std::size_t>(pin):Layout::inputRow(node,static_cast<std::size_t>(pin));
-    const float y=reroute(node.kind)?16.0f:node.collapsed?renderHeight(graph,node)*0.5f+(static_cast<float>(row)-(static_cast<float>(count)-1)*0.5f)*12.0f:HeaderHeight+15.0f+row*PinSpacing;
+    const float y=reroute(node.kind)?Layout::RerouteCenterY:node.collapsed?renderHeight(graph,node)*0.5f+(static_cast<float>(row)-(static_cast<float>(count)-1)*0.5f)*12.0f:HeaderHeight+15.0f+row*PinSpacing;
     return screenPoint(graph, origin, node.x + (output ? cardWidth(node) : 0), node.y+y);
 }
 void fitGraph(Graph& graph, ImVec2 size)
@@ -1919,7 +1955,7 @@ void insertReroute(Graph& graph,int index,ImVec2 position,int tab,std::size_t ti
     const auto type=definition(source->kind).outputs[previous.fromPort].type;
     const int id=nextNodeId(graph);
     remember();
-    const auto rerouteNode=defaultNode(rerouteKind(type),id,snap(position.x-32),snap(position.y-16));
+    const auto rerouteNode=defaultNode(rerouteKind(type),id,snap(position.x)-Layout::RerouteCenterX,snap(position.y)-Layout::RerouteCenterY);
     graph.nodes.push_back(rerouteNode);
     graph.links[index]={previous.fromNode,previous.fromPort,id,0};
     graph.links.push_back({id,0,previous.toNode,previous.toPort});
@@ -1934,7 +1970,8 @@ void insertReroute(Graph& graph,int index,ImVec2 position,int tab,std::size_t ti
             group.nodes.push_back(id);
             const float right=std::max(group.x+group.width,rerouteNode.x+64+32);
             const float bottom=std::max(group.y+group.height,rerouteNode.y+32+32);
-            group.x=std::min(group.x,rerouteNode.x-32);group.y=std::min(group.y,rerouteNode.y-32);
+            group.x=std::min(group.x,std::floor((rerouteNode.x-32)/GridSize)*GridSize);
+            group.y=std::min(group.y,std::floor((rerouteNode.y-32)/GridSize)*GridSize);
             group.width=std::ceil((right-group.x)/GridSize)*GridSize;
             group.height=std::ceil((bottom-group.y)/GridSize)*GridSize;
             break;
@@ -1945,7 +1982,7 @@ void insertReroute(Graph& graph,int index,ImVec2 position,int tab,std::size_t ti
 void addLooseReroute(Graph& graph,int tab,ImVec2 position)
 {
     if(graph.nodes.size()>=MaxNodes){editor.error=true;editor.message="Node limit reached (128).";return;}
-    const auto node=defaultNode(NodeKind::RerouteFloat,nextNodeId(graph),snap(position.x-32),snap(position.y-16));
+    const auto node=defaultNode(NodeKind::RerouteFloat,nextNodeId(graph),snap(position.x)-Layout::RerouteCenterX,snap(position.y)-Layout::RerouteCenterY);
     int owner=0;float area=std::numeric_limits<float>::max();
     for(const auto& group:graph.groups)
         if(contains(position,ImVec2(group.x,group.y+32),ImVec2(group.x+group.width,group.y+group.height))&&group.width*group.height<area)
@@ -1961,7 +1998,7 @@ bool modelPathInput(NodeKind kind,const char* key)
 std::string valueText(const Value* value)
 {
     if (!value || !value->valid) return value&&!value->error.empty()?"ERROR":"";
-    if(value->preview)return std::string(typeName(value->preview->sourceType))+"  "+std::to_string(value->preview->sourceWidth)+" x "+std::to_string(value->preview->sourceHeight);
+    if(value->preview)return std::string(typeName(value->preview->sourceType))+(value->preview->width>0?"  "+std::to_string(value->preview->sourceWidth)+" x "+std::to_string(value->preview->sourceHeight):"");
     if (value->type == ValueType::Boolean) return value->boolean ? "TRUE" : "FALSE";
     if (value->type == ValueType::Integer) return std::to_string(value->integer);
     if(value->type==ValueType::String)
@@ -2126,6 +2163,9 @@ void inputDefaultTooltip(const Pin& pin,const InputDefaultDisplay& value,bool ed
     else ImGui::Text("Default: %s",value.fullText.c_str());
     if(value.kind!=InputDefaultKind::Required)ImGui::TextDisabled("Used when this input is not connected.");
     if(editable)ImGui::TextUnformatted(pin.type==ValueType::Boolean?"Click the value to toggle.":value.parameter&&value.parameter->choices?"Click the value to choose an option.":pin.type==ValueType::String?"Click the value to edit text or choose an option.":"Drag the value, or Ctrl+click to type a precise value.");
+    if(editable&&(pin.type==ValueType::Integer||pin.type==ValueType::Float)&&!(value.parameter&&value.parameter->choices)&&
+        !(pin.defaultParameter&&!std::strcmp(pin.defaultParameter,"virtual_key")))
+        ImGui::TextUnformatted("At 100% zoom or closer, click to enable the wheel. Shift: finer Float steps. Ctrl: faster. Moving away disables it.");
     ImGui::TextUnformatted("Drag the socket to connect. Alt+click it to disconnect.");
     ImGui::PopTextWrapPos();ImGui::EndTooltip();
 }
@@ -2325,7 +2365,8 @@ bool addCatalogNode(Graph& graph,int index,NodeKind kind,std::string& error)
 {
     if(graph.nodes.size()>=MaxNodes){error="Node limit reached (128).";return false;}
     if(!kindAllowed(graph,kind)){error="This node cannot be added to the current graph.";return false;}
-    Node node=defaultNode(kind,nextNodeId(graph),snap(editor.catalogPosition.x),snap(editor.catalogPosition.y));
+    Node node=defaultNode(kind,nextNodeId(graph),snap(editor.catalogPosition.x)-(reroute(kind)?Layout::RerouteCenterX:0),
+        snap(editor.catalogPosition.y)-(reroute(kind)?Layout::RerouteCenterY:0));
     if(variableSet(kind)){std::vector<Node> named{node};remapNamedCopies(graph,named);node=std::move(named[0]);}
     if(kind==NodeKind::Boolean)node.value=1;
     Link connection;
@@ -2382,7 +2423,8 @@ CatalogPath catalogPath(const Definition& def)
     case K::AimOutput:case K::AutoShootOutput:case K::RecoilOutput:return {"Outputs","Controls"};
     case K::VisionOutput:return {"Outputs","Observations"};
     case K::CollectDataset:case K::DatasetOutput:case K::DatasetLabels:case K::ScreenshotOutput:return {"Outputs","Recording"};
-    case K::RenderOverlay:case K::OverlayOutput:case K::ImagePreview:return {"Outputs","Rendering"};
+    case K::RenderOverlay:case K::OverlayOutput:return {"Outputs","Rendering"};
+    case K::ImagePreview:return {"Utilities","Inspection"};
     case K::OverlayBoxes:case K::OverlayFrame:case K::OverlayMotion:case K::OverlayIcon:case K::OverlayDepth:case K::OverlayCorrection:return {"Outputs","Overlay layers"};
     case K::RerouteOverlay:case K::RerouteLabels:return {"Routing","Settings"};
     case K::RerouteBoolean:case K::RerouteNumber:case K::RerouteInteger:case K::ReroutePoint:return {"Routing","Signals"};
@@ -2578,7 +2620,7 @@ void drawCatalogCard(CatalogPreviewState& preview)
         {
             const ImVec2 a(p.x+10,p.y+preview.settingsY),b(q.x-10,q.y-12);
             draw->AddRectFilled(a,b,IM_COL32(17,19,23,255),4);draw->AddRect(a,b,IM_COL32(66,73,83,150),4);
-            const char* label="Connect Frame, Depth or Mask";const float wrap=std::max(1.0f,b.x-a.x-16);
+            const char* label="Connect any data";const float wrap=std::max(1.0f,b.x-a.x-16);
             const auto size=ImGui::GetFont()->CalcTextSizeA(font,FLT_MAX,wrap,label);
             draw->AddText(ImGui::GetFont(),font,add(ImVec2((a.x+b.x)*0.5f,(a.y+b.y)*0.5f),multiply(size,-0.5f)),IM_COL32(137,146,159,255),label,nullptr,wrap);
         }
@@ -2916,6 +2958,48 @@ void rememberParameterChange()
     if(ImGui::IsItemActivated()||!ImGui::IsItemActive()||editor.parameterUndoItem!=item)remember();
     editor.parameterUndoItem=item;
 }
+constexpr float NumericWheelMinZoom=1.0f;
+bool numericWheelInput(const Node& node,std::size_t pin,const ParameterSpec* spec)
+{
+    const auto type=definition(node.kind).inputs[pin].type;
+    return (type==ValueType::Float||type==ValueType::Integer)&&!(spec&&spec->choices)&&
+        node.kind!=NodeKind::KeyHeld&&node.kind!=NodeKind::KeyPressed&&node.kind!=NodeKind::KeyReleased;
+}
+bool numericWheelValue(const Graph& graph,int index,int node,int pin,double& value,bool integer,double minimum,double maximum,bool widgetChanged)
+{
+    if(graph.zoom<NumericWheelMinZoom||!ImGui::IsItemHovered())return false;
+    auto& wheel=editor.numericWheel;const auto item=ImGui::GetItemID();auto& io=ImGui::GetIO();
+    if(ImGui::IsItemClicked(ImGuiMouseButton_Left)&&!io.KeyAlt)
+    {wheel={};wheel.graph=index;wheel.node=node;wheel.pin=pin;wheel.item=item;}
+    if(wheel.graph!=index||wheel.node!=node||wheel.pin!=pin||wheel.item!=item)return false;
+    ImGui::GetWindowDrawList()->AddRect(ImGui::GetItemRectMin(),ImGui::GetItemRectMax(),IM_COL32(88,198,232,180),3*graph.zoom);
+    ImGui::SetItemKeyOwner(ImGuiKey_MouseWheelY);
+    if(widgetChanged||io.KeyAlt||ImGui::IsAnyMouseDown()||
+        (ImGui::IsAnyItemActive()&&ImGui::GetActiveID()!=item)||
+        ImGui::IsPopupOpen(nullptr,ImGuiPopupFlags_AnyPopupId|ImGuiPopupFlags_AnyPopupLevel))return false;
+    if(io.MouseWheel==0||!std::isfinite(io.MouseWheel))return false;
+    const double now=ImGui::GetTime();
+    if(now-wheel.lastTick>0.4||wheel.editedAt!=editor.editedAt||wheel.lastValue!=value)
+    {
+        wheel.remembered=false;wheel.remainder=0;
+        wheel.step=integer?1:value==0?0.01:std::max(std::numeric_limits<double>::denorm_min(),std::pow(10.0,std::floor(std::log10(std::abs(value)))-1));
+    }
+    wheel.lastTick=now;wheel.lastValue=value;wheel.editedAt=editor.editedAt;
+    wheel.remainder+=io.MouseWheel;
+    const double ticks=std::trunc(wheel.remainder);wheel.remainder-=ticks;
+    const double step=wheel.step*(io.KeyCtrl?10:1)*(io.KeyShift&&!integer?0.1:1);
+    const double next=std::clamp(value+ticks*step,minimum,maximum);
+    if(ticks==0||!std::isfinite(next)||next==value)return false;
+    if(!wheel.remembered){remember();wheel.remembered=true;}
+    // InputDouble and temporary DragScalar text edits cache their own buffer.
+    // End text entry before replacing the value so the next frame shows it.
+    if(ImGui::GetActiveID()==item)ImGui::ClearActiveID();
+    value=next;wheel.lastValue=value;return true;
+}
+void finishNumericWheelChange()
+{
+    editor.numericWheel.editedAt=editor.editedAt;
+}
 void ownInputPopup(int node,int pin)
 {
     editor.inputPopupNode=node;editor.inputPopupPin=pin;
@@ -3201,14 +3285,21 @@ void inlineSettings(Graph& graph,int index,int id,NodeDisplay& state,ImVec2 orig
         if(node->kind==NodeKind::Number)
         {
             double value=node->value;
-            if(ImGui::InputDouble("##constant",&value,0,0,"%.5f")&&std::isfinite(value)){rememberParameterChange();node->value=value;edited();}
+            bool changed=ImGui::InputDouble("##constant",&value,0,0,"%.5f");
+            const bool wheeled=numericWheelValue(graph,index,id,-1,value,false,-1e9,1e9,changed);
+            if((changed||wheeled)&&std::isfinite(value))
+            {if(!wheeled)rememberParameterChange();node->value=value;edited();if(wheeled)finishNumericWheelChange();}
             ownInlineItem(id);
+            if(ImGui::IsItemHovered())ImGui::SetTooltip("At 100%% zoom or closer, click to enable the wheel. Shift: finer Float steps. Ctrl: faster. Moving away disables it.");
         }
         else if(node->kind==NodeKind::Integer)
         {
-            int value=static_cast<int>(node->value);
-            if(ImGui::InputInt("##constant",&value,0,0)){rememberParameterChange();node->value=value;edited();}
+            int integer=static_cast<int>(node->value);
+            bool changed=ImGui::InputInt("##constant",&integer,0,0);double value=integer;
+            const bool wheeled=numericWheelValue(graph,index,id,-1,value,true,MinInteger,MaxInteger,changed);
+            if(changed||wheeled){if(!wheeled)rememberParameterChange();node->value=value;edited();if(wheeled)finishNumericWheelChange();}
             ownInlineItem(id);
+            if(ImGui::IsItemHovered())ImGui::SetTooltip("At 100%% zoom or closer, click to enable the wheel. Ctrl: faster. Moving away disables it.");
         }
         else variableNameControl(graph,id,state);
         ImGui::PopStyleVar();
@@ -3338,17 +3429,22 @@ bool inlineInputDefault(Graph& graph,int index,int id,std::size_t pin,NodeDispla
         const float speed=static_cast<float>(std::clamp(std::abs(number)*0.01,parameterSpec?0.001:0.1,1000000.0));
         changed=ImGui::DragScalar("##value",ImGuiDataType_Double,&number,speed,&minimum,&maximum,"%.6g",ImGuiSliderFlags_AlwaysClamp);
     }
+    const bool wheeled=numericWheelInput(*node,pin,parameterSpec)&&numericWheelValue(graph,index,id,static_cast<int>(pin),number,
+        input.type==ValueType::Integer||(parameterSpec&&parameterSpec->kind==ParameterKind::Integer),
+        parameterSpec?parameterSpec->minValue:input.type==ValueType::Integer?MinInteger:-std::numeric_limits<double>::max(),
+        parameterSpec?parameterSpec->maxValue:input.type==ValueType::Integer?MaxInteger:std::numeric_limits<double>::max(),changed);
+    changed|=wheeled;
     ownInlineItem(id);
     if(ImGui::IsItemActive()){editor.inputEditNode=id;editor.inputEditPin=static_cast<int>(pin);}
     if(required&&input.type!=ValueType::Boolean&&ImGui::IsItemActivated())changed=true;
     if(changed&&std::isfinite(number))
     {
-        rememberParameterChange();Node updated=*node;
+        if(!wheeled)rememberParameterChange();Node updated=*node;
         if(input.type==ValueType::String)
         {if(textSpec)updated.textParameters[textSpec->key]=text;else updated.inputTexts[static_cast<int>(pin)]=text;}
         else if(parameterSpec)updated.parameters[parameterSpec->key]=std::clamp(number,parameterSpec->minValue,parameterSpec->maxValue);
         else updated.inputValues[static_cast<int>(pin)]=number;
-        *node=std::move(updated);edited();
+        *node=std::move(updated);edited();if(wheeled)finishNumericWheelChange();
     }
     ImGui::PopStyleColor(2);ImGui::PopStyleVar(2);ImGui::PopFont();ImGui::PopItemFlag();ImGui::PopID();ImGui::PopID();ImGui::PopID();
     dc.CursorPos=cursor;dc.CursorPosPrevLine=previous;dc.CursorMaxPos=maximum;dc.IdealMaxPos=ideal;
@@ -3371,6 +3467,11 @@ void inspector(Graph& graph,int index)
         ImGui::Separator();
     }
     if(ImGui::MenuItem("Node information","Enter"))openProperties(index);
+    if(snapshot.kind==NodeKind::ImagePreview)
+    {
+        const auto* value=nodeValue(index,id,telemetryFresh(index,std::chrono::steady_clock::now()));const auto content=value?value->preview:Preview{};
+        if(ImGui::MenuItem("Copy preview value",nullptr,false,content&&content->width==0))ImGui::SetClipboardText(content->text.c_str());
+    }
     if(ImGui::MenuItem("Copy","Ctrl+C"))copySelection(graph,index);
     if(ImGui::MenuItem("Duplicate","Ctrl+D"))duplicateSelection(graph,index);
     if(ImGui::MenuItem("Bypass","Ctrl+B",snapshot.bypassed,canBypass(snapshot.kind)))bypassSelection(graph,index);
@@ -3650,7 +3751,7 @@ void nudgeSelection(Graph& graph,int index,float x,float y)
 {
     if(editor.selection[index].empty()&&editor.tieSelection[index].empty()&&!findGroup(graph,editor.selectedGroup[index]))return;
     remember();captureDragSelection(graph,index,true);
-    for(const auto& start:editor.dragPositions)if(auto* node=findNode(graph,start.id)){node->x=snap(node->x+x);node->y=snap(node->y+y);}
+    for(const auto& start:editor.dragPositions)if(auto* node=findNode(graph,start.id)){node->x=Layout::snapNodeX(node->kind,node->x+x);node->y=Layout::snapNodeY(node->kind,node->y+y);}
     for(const auto& start:editor.dragGroupPositions)if(auto* group=findGroup(graph,start.id)){group->x=snap(group->x+x);group->y=snap(group->y+y);}
     for(const auto& start:editor.dragTiePositions)if(auto* tie=findTie(graph,start.id)){tie->x=snap(tie->x+x);tie->y=snap(tie->y+y);}
     syncGroupMembership(graph);editor.autoFit[index]=false;edited(false);
@@ -3719,7 +3820,7 @@ void drawLayoutSnapPreview(ImDrawList* draw,const Graph& graph,ImVec2 origin,ImV
     {
         if(reroute(node->kind))
         {
-            const auto point=screenPoint(graph,origin,snap(node->x)+32,snap(node->y)+16);
+            const auto point=screenPoint(graph,origin,snap(node->x+Layout::RerouteCenterX),snap(node->y+Layout::RerouteCenterY));
             draw->AddCircleFilled(point,7,SnapPreviewFill,12);draw->AddCircle(point,7,IM_COL32(97,209,242,180),12,1.2f);
         }
         else rectangle(node->x,node->y,cardWidth(*node),renderHeight(graph,*node));
@@ -3782,7 +3883,7 @@ void canvas(Graph& graph, int index)
     if(editor.inputPopup&&!ImGui::IsPopupOpen(editor.inputPopup,ImGuiPopupFlags_AnyPopupLevel))
     {editor.inputPopup=0;editor.inputPopupNode=0;editor.inputPopupPin=-1;}
     const bool controlActive=editor.inlineActiveItem!=0;
-    int settingsHovered=0,inputHovered=0,inputHoveredPin=-1;bool settingsPortPriority=false;
+    int settingsHovered=0,inputHovered=0,inputHoveredPin=-1,previewHovered=0,numericHovered=0,numericPin=-1;bool settingsPortPriority=false;
     if(hovered)
         for(auto it=graph.nodes.rbegin();it!=graph.nodes.rend();++it)
         {
@@ -3790,6 +3891,14 @@ void canvas(Graph& graph, int index)
             const auto center=rerouteCenter(graph,origin,*it);
             if(reroute(it->kind)?distanceSquared(center,io.MousePos)>std::pow(std::max(6.0f,10*graph.zoom),2):!contains(io.MousePos,p,q))continue;
             if(!compactNode(graph,*it)&&hasNodeSettings(*it)&&settingsRect(graph,origin,*it).Contains(io.MousePos))settingsHovered=it->id;
+            if(settingsHovered&&(it->kind==NodeKind::Float||it->kind==NodeKind::Integer))
+            {
+                const auto panel=settingsRect(graph,origin,*it);const float scale=graph.zoom;
+                const auto row=localSettingsRow(add(panel.Min,ImVec2(5*scale,6*scale)),panel.GetWidth()-21*scale,ImGui::GetStyle().FontSizeBase*scale,scale);
+                if(row.value.Contains(io.MousePos))numericHovered=it->id;
+            }
+            if(it->kind==NodeKind::ImagePreview&&!compactNode(graph,*it)&&!io.KeyCtrl&&previewRect(graph,origin,*it).Contains(io.MousePos))
+                if(const auto* value=nodeValue(index,it->id,telemetryFresh(index,std::chrono::steady_clock::now()));value&&value->preview&&value->preview->width==0)previewHovered=it->id;
             if(!compactNode(graph,*it)&&!reroute(it->kind)&&graph.zoom>=0.55f)
             {
                 const auto& inputs=definition(it->kind).inputs;std::uint64_t connected=0;
@@ -3805,7 +3914,11 @@ void canvas(Graph& graph, int index)
                     auto& display=nodeIndex<displays.size()&&displays[nodeIndex].id==it->id?displays[nodeIndex]:temporary;
                     const float desired=inputValueWidth(display,*it,pin,connected,ImGui::GetFont(),font,graph.zoom);
                     if(inputValueRect(graph,*it,pin,origin,font,desired).Contains(io.MousePos))
-                    {inputHovered=it->id;inputHoveredPin=static_cast<int>(pin);break;}
+                    {
+                        inputHovered=it->id;inputHoveredPin=static_cast<int>(pin);
+                        if(numericWheelInput(*it,pin,display.defaults[pin].parameter)){numericHovered=it->id;numericPin=static_cast<int>(pin);}
+                        break;
+                    }
                 }
             }
             break;
@@ -3818,7 +3931,7 @@ void canvas(Graph& graph, int index)
                 for(std::size_t pin=0;pin<pins.size();++pin)
                     if((side||Layout::inputVisible(node,pin))&&distanceSquared(portPoint(graph,origin,node,side!=0,static_cast<int>(pin)),io.MousePos)<std::pow(std::max(7.0f,8*graph.zoom),2))settingsPortPriority=true;
             }
-    if(settingsPortPriority){settingsHovered=inputHovered=0;inputHoveredPin=-1;}
+    if(settingsPortPriority){settingsHovered=inputHovered=numericHovered=0;inputHoveredPin=-1;}
     if(editor.keyboardMove&&ImGui::IsMouseClicked(ImGuiMouseButton_Left))editor.confirmKeyboardMove=true;
     if(editor.autoFit[index]&&(std::abs(editor.canvasSize[index].x-size.x)>1||std::abs(editor.canvasSize[index].y-size.y)>1))editor.fit[index]=true;
     editor.canvasSize[index]=size;
@@ -3826,6 +3939,11 @@ void canvas(Graph& graph, int index)
     if(editor.focusSelection[index])
     {revealSelection(graph,index,ImVec2(showProperties&&!dockProperties?std::max(1.0f,size.x-propertyWidth-16):size.x,size.y));editor.focusSelection[index]=false;}
     const bool leftGesture=editor.wireNode||editor.dragNode||editor.resizeNode||editor.dragGroup||editor.resizeGroup||editor.dragTie||editor.tieStroke||editor.keyboardMove||editor.cutStroke||editor.bendGraph>=0;
+    const bool numericArmed=editor.numericWheel.node&&editor.numericWheel.graph==index&&
+        editor.numericWheel.node==numericHovered&&editor.numericWheel.pin==numericPin&&graph.zoom>=NumericWheelMinZoom&&
+        !leftGesture&&!editor.rightGesture&&editor.panButton<0&&!io.KeyAlt&&!ImGui::IsKeyPressed(ImGuiKey_Escape)&&
+        !ImGui::IsPopupOpen(nullptr,ImGuiPopupFlags_AnyPopupId|ImGuiPopupFlags_AnyPopupLevel);
+    if(!numericArmed)editor.numericWheel={};
     if((settingsHovered||inputHovered)&&!leftGesture&&editor.panButton<0&&!editor.rightGesture)
     {
         // Win32 can deliver mouse entry and press together. Hand that press
@@ -3846,11 +3964,24 @@ void canvas(Graph& graph, int index)
             const float x=editor.panStart.x+delta.x,y=editor.panStart.y+delta.y;
             if(graph.panX!=x||graph.panY!=y){graph.panX=x;graph.panY=y;editor.autoFit[index]=false;edited(false);}
         }
-        if(released)editor.panButton=-1;
-        else if(!ImGui::IsMouseDown(button))editor.panButton=-1;
+        if(released)
+        {
+            // Wait for release to distinguish an empty click from canvas panning.
+            if(button==ImGuiMouseButton_Left&&editor.clearSelectionOnPanClick&&!editor.panned&&hovered&&
+                !io.KeyShift&&!io.KeyCtrl&&!io.KeyAlt)selectOne(index,0);
+            editor.panButton=-1;editor.clearSelectionOnPanClick=false;
+        }
+        else if(!ImGui::IsMouseDown(button)){editor.panButton=-1;editor.clearSelectionOnPanClick=false;}
     }
-    if (hovered && !settingsHovered && !inputHovered && !controlActive && !leftGesture && !editor.rightGesture && editor.panButton<0 && !ImGui::IsMouseDown(ImGuiMouseButton_Middle) && !ImGui::IsMouseDown(ImGuiMouseButton_Right) && io.MouseWheel != 0)
+    const bool zoomOverNumeric=numericHovered&&!numericArmed;
+    const bool numericControlActive=controlActive&&editor.inlineActiveNode==numericHovered&&
+        (numericPin<0||editor.inputEditPin==numericPin);
+    if (hovered && ((!settingsHovered&&!inputHovered)||zoomOverNumeric) && !previewHovered &&
+        (!controlActive||(zoomOverNumeric&&numericControlActive)) && !leftGesture && !editor.rightGesture && editor.panButton<0 &&
+        !ImGui::IsAnyMouseDown() && io.MouseWheel != 0)
     {
+        if(numericControlActive)
+        {ImGui::ClearActiveID();editor.inlineActiveItem=0;editor.inlineActiveNode=0;editor.inputEditNode=0;editor.inputEditPin=-1;}
         const float zoom = std::clamp(graph.zoom*std::pow(1.15f,io.MouseWheel), 0.25f, 1.75f);
         const float ratio = zoom/graph.zoom;
         graph.panX = io.MousePos.x-origin.x-(io.MousePos.x-origin.x-graph.panX)*ratio;
@@ -3970,7 +4101,7 @@ void canvas(Graph& graph, int index)
     }
     int hoverNode = 0, hoverPort = -1, hoverCollapse = 0,hoverResizeNode=0,hoverResizeEdges=0;
     std::vector<int> previewNodes;
-    if(graph.kind==GraphKind::Vision)for(const auto& node:graph.nodes)
+    for(const auto& node:graph.nodes)
     {
         if(node.kind!=NodeKind::ImagePreview||node.disabled||node.bypassed||compactNode(graph,node))continue;
         if(parameter(node,"enabled")==0&&std::none_of(graph.links.begin(),graph.links.end(),[&](const Link& link){return link.toNode==node.id&&link.toPort==0;}))continue;
@@ -4141,7 +4272,12 @@ void canvas(Graph& graph, int index)
             const bool requested=std::find(previewNodes.begin(),previewNodes.end(),previewKey(index,node.id))!=previewNodes.end();
             const auto image=requested&&value?value->preview:Preview{};
             const auto texture=NodePreview::texture(previewKey(index,node.id),image,g_pd3dDevice,g_pd3dDeviceContext);
-            if(texture)
+            if(image&&image->width==0)
+            {
+                display.previewText.prepare(image,ImGui::GetFont(),font,std::max(1.0f,panel.GetWidth()-16*graph.zoom));
+                display.previewText.draw(draw,panel,graph.zoom,previewHovered==node.id&&!leftGesture&&!editor.rightGesture&&editor.panButton<0);
+            }
+            else if(texture)
             {
                 const float scale=std::min(panel.GetWidth()/image->width,panel.GetHeight()/image->height);
                 const ImVec2 size(image->width*scale,image->height*scale),a=add(panel.GetCenter(),multiply(size,-0.5f));
@@ -4150,7 +4286,7 @@ void canvas(Graph& graph, int index)
             else
             {
                 const char* label=node.disabled?"Disabled":node.bypassed?"Bypassed":!requested?"Preview paused":
-                    value&&!value->error.empty()?"Preview unavailable":(geometry.connections[nodeIndex][0]&14)==0?"Connect Frame, Depth or Mask":"Waiting for image";
+                    value&&!value->error.empty()?"Preview unavailable":(geometry.connections[nodeIndex][0]&14)==0?"Connect any data":"Waiting for data";
                 const auto size=ImGui::GetFont()->CalcTextSizeA(font,10000,0,label);
                 draw->AddText(ImGui::GetFont(),font,add(panel.GetCenter(),multiply(size,-0.5f)),IM_COL32(137,146,159,255),label);
             }
@@ -4399,7 +4535,11 @@ void canvas(Graph& graph, int index)
         {
             if(emptyDoubleClick&&!io.KeyCtrl&&!io.KeyShift&&!io.KeyAlt&&!editor.panned&&!editor.wireNode&&!editor.popupNavigation)
                 addLooseReroute(graph,index,ImVec2((io.MousePos.x-origin.x-graph.panX)/graph.zoom,(io.MousePos.y-origin.y-graph.panY)/graph.zoom));
-            else{beginPan(graph,ImGuiMouseButton_Left);editor.emptyClickCandidate=!editor.popupNavigation;}
+            else
+            {
+                beginPan(graph,ImGuiMouseButton_Left);editor.emptyClickCandidate=!editor.popupNavigation;
+                editor.clearSelectionOnPanClick=hoverLink<0&&!io.KeyShift&&!io.KeyCtrl&&!io.KeyAlt&&!editor.popupNavigation;
+            }
         }
     }
     if(editor.bendGraph==index)
@@ -5081,7 +5221,6 @@ int NodeEditor_CreateWorkflow(const std::string& title,int kind,std::string& err
         });
         if(existingCapture)for(auto& node:graph.nodes)if(node.kind==NodeKind::CaptureSource)
             node=defaultNode(NodeKind::CurrentFrame,node.id,node.x,node.y);
-        if(existingCapture)Layout::arrange(graph);
     }
     const bool sourceExists=std::any_of(workspace.graphs.begin(),workspace.graphs.end(),[](const Graph& other){
         return std::any_of(other.nodes.begin(),other.nodes.end(),[](const Node& node){return node.kind==NodeKind::MouseProfile&&textParameter(node,"name")=="mouse";});
@@ -5094,14 +5233,19 @@ int NodeEditor_CreateWorkflow(const std::string& title,int kind,std::string& err
             for(const auto& node:graph.nodes)if(node.kind==NodeKind::MouseProfile)removed.push_back(node.id);
             graph.nodes.erase(std::remove_if(graph.nodes.begin(),graph.nodes.end(),[](const Node& node){return node.kind==NodeKind::MouseProfile;}),graph.nodes.end());
             for(auto& group:graph.groups)for(int id:removed)group.nodes.erase(std::remove(group.nodes.begin(),group.nodes.end(),id),group.nodes.end());
+            graph.groups.erase(std::remove_if(graph.groups.begin(),graph.groups.end(),[](const Group& group){return group.nodes.empty();}),graph.groups.end());
         }
         else if(std::any_of(graph.nodes.begin(),graph.nodes.end(),[](const Node& node){return calibrationIdentifier(node.kind)&&node.kind!=NodeKind::MouseProfile;})&&
             std::none_of(graph.nodes.begin(),graph.nodes.end(),[](const Node& node){return node.kind==NodeKind::MouseProfile;}))
         {
-            int id=1;for(const auto& node:graph.nodes)id=std::max(id,node.id+1);
-            graph.nodes.push_back(defaultNode(NodeKind::MouseProfile,id));
+            int id=1;float right=0,top=0;
+            for(const auto& node:graph.nodes){id=std::max(id,node.id+1);right=std::max(right,node.x+cardWidth(node));top=std::min(top,node.y);}
+            auto profile=defaultNode(NodeKind::MouseProfile,id,Layout::up(right+GridSize*3),std::floor(top/GridSize)*GridSize);
+            graph.nodes.push_back(profile);
+            int groupId=1;for(const auto& group:graph.groups)groupId=std::max(groupId,group.id+1);
+            graph.groups.push_back({groupId,"Shared aiming and recoil calibration",profile.x-GridSize,profile.y-2*GridSize,
+                Layout::up(cardWidth(profile)+2*GridSize),Layout::up(Layout::height(profile,true)+3*GridSize),0x40ffcd60u,{id}});
         }
-        Layout::arrange(graph);
     }
     graph.pageName.clear();
     const int index=static_cast<int>(workspace.graphs.size());workspace.graphs.push_back(std::move(graph));

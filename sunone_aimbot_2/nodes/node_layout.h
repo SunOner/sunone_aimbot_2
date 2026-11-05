@@ -14,6 +14,7 @@
 namespace NodeGraph::Layout
 {
 constexpr float Grid=32,CardWidth=192,HeaderHeight=28,PinSpacing=20,Gap=64,ColumnGap=96;
+constexpr float RerouteCenterX=32,RerouteCenterY=16;
 constexpr float MinWidth=160,MaxWidth=1024,MaxHeight=2048;
 inline float up(float value){return std::ceil(value/Grid)*Grid;}
 inline float snap(float value){return std::round(value/Grid)*Grid;}
@@ -23,6 +24,9 @@ inline bool isReroute(NodeKind kind)
         kind==NodeKind::RerouteFrame||kind==NodeKind::RerouteDepth||kind==NodeKind::RerouteMask||kind==NodeKind::RerouteInteger||
         kind==NodeKind::RerouteString||kind==NodeKind::RerouteMonitor||kind==NodeKind::RerouteMonitors||kind==NodeKind::RerouteOverlay||kind==NodeKind::RerouteLabels||kind==NodeKind::RerouteMotion||kind==NodeKind::RerouteCalibration;
 }
+// Cards snap by their top-left corner; point nodes snap by their visible center.
+inline float snapNodeX(NodeKind kind,float x){const float anchor=isReroute(kind)?RerouteCenterX:0;return snap(x+anchor)-anchor;}
+inline float snapNodeY(NodeKind kind,float y){const float anchor=isReroute(kind)?RerouteCenterY:0;return snap(y+anchor)-anchor;}
 inline bool inputVisible(const Node& node,std::size_t pin)
 {
     return pin<definition(node.kind).inputs.size();
@@ -148,7 +152,7 @@ inline bool arrange(Graph& graph,int bandColumns=4)
                 float y=bandY,columnWidth=0;
                 for(int n:layer)
                 {
-                    auto& node=graph.nodes[n];node.x=x;node.y=y+(isReroute(node.kind)?Grid:0);
+                    auto& node=graph.nodes[n];node.x=snapNodeX(node.kind,x);node.y=snapNodeY(node.kind,y+(isReroute(node.kind)?Grid:0));
                     columnWidth=std::max(columnWidth,width(node));y=up(node.y+height(node,true)+Gap);
                 }
                 if(!layer.empty()){bandHeight=std::max(bandHeight,y-bandY-Gap);right=std::max(right,x+columnWidth);x+=up(columnWidth+ColumnGap);}
