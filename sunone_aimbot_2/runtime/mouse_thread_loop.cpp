@@ -100,8 +100,10 @@ void mouseThreadFunction(MouseThread& mouseThread)
     double observationDelaySeconds=0;
     std::unordered_map<int, NodeGraph::Movement> windCache;
     bool inputWasCaptured = false;
+    double recoilRemainder = 0.0;
 
     auto resetSelections = [&]() {
+        recoilRemainder = 0.0;
         selectionStates.clear();
         predictionCache.clear();
         motionCache.clear();
@@ -169,6 +171,7 @@ void mouseThreadFunction(MouseThread& mouseThread)
 
         if (input_method_changed.exchange(false))
         {
+            recoilRemainder = 0.0;
             createInputDevices();
             assignInputDevices();
         }
@@ -195,6 +198,7 @@ void mouseThreadFunction(MouseThread& mouseThread)
         }
         if (pausedNow)
         {
+            recoilRemainder = 0.0;
             graphAimActive = false;
             NodeGraph::Context pausedContext;
             pausedContext.inputCaptured = inputCaptured;
@@ -376,6 +380,7 @@ void mouseThreadFunction(MouseThread& mouseThread)
         NodeVision::retainControlDrawings(actions.activeRenderKeys);
         if(editorInputCaptured.load())
         {
+            recoilRemainder = 0.0;
             graphAimActive=false;mouseThread.clearQueuedMoves();mouseThread.releaseMouse();continue;
         }
         // If publication raced the pre-evaluation revision snapshot, discard
@@ -416,12 +421,18 @@ void mouseThreadFunction(MouseThread& mouseThread)
         else
             mouseThread.releaseMouse();
 
-        if (actions.valid && actions.recoil && std::isfinite(actions.recoilStrength))
+        if (actions.valid && actions.recoil && std::isfinite(actions.recoilStrength) && actions.recoilStrength != 0)
         {
-            const int compensation = static_cast<int>(std::clamp(actions.recoilStrength, -1000.0, 1000.0));
-            const double pixelsPerCount=actions.recoilStrength!=0?actions.recoilPixelDeltaY/actions.recoilStrength:0;
+            // Device counts are integers. Carry sub-count strength between
+            // active ticks instead of truncating each tick's movement to zero.
+            recoilRemainder += std::clamp(actions.recoilStrength, -1000.0, 1000.0);
+            const int compensation = static_cast<int>(recoilRemainder);
+            recoilRemainder -= compensation;
+            const double pixelsPerCount=actions.recoilPixelDeltaY/actions.recoilStrength;
             mouseThread.dispatchGraphRecoil(compensation,pixelsPerCount);
         }
+        else
+            recoilRemainder = 0.0;
     }
     NodeVision::retainControlDrawings({});
 }

@@ -74,9 +74,11 @@ struct FakeState
     int moves = 0;
     int lastDx = 0;
     int lastDy = 0;
+    std::vector<std::pair<int, int>> movements;
     int downs = 0;
     int ups = 0;
     bool blockMoves = false;
+    int blockAtMove = 1;
     bool unblock = false;
 };
 
@@ -92,8 +94,11 @@ public:
         ++state_->moves;
         state_->lastDx = dx;
         state_->lastDy = dy;
+        state_->movements.emplace_back(dx, dy);
         state_->cv.notify_all();
-        state_->cv.wait(lock, [&] { return !state_->blockMoves || state_->unblock; });
+        state_->cv.wait(lock, [&] {
+            return !state_->blockMoves || state_->moves < state_->blockAtMove || state_->unblock;
+        });
         return true;
     }
     bool leftDown() override
@@ -646,6 +651,54 @@ void recoilGraphWorksWithoutTarget()
     require(std::abs(mouse->getMotionCompensationSince(since).second-3*2*0.03*320/80)<1e-9,
         "The control loop failed to send node calibration to recoil feedback");
 }
+
+void fractionalRecoilPreservesMovementAndFeedback()
+{
+    for (double strength : {0.4, 0.1, 0.99, 1.0, 1.25, 3.0})
+    {
+        resetFixture();
+        aiming = false;
+        shooting = zooming = true;
+        setNodeParameter(NodeGraph::NodeKind::RecoilEnabled, "enabled", 1);
+        setNodeParameter(NodeGraph::NodeKind::RecoilStrength, "strength", strength);
+        setNodeParameter(NodeGraph::NodeKind::MouseProfile, "sens", 2);
+        setNodeParameter(NodeGraph::NodeKind::MouseProfile, "pitch", 0.03);
+        setNodeParameter(NodeGraph::NodeKind::MouseProfile, "fov_y", 80);
+        auto state = std::make_shared<FakeState>();
+        state->blockMoves = true;
+        state->blockAtMove = 8;
+        FakeInput device(state);
+        auto mouse = makeMouse(&device);
+        const auto since = Clock::now();
+        bool moved = false;
+        {
+            MouseLoop loop(*mouse);
+            {
+                std::unique_lock<std::mutex> lock(state->mutex);
+                moved = state->cv.wait_for(lock, 2s, [&] { return state->moves == state->blockAtMove; });
+            }
+            shouldExit = true;
+            unblock(state);
+        }
+        const auto label = "Recoil strength " + std::to_string(strength);
+        require(moved, (label + " produced no sustained movement").c_str());
+        int total = 0;
+        bool sentFraction = false;
+        for (const auto& [dx, dy] : state->movements)
+        {
+            require(dx == 0 && (dy == static_cast<int>(std::floor(strength)) ||
+                dy == static_cast<int>(std::ceil(strength))),
+                (label + " produced an unexpected device step").c_str());
+            sentFraction = sentFraction || dy > strength;
+            total += dy;
+        }
+        if (strength != std::floor(strength))
+            require(sentFraction, (label + " lost its fractional counts").c_str());
+        require(std::abs(mouse->getMotionCompensationSince(since).second - total * 2 * 0.03 * 320 / 80) < 1e-9,
+            (label + " recorded feedback for unsent fractional movement").c_str());
+    }
+}
+
 void editorCaptureReleasesAndBlocksInput()
 {
     resetFixture();
@@ -986,6 +1039,7 @@ int main()
         { "layout-only graph edit keeps held output", layoutOnlyEditKeepsHeldButton },
         { "graph coordinates drive movement", graphCoordinatesDriveMovement },
         { "recoil graph without target", recoilGraphWorksWithoutTarget },
+        { "fractional recoil movement and feedback", fractionalRecoilPreservesMovementAndFeedback },
         { "editor capture releases and blocks input", editorCaptureReleasesAndBlocksInput },
         { "drawing samples latest motion while editing", drawingSamplesLatestMotionWhileEditorOwnsInput },
         { "explicit scope node controls shooting", explicitScopeNodeControlsShooting },
