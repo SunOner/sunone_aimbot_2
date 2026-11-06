@@ -131,6 +131,12 @@ Preview textPreview(const Value& value)
     }
     result->text=text.str();return result;
 }
+Preview previewError(const Value& value,const std::string& error)
+{
+    auto message=std::make_shared<PreviewImage>();message->sourceType=value.type;
+    message->generation=value.frame?value.frame->generation:value.mask?value.mask->generation:0;
+    message->text=std::string("Input error (")+typeName(value.type)+")\n\n"+error;return message;
+}
 bool signalIsActive(const Value& value)
 {
     if (!value.valid || !value.error.empty()) return false;
@@ -2206,6 +2212,27 @@ Actions Service::evaluateDomain(const Context& context,bool vision,bool configur
     inputIsCaptured();
     Actions actions;
     actions.revision = program->revision;
+    std::vector<int>* activityKeys[]={&actions.activeSelectionKeys,&actions.activePredictionKeys,&actions.activeWindKeys,&actions.activeProviderKeys,&actions.activeDepthKeys,&actions.activeMaskKeys};
+    const auto restoreActivity=[&](const auto& retained){
+        for(std::size_t k=0;k<retained.size();++k)for(int key:retained[k])
+            if(std::find(activityKeys[k]->begin(),activityKeys[k]->end(),key)==activityKeys[k]->end())activityKeys[k]->push_back(key);
+    };
+    const auto rememberActivity=[&](int graph,int root,auto& retained){
+        for(auto& keys:retained)keys.clear();
+        std::vector<std::pair<int,int>> pending={{graph,root}};std::set<std::pair<int,int>> visited;
+        while(!pending.empty())
+        {
+            const auto current=pending.back();pending.pop_back();if(!visited.insert(current).second)continue;
+            const auto [graphIndex,index]=current;if(!inDomain(graphIndex))continue;
+            const auto& dependency=program->graphs[graphIndex].nodes[index];const int key=graphIndex*NodeKeyStride+dependency.node.id;
+            for(std::size_t k=0;k<retained.size();++k)
+                if(std::find(activityKeys[k]->begin(),activityKeys[k]->end(),key)!=activityKeys[k]->end())retained[k].push_back(key);
+            const auto reads=domain.evaluations[graphIndex].readInputs[index];
+            for(std::size_t pin=0;pin<MaxPins;++pin)if((reads&(std::uint64_t{1}<<pin))&&dependency.inputs[pin]>=0)pending.push_back({graphIndex,dependency.inputs[pin]});
+            if(dependency.variableSource>=0)pending.push_back({graphIndex,dependency.variableSource});
+            if(dependency.sharedGraph>=0&&dependency.sharedIndex>=0)pending.push_back({dependency.sharedGraph,dependency.sharedIndex});
+        }
+    };
     bool sample = monitorSignals && now - domain.sampledAt >= std::chrono::milliseconds(33);
     auto completedAt=now;
     Telemetry telemetry;
@@ -2290,7 +2317,9 @@ Actions Service::evaluateDomain(const Context& context,bool vision,bool configur
                 {
                     readInputs[i]|=std::uint64_t{1}<<pin;if(!ready(n.inputs[pin]))return values[i];const auto& value=values[n.inputs[pin]];const auto& input=definition_.inputs[pin];
                     auto fail=[&](const std::string& reason)->const Value&{values[i].type=definition_.outputs.empty()?T::Boolean:definition_.outputs[0].type;values[i].valid=false;values[i].error=reason;return values[i];};
-                    if(!value.valid||!value.error.empty())return fail(value.error.empty()?std::string("Unavailable setting: ")+input.name:value.error);
+                    // A lost target or an inactive branch can leave a bound
+                    // value unavailable without an evaluation error.
+                    if(!value.valid||!value.error.empty())return fail(value.error);
                     if(n.node.kind==K::CaptureSource&&pin==0)
                     {
                         if(!value.monitor)return fail("Monitor is unavailable.");
@@ -2368,16 +2397,23 @@ Actions Service::evaluateDomain(const Context& context,bool vision,bool configur
                 if(!configurationOnly&&cached!=domain.previews.end()&&cached->second.settings==options&&
                     (!context.frame||!cached->second.image||!imageValue(cached->second.image->sourceType)||cached->second.image->generation==context.frame->generation)&&
                     now-cached->second.updatedAt<std::chrono::duration<double>(1.0/parameter(settings,"max_fps")))
-                {out.preview=cached->second.image;out.valid=static_cast<bool>(out.preview);out.boolean=out.valid;out.error=cached->second.error;return out;}
+                {restoreActivity(cached->second.retainedKeys);out.preview=cached->second.image;out.error=cached->second.error;out.valid=static_cast<bool>(out.preview)&&out.error.empty();out.boolean=out.valid;return out;}
                 readInputs[i]|=std::uint64_t{1}<<pin;if(!ready(n.inputs[pin]))return out;
                 const auto& image=values[n.inputs[pin]];
-                if(!image.valid&&!configurationOnly){out.error=image.error;domain.previews.erase(previewKey(g,settings.id));return out;}
+                if(!image.valid&&!configurationOnly)
+                {
+                    out.error=image.error;
+                    if(image.error.empty()){domain.previews.erase(previewKey(g,settings.id));return out;}
+                    auto& state=domain.previews[previewKey(g,settings.id)];
+                    if(!state.image||state.error!=image.error||state.image->sourceType!=image.type)
+                        state.image=previewError(image,image.error);
+                    state.error=image.error;state.settings=options;state.updatedAt=now;out.preview=state.image;rememberActivity(g,static_cast<int>(i),state.retainedKeys);return out;
+                }
                 const bool raster=imageValue(image.type);
                 DetectionStream detections;
                 if(raster&&parameter(settings,"draw_boxes")!=0&&n.inputs[4]>=0)
                 {readInputs[i]|=std::uint64_t{1}<<4;if(!ready(n.inputs[4]))return out;if(values[n.inputs[4]].valid)detections=values[n.inputs[4]].detections;}
                 if(configurationOnly)return out;
-                if(raster&&!context.preview){out.error="Image preview is unavailable in this workflow.";return out;}
                 const auto currentPreviews=previewNodes();
                 if(!currentPreviews||!std::binary_search(currentPreviews->begin(),currentPreviews->end(),previewKey(g,settings.id)))return out;
                 auto& state=domain.previews[previewKey(g,settings.id)];
@@ -2387,20 +2423,23 @@ Actions Service::evaluateDomain(const Context& context,bool vision,bool configur
                     detections?static_cast<std::uint64_t>(detections->version):0,detections?detections->generation:0};
                 const bool reset=state.stamp[0]!=generation||state.settings!=options;
                 state.updatedAt=now;
-                if(reset||state.stamp!=stamp||!state.image)
+                if(reset||state.stamp!=stamp||!state.image||!state.error.empty())
                 {
                     state.stamp=stamp;state.settings=options;state.error.clear();state.image.reset();
                     try
                     {
-                        state.image=raster?context.preview(image,detections,settings):textPreview(image);
+                        if(raster&&!context.preview)state.error="Image preview is unavailable in this workflow.";
+                        else state.image=raster?context.preview(image,detections,settings):textPreview(image);
                         if(raster&&state.image&&(state.image->width<1||state.image->height<1||state.image->width>640||state.image->height>640||
                             state.image->rgba.size()!=static_cast<std::size_t>(state.image->width)*state.image->height*4))
                         {state.image.reset();state.error="Preview returned an invalid image.";}
                     }
                     catch(const std::exception& error){state.error=error.what();}
                     catch(...){state.error="Preview conversion failed.";}
+                    if(!state.error.empty())state.image=previewError(image,state.error);
                 }
-                out.preview=state.image;out.valid=static_cast<bool>(state.image);out.boolean=out.valid;out.error=state.error;return out;
+                out.preview=state.image;out.error=state.error;out.valid=static_cast<bool>(state.image)&&out.error.empty();out.boolean=out.valid;
+                rememberActivity(g,static_cast<int>(i),state.retainedKeys);return out;
             }
             if(configurationOnly&&(settings.kind==K::CaptureSource||settings.kind==K::Inference||settings.kind==K::DepthInference||settings.kind==K::DepthToMask))
             {
@@ -2450,9 +2489,7 @@ Actions Service::evaluateDomain(const Context& context,bool vision,bool configur
                 if(state.renderedAt.time_since_epoch().count()&&std::chrono::duration<double>(now-state.renderedAt).count()<interval)
                 {
                     values[i]=state.output;if(state.rendered)actions.activeRenderKeys.push_back(g*NodeKeyStride+settings.id);
-                    std::vector<int>* keys[]={&actions.activeSelectionKeys,&actions.activePredictionKeys,&actions.activeWindKeys,&actions.activeProviderKeys,&actions.activeDepthKeys,&actions.activeMaskKeys};
-                    for(std::size_t k=0;k<state.retainedKeys.size();++k)for(int key:state.retainedKeys[k])
-                        if(std::find(keys[k]->begin(),keys[k]->end(),key)==keys[k]->end())keys[k]->push_back(key);
+                    restoreActivity(state.retainedKeys);
                     return values[i];
                 }
             }
@@ -3022,21 +3059,7 @@ Actions Service::evaluateDomain(const Context& context,bool vision,bool configur
             if(settings.kind==K::RenderDrawing)
             {
                 auto& state=domain.drawings[nodeKey];state.output=out;state.rendered=out.valid&&out.boolean;
-                for(auto& keys:state.retainedKeys)keys.clear();
-                const std::vector<int>* keys[]={&actions.activeSelectionKeys,&actions.activePredictionKeys,&actions.activeWindKeys,&actions.activeProviderKeys,&actions.activeDepthKeys,&actions.activeMaskKeys};
-                std::vector<std::pair<int,int>> pending={{g,static_cast<int>(i)}};std::set<std::pair<int,int>> visited;
-                while(!pending.empty())
-                {
-                    const auto current=pending.back();pending.pop_back();if(!visited.insert(current).second)continue;
-                    const auto [graphIndex,index]=current;const auto& dependency=program->graphs[graphIndex].nodes[index];
-                    const int key=graphIndex*NodeKeyStride+dependency.node.id;
-                    for(std::size_t k=0;k<state.retainedKeys.size();++k)
-                        if(std::find(keys[k]->begin(),keys[k]->end(),key)!=keys[k]->end())state.retainedKeys[k].push_back(key);
-                    const auto reads=domain.evaluations[graphIndex].readInputs[index];
-                    for(std::size_t pin=0;pin<MaxPins;++pin)if((reads&(std::uint64_t{1}<<pin))&&dependency.inputs[pin]>=0)pending.push_back({graphIndex,dependency.inputs[pin]});
-                    if(dependency.variableSource>=0)pending.push_back({graphIndex,dependency.variableSource});
-                    if(dependency.sharedGraph>=0&&dependency.sharedIndex>=0)pending.push_back({dependency.sharedGraph,dependency.sharedIndex});
-                }
+                rememberActivity(g,static_cast<int>(i),state.retainedKeys);
             }
             if(!out.valid&&eventNode(settings.kind))domain.events[nodeKey].reseed=true;
             if(!out.valid&&out.boolean)

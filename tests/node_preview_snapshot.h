@@ -1,7 +1,7 @@
 #pragma once
 namespace
 {
-int snapshotUniversalPreview(const std::string& filename,bool drawingExample=false,int focusGroup=0)
+int snapshotUniversalPreview(const std::string& filename,bool drawingExample=false,int focusGroup=0,bool previewStatus=false)
 {
     EditorHarness h;EditorBenchmarkGpu gpu;
     if(drawingExample){h.windowWidth=1960;ImGui::GetIO().DisplaySize=ImVec2(2000,800);}
@@ -28,10 +28,21 @@ int snapshotUniversalPreview(const std::string& filename,bool drawingExample=fal
     for(int i=0;i<20;++i)text->text+="Additional line "+std::to_string(i)+"\n";
     auto image=std::make_shared<PreviewImage>();image->width=320;image->height=180;image->sourceWidth=1280;image->sourceHeight=720;image->rgba.resize(320*180*4);
     for(int y=0;y<180;++y)for(int x=0;x<320;++x){const auto at=(y*320+x)*4;image->rgba[at]=static_cast<std::uint8_t>(x*255/319);image->rgba[at+1]=static_cast<std::uint8_t>(y*255/179);image->rgba[at+2]=150;image->rgba[at+3]=255;}
+    if(previewStatus)
+    {
+        graph.nodes[0]=defaultNode(NodeKind::ProjectPoint,1,-600,32);graph.nodes[2]=defaultNode(NodeKind::Center,3,-600,320);edited();
+        text->sourceType=ValueType::Point;text->text="Input error (Point (pixels))\n\nVelocity provider lost";
+        image=std::make_shared<PreviewImage>();image->sourceType=ValueType::Point;image->text="Point (pixels)\n\nX: 123.25\nY: 999.5";
+    }
     for(int frame=0;frame<3;++frame)
     {
         editor.live.graphs[3].clear();editor.liveIndex[3].clear();
-        if(!drawingExample)for(const auto entry:{std::pair{2,Preview(text)},std::pair{4,Preview(image)}}){NodeValue value;value.nodeId=entry.first;value.value.preview=entry.second;value.value.boolean=true;editor.liveIndex[3].emplace_back(entry.first,editor.live.graphs[3].size());editor.live.graphs[3].push_back(std::move(value));}
+        if(!drawingExample)for(const auto entry:{std::pair{2,Preview(text)},std::pair{4,Preview(image)}})
+        {
+            NodeValue value;value.nodeId=entry.first;value.value.preview=entry.second;value.value.boolean=true;
+            if(previewStatus&&entry.first==2){value.value.valid=false;value.value.boolean=false;value.value.error="Velocity provider lost";}
+            editor.liveIndex[3].emplace_back(entry.first,editor.live.graphs[3].size());editor.live.graphs[3].push_back(std::move(value));
+        }
         editor.live.graphRevisions[3]=service().revision();editor.live.graphSampledAt[3]=std::chrono::steady_clock::now();editor.telemetryAt=1000000;
         ImGui_ImplDX11_NewFrame();h.frame();gpu.render();
     }

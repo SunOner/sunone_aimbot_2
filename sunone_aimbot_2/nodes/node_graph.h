@@ -544,6 +544,7 @@ private:
             std::array<double,4> settings{};
             std::chrono::steady_clock::time_point updatedAt{};
             std::string error;
+            std::array<std::vector<int>,6> retainedKeys;
         };
         std::map<int,PreviewState> previews;
         std::array<std::vector<std::array<Value,MaxDataPins>>,MaxGraphs> inputStorage;

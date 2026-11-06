@@ -617,7 +617,7 @@ int main()
     catch(const std::exception& error){std::cerr<<error.what()<<'\n';return 1;}
     try{run("testStarterLayoutsAreExactAndPortable",testStarterLayoutsAreExactAndPortable);}
     catch(const std::exception& error){std::cerr<<error.what()<<'\n';return 1;}
-    try{run("testUniversalPreviewAcceptsValuesInEveryWorkflow",testUniversalPreviewAcceptsValuesInEveryWorkflow);run("testUniversalPreviewNumbersStructuresAndImageCompatibility",testUniversalPreviewNumbersStructuresAndImageCompatibility);}
+    try{run("testPreviewSamplingKeepsUpstreamRuntimeState",testPreviewSamplingKeepsUpstreamRuntimeState);run("testPointPreviewWaitsForTargetAndShowsErrorCause",testPointPreviewWaitsForTargetAndShowsErrorCause);run("testUniversalPreviewAcceptsValuesInEveryWorkflow",testUniversalPreviewAcceptsValuesInEveryWorkflow);run("testUniversalPreviewNumbersStructuresAndImageCompatibility",testUniversalPreviewNumbersStructuresAndImageCompatibility);}
     catch(const std::exception& error){std::cerr<<"Universal preview test failed: "<<error.what()<<'\n';return 1;}
     try{run("testRerouteDeletionPreservesBranchesAndRoutes",testRerouteDeletionPreservesBranchesAndRoutes);run("testRerouteDeletionSupportsEveryTypeAndRouteLimits",testRerouteDeletionSupportsEveryTypeAndRouteLimits);}
     catch(const std::exception& error){std::cerr<<"Reroute deletion test failed: "<<error.what()<<'\n';return 1;}

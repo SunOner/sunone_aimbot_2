@@ -2068,6 +2068,7 @@ void testWindowButtonsStayOrderedAndReachable()
 }
 
 #include "node_reroute_delete_input_tests.h"
+#include "node_user_journey_tests.h"
 #include "node_preview_snapshot.h"
 int main(int argc,char** argv)
 {
@@ -2075,9 +2076,13 @@ int main(int argc,char** argv)
     {
         if(argc>1&&std::string(argv[1])=="--benchmark")return benchmarkNodeEditor(argc>2?argv[2]:"benchmark_results/node_editor.csv",argc>3?argv[3]:"");
         if(argc>2&&std::string(argv[1])=="--preview-snapshot")return snapshotUniversalPreview(argv[2]);
+        if(argc>2&&std::string(argv[1])=="--preview-status-snapshot")return snapshotUniversalPreview(argv[2],false,0,true);
         if(argc>2&&std::string(argv[1])=="--drawing-snapshot")return snapshotUniversalPreview(argv[2],true,argc>3?std::stoi(argv[3]):0);
         const auto run=[&](const char* name,auto test){if(argc>2&&std::string(argv[1])=="--test"&&std::string(argv[2])!=name)return;gestureScenario=name;if(argc>1&&std::string(argv[1])=="--trace")std::cerr<<"Running "<<name<<std::endl;test();};
         run("testWindowButtonsStayOrderedAndReachable",testWindowButtonsStayOrderedAndReachable);
+        run("testUserBuildsCopiesAndRestoresAnArithmeticWorkflow",testUserBuildsCopiesAndRestoresAnArithmeticWorkflow);
+        run("testRoutingEditsStayUndoableForEveryDataType",testRoutingEditsStayUndoableForEveryDataType);
+        run("testMixedEditingSequencesRoundTripHistoryAndFiles",testMixedEditingSequencesRoundTripHistoryAndFiles);
         run("testMcpEditorTransactions",testMcpEditorTransactions);
         run("testMcpDiagnosticsLease",testMcpDiagnosticsLease);
         run("testMcpApplicationSettings",testMcpApplicationSettings);

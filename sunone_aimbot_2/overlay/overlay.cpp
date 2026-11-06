@@ -1519,7 +1519,8 @@ bool CreateOverlayWindow()
     };
     ::RegisterClassEx(&wc);
 
-    const DWORD exStyle = WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED;
+    // The standalone test editor is a normal, discoverable app window.
+    const DWORD exStyle = WS_EX_TOPMOST | (g_overlayPreview ? WS_EX_APPWINDOW : WS_EX_TOOLWINDOW) | WS_EX_LAYERED;
     const DWORD style = WS_POPUP;
 
     RECT wr = { overlayX, overlayY, overlayX + overlayWidth, overlayY + overlayHeight };
