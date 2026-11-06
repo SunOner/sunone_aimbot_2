@@ -128,6 +128,8 @@ class WorkflowMcpTests(unittest.TestCase):
     def test_agent_discovery_resources_and_compact_responses(self):
         server = mcp.Server(Bridge())
         self.assertEqual(len(server.call("get_catalog", dict(query="BOOLEAN"))["nodes"]), 2)
+        self.assertEqual([item["kind"] for item in server.call("get_catalog", dict(query="BOOLEAN", kinds=[12]))["nodes"]], [12])
+        self.assertEqual(server.call("get_catalog", dict(kinds=[999]))["nodes"], [])
         self.assertEqual(len(server.call("get_catalog", {})["nodes"]), 4)
         current = server.call("get_workspace", dict(summary=True))
         self.assertNotIn("workspace", current)
@@ -140,6 +142,64 @@ class WorkflowMcpTests(unittest.TestCase):
         result = server.handle(dict(jsonrpc="2.0", id=2, method="resources/read", params=dict(uri=listed[0]["uri"])))
         self.assertIn("settings_version", result["result"]["contents"][0]["text"])
         self.assertIn("error", server.handle(dict(jsonrpc="2.0", id=3, method="resources/read", params=dict(uri="file:///private"))))
+
+    def test_inspection_names_connections_defaults_and_only_fresh_consumed_inputs(self):
+        bridge = Bridge()
+        catalog = copy.deepcopy(CATALOG)
+        catalog["nodes"][1].update(inputs=[dict(index=0, name="Amount", type="Float", default_parameter="amount")],
+                                   parameters=[dict(key="amount", default=2)])
+        for spec in catalog["nodes"]:
+            for pin in spec["outputs"]:
+                pin["name"] = "Result"
+        item = bridge.workspace["graphs"][0]
+        item["nodes"] = [mcp.default_node(catalog["nodes"][1], 1, dict(parameters=dict(amount=0.005555555555555556))),
+                         mcp.default_node(catalog["nodes"][1], 2)]
+        item["links"] = [dict(from_node=1, from_port=0, to_node=2, to_port=0, ties=[], bend={})]
+        sampled = dict(graphs=[dict(workflow=1, current=True, sample_age_ms=10, nodes=[
+            dict(node=1, active=True, read_inputs="1", value=dict(valid=True, value=3)),
+            dict(node=2, active=True, read_inputs="1", value=dict(valid=True, value=3))])], execution_revision=7)
+        def connect(**request):
+            if request["op"] == "diagnostics":
+                return copy.deepcopy(sampled)
+            if request["op"] == "catalog":
+                return copy.deepcopy(catalog)
+            return dict(bridge(**request), execution_revision=7)
+        server = mcp.Server(connect)
+        inspected = server.call("inspect_node", dict(workflow=1, node=2))
+        self.assertTrue(inspected["runtime"]["current"])
+        self.assertEqual(inspected["inputs"][0]["source"]["name"], "Result")
+        self.assertTrue(inspected["inputs"][0]["consumed"])
+        self.assertEqual(inspected["inputs"][0]["configured_default"]["value"], 2)
+        first = server.call("inspect_node", dict(workflow=1, node=1))
+        self.assertEqual(first["outputs"][0]["destinations"][0]["name"], "Amount")
+        self.assertEqual(first["inputs"][0]["configured_default"]["value"], 0.005555555555555556)
+        sampled["execution_revision"] = 8
+        stale = server.call("inspect_node", dict(workflow=1, node=2))
+        self.assertFalse(stale["runtime"]["current"])
+        self.assertFalse(stale["inputs"][0]["source"]["runtime"]["current"])
+        self.assertNotIn("consumed", stale["inputs"][0])
+        sampled["graphs"][0]["nodes"] = []
+        self.assertFalse(server.call("inspect_node", dict(workflow=1, node=1))["runtime"]["current"])
+        sampled["execution_revision"] = 7
+        sampled["graphs"][0]["nodes"] = [dict(node=1, value_age_ms=1001, cached=True)]
+        self.assertFalse(server.call("inspect_node", dict(workflow=1, node=1))["runtime"]["current"])
+        with self.assertRaises(mcp.ToolError) as issue:
+            server.call("inspect_node", dict(workflow=999, node=1))
+        self.assertEqual(issue.exception.code, "not_found")
+
+    def test_error_codes_and_argument_paths_are_machine_readable(self):
+        server = mcp.Server(Bridge())
+        server.initialized = server.ready = True
+        def call(arguments):
+            return server.handle(dict(jsonrpc="2.0", id=1, method="tools/call", params=dict(name="edit_workflows", arguments=arguments)))["result"]
+        invalid = call(dict(expected_version="v", operations=[dict(op="node.add", workflow=True)]))
+        self.assertTrue(invalid["isError"])
+        self.assertEqual(invalid["structuredContent"]["details"]["path"], "$.operations[0].workflow")
+        self.assertFalse(invalid["structuredContent"]["retryable"])
+        conflict = call(dict(expected_version="stale", operations=[dict(op="workflow.create")]))["structuredContent"]
+        self.assertEqual(conflict["code"], "version_conflict")
+        self.assertTrue(conflict["retryable"])
+        self.assertIn("current_version", conflict["details"])
 
     def test_application_tool_arguments_and_forwarding(self):
         calls = []

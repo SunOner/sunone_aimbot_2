@@ -67,7 +67,7 @@ async def exercise(stage, instance):
             return raw.get("structuredContent") or json.loads(raw["content"][0]["text"])
 
         tools = await sessions[0].list_tools()
-        assert len(tools.tools) == 13
+        assert len(tools.tools) == 14
         resources = await sessions[0].list_resources()
         assert str(resources.resources[0].uri) == "sunone://agent-guide"
         guide = await sessions[0].read_resource(resources.resources[0].uri)
@@ -91,6 +91,7 @@ async def exercise(stage, instance):
         assert isinstance((await call("get_sources"))["entries"], list)
         assert isinstance((await call("get_sources", dict(source="monitors")))["entries"], list)
         catalog = await call("get_catalog")
+        assert len((await call("get_catalog", dict(kinds=[catalog["nodes"][0]["kind"]])))["nodes"]) == 1
         assert all("inference" in (node["title"] + " " + node["category"]).casefold() for node in (await call("get_catalog", dict(query="inference")))["nodes"])
         assert "workspace" not in await call("get_workspace", dict(summary=True))
         definitions = {item["title"].casefold(): item for item in catalog["nodes"]}
@@ -122,7 +123,8 @@ async def exercise(stage, instance):
         assert len(graph["nodes"]) == 5 and graph["ties"][0]["angle"] == 15
         assert graph["nodes"][2]["kind"] == definitions["reroute boolean"]["kind"]
         assert set(graph["groups"][0]["nodes"]) == {1, 2, 3, 4, 5}
-        await call("edit_workflows", arguments, client=1, error=True)
+        conflict = await call("edit_workflows", arguments, client=1, error=True)
+        assert conflict["code"] == "version_conflict" and conflict["retryable"]
         invalid = dict(expected_version=edited["version"], operations=[dict(op="node.update", workflow=identifier, id=1, fields=dict(value=0)), dict(op="link.connect", workflow=identifier, link=dict(from_node=2, from_port=0, to_node=3, to_port=0))])
         await call("edit_workflows", invalid, error=True)
         assert (await call("get_workspace"))["version"] == edited["version"]
@@ -140,6 +142,13 @@ async def exercise(stage, instance):
         await asyncio.sleep(0.12)
         diagnostics = await call("get_diagnostics", dict(workflow=identifier))
         assert diagnostics["graphs"][0]["current"]
+        inspection = await call("inspect_node", dict(workflow=identifier, node=2))
+        assert inspection["runtime"]["current"] and inspection["inputs"][0]["connected"]
+        assert inspection["inputs"][0]["source"]["node"] == 3
+        assert inspection["outputs"][0]["destinations"][0]["node"] == 4
+        missing = await call("inspect_node", dict(workflow=identifier, node=999999), error=True)
+        assert missing["code"] == "not_found" and not missing["retryable"]
+        await call("get_diagnostics", dict(workflow=999999), error=True)
         assert next(node for node in diagnostics["graphs"][0]["nodes"] if node["node"] == 2)["value"]["value"] is False
         preview_text = "Universal preview: полный текст\n0.005555555555555556"
         current = await call("get_workspace")

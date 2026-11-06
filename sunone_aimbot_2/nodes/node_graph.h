@@ -431,6 +431,8 @@ struct NodeValue
     std::uint64_t readInputs = 0;
     bool active = false;
     bool signalActive = false;
+    std::chrono::steady_clock::time_point evaluatedAt{};
+    bool evaluated = false;
 };
 struct Telemetry
 {
@@ -489,6 +491,8 @@ private:
             std::chrono::steady_clock::time_point signaledAt{};
             std::uint64_t readInputs = 0;
             bool available = false, active = false, signalActive = false;
+            Value lastValue;
+            std::chrono::steady_clock::time_point evaluatedAt{};
         };
         std::map<int,EventState> events;
         std::shared_ptr<const Program> eventProgram;

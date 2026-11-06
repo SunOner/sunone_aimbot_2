@@ -2191,6 +2191,8 @@ Actions Service::evaluateDomain(const Context& context,bool vision,bool configur
     {
         domain.sampledAt={};for(auto& signals:domain.signals)signals.clear();domain.signalProgram.reset();
     }
+    if(!monitorSignals&&domain.telemetryWasEnabled)
+        for(auto& signals:domain.signals)for(auto& signal:signals){signal.lastValue=Value{};signal.evaluatedAt={};}
     domain.telemetryWasEnabled=monitorSignals;
     for(auto it=domain.previews.begin();it!=domain.previews.end();)
         if(!previewWanted(it->first))it=domain.previews.erase(it);else++it;
@@ -2478,6 +2480,7 @@ Actions Service::evaluateDomain(const Context& context,bool vision,bool configur
                 {
                     values[i] = boolean(false);
                     values[i].valid = enable.valid;
+                    values[i].error = enable.error;
                     return values[i];
                 }
             }
@@ -2863,6 +2866,7 @@ Actions Service::evaluateDomain(const Context& context,bool vision,bool configur
                 out=filtered({b,inputs[2].number,0,0},[&]{return filterStream(inputs[0].detections,[&](const Detection& d){return d.width*d.height>=b&&d.width*d.height<=inputs[2].number;});});break;
             case K::FilterCircle:
             {
+                if(!valid||!inputs[0].detections){out.type=T::Detections;out.valid=false;break;}
                 const double percent=parameter(settings,"radius_percent");
                 const double radius=percent>0?std::min(inputs[0].detections->width,inputs[0].detections->height)*0.5*percent/100.0:std::max(0.0,inputs[2].number);
                 out=filtered({inputs[1].point.x,inputs[1].point.y,radius,parameter(settings,"enabled")},[&]{return parameter(settings,"enabled")==0?inputs[0].detections:filterStream(inputs[0].detections,[&](const Detection& d){return std::hypot(d.x+d.width*0.5-inputs[1].point.x,d.y+d.height*0.5-inputs[1].point.y)<=radius;});});break;
@@ -3145,14 +3149,21 @@ Actions Service::evaluateDomain(const Context& context,bool vision,bool configur
                     signal.stamp=stamp;
                 }
                 signal.available=available;
+                // Keep the latest actual evaluation between telemetry samples.
+                // Throttled sinks may skip their inputs on a sampling tick.
+                // Move here after all graph evaluation; copy only at 30 Hz.
+                if(evaluated[i]){signal.lastValue=std::move(values[i]);signal.evaluatedAt=completedAt;}
+                else if(completedAt-signal.evaluatedAt>std::chrono::seconds(1))
+                {signal.lastValue=Value{};signal.evaluatedAt={};}
                 if(sample)
                 {
-                    if(!evaluated[i])
+                    Value value=signal.lastValue;
+                    if(signal.evaluatedAt.time_since_epoch().count()==0)
                     {
-                        values[i].valid=false;const auto& def=definition(nodes[i].node.kind);
-                        if(!def.outputs.empty())values[i].type=def.outputs[0].type;
+                        value.valid=false;const auto& def=definition(nodes[i].node.kind);
+                        if(!def.outputs.empty())value.type=def.outputs[0].type;
                     }
-                    telemetry.graphs[g].push_back({nodes[i].node.id,std::move(values[i]),signal.sequence,signal.signaledAt,signal.readInputs,signal.active,signal.signalActive});
+                    telemetry.graphs[g].push_back({nodes[i].node.id,std::move(value),signal.sequence,signal.signaledAt,signal.readInputs,signal.active,signal.signalActive,signal.evaluatedAt,evaluated[i]!=0});
                     signal.readInputs=0;
                 }
             }
@@ -3179,7 +3190,7 @@ Actions Service::evaluateDomain(const Context& context,bool vision,bool configur
             telemetry_.actions.aim=actions.aim;telemetry_.actions.autoShoot=actions.autoShoot;telemetry_.actions.recoil=actions.recoil;
             telemetry_.actions.aimPoint=actions.aimPoint;telemetry_.actions.recoilStrength=actions.recoilStrength;
             telemetry_.actions.recoilPixelDeltaY=actions.recoilPixelDeltaY;
-            telemetry_.actions.shootTarget=actions.shootTarget;telemetry_.actions.movement=actions.movement;
+            telemetry_.actions.shootTarget=actions.shootTarget;telemetry_.actions.movement=actions.movement;telemetry_.actions.movements=actions.movements;
             telemetry_.actions.activePredictionKeys=actions.activePredictionKeys;telemetry_.actions.activeWindKeys=actions.activeWindKeys;telemetry_.actions.activeSelectionKeys=actions.activeSelectionKeys;
         }
         telemetry_.actions.valid=actions.valid;telemetry_.actions.revision=actions.revision;telemetry_.sampledAt=completedAt;

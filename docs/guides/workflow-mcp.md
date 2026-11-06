@@ -32,6 +32,7 @@ The app uses a local Windows named pipe restricted to the current user and rejec
 | `get_catalog` | All node kinds, port types, defaults, ranges, choices and limits |
 | `get_sources` | Available model paths and monitor indexes/devices |
 | `get_workspace` | Workflows, IDs, nodes, settings, wires, groups and layout |
+| `inspect_node` | One node, definition, named connections, configured defaults and cached neighbor state |
 | `edit_workflows` | An atomic batch of edits, one Undo step, immediate autosave |
 | `validate_workflows` | Validate and normalize a proposed batch without applying it |
 | `import_workflows` | Replace the workspace or append workflows from structured data |
@@ -45,6 +46,8 @@ The app uses a local Windows named pipe restricted to the current user and rejec
 
 The server provides agent instructions during initialization and an MCP resource, `sunone://agent-guide`. Start with `get_application`, `get_workspace(summary=true)` and `get_catalog(query="...")` to discover the app without filling the agent context with every node. `edit_workflows(response="summary")` returns the version, created IDs and workflow counts instead of the whole workspace.
 
+Use `get_catalog(kinds=[...])` for exact definitions and `inspect_node(workflow=ID,node=ID)` to diagnose one node. Inspection includes every port, named sources/destinations, configured input defaults and the workspace version. Defaults on wired inputs are inactive. Omitted defaults use the runtime fallback. Samples describe a node evaluation, not individual output ports; `consumed` is included only for fresh samples. Inspection requests definitions only for immediate neighbors and reuses the bounded diagnostics lease.
+
 Example request to an agent: **“Inspect the available models and my Vision workflow, fix disconnected inputs, arrange the nodes and verify fresh diagnostics. Keep processing paused until the graph is ready.”** The agent can perform this through MCP without editing project source or simulating mouse input.
 
 Global settings use `expected_settings_version` from `get_application`. Only application-owned settings are accepted: devices, hotkeys, overlay and startup resources. Capture, inference and control options remain graph-owned. Startup changes are returned in `restart_required`; they take effect after the next app launch. These settings have no graph Undo; retain their previous values when you need to restore them.
@@ -52,6 +55,8 @@ Global settings use `expected_settings_version` from `get_application`. Only app
 Window and pause actions are queued; read `get_application` again for the resulting state. Setting an existing pause state or window mode does not toggle it. `model_export` uses the same job and cancellation as the Export tab. A finished job returns its output path; choose it in the inference node explicitly. A running export cannot be silently replaced.
 
 Read the catalog and workspace before editing. Pass the returned opaque `version` as `expected_version`; it includes layout changes. Conflicts and invalid batches apply nothing. Requests are executed on the editor thread, including while the menu is hidden. An active user interaction returns a busy error. Read and retry after it ends.
+
+Tool errors return `code`, `retryable` and optional `details`. `version_conflict` requires reading and rebasing; `busy` requires waiting for the user's gesture to end. Both apply nothing. `not_found` requires correcting the ID. Argument type errors identify their JSON path. After `transport_error`, read state before retrying a write because a response may have been lost.
 
 Example arguments for `edit_workflows`:
 
@@ -73,6 +78,14 @@ Applied changes are live and can activate graph outputs. `dry_run` does not exec
 
 Diagnostics request a one-second telemetry lease without opening the menu or requesting image pixels. Read again after a runtime tick if `current` is false; stale or absent samples are not evidence of successful execution. Preview mode evaluates synthetic data only and stops ticking while its window is hidden.
 
+Nodes report `evaluated`, `cached` and `value_age_ms`. Between throttled sink updates, diagnostics retain the last actual upstream value for at most one second. A program edit invalidates this cache. Cached values never cause extra graph execution or fresh wire impulses. `inspect_node.runtime.current` checks both the program revision and the node's value age.
+
+`get_diagnostics.outputs` reports sampled workspace-wide actions: aim/shoot/recoil flags, summed mouse counts, calibrated recoil delta, detection count and provider activity. Check `control_current` and `vision_current`; graph/node filters do not narrow these totals. These are computed graph outputs, not acknowledgements from a physical input device.
+
 The universal Preview node has an `Any` Data input (port 1), available in every workflow. Visible text/data previews appear in diagnostics as `value.preview.type` and `value.preview.text`; images expose metadata only. Existing depth/mask ports remain compatible. Preview subscriptions still require a visible, expanded card; the diagnostics lease does not request pixel conversion.
 
 To diagnose a connection, run `python workflow_mcp.py --check` beside the executable (add `--instance NAME` for a custom instance). It reports connection/build/window state and exits. A local stdio client must run on the same Windows host and user as the application; a cloud-only chat cannot reach this pipe directly.
+
+After a wrapper build, run `python tests/workflow_codex_integration.py --build-dir build/dml/Release` (or `build/cuda/Release`) with an authenticated Codex CLI. It launches a separate synthetic editor, supplies temporary MCP configuration to an ephemeral Codex run, verifies actual tool-call events for arithmetic, stale-version rejection and Undo, then checks autosave. User configuration and existing workflows are untouched. Logs remain under ignored `build/qa-codex-mcp-*`.
+
+Run `python tests/workflow_templates_mcp_integration.py --build-dir build/cuda/Release --sdk-dir build/mcp-sdk-check` to check all four standard workflows over MCP. `--workspace PATH` tests a copy of a saved workspace. Cases cover activation, scope, calibrated movement/recoil, Vision filters, missing providers, masks, rendering, disconnected inputs and recovery. Results and MCP call logs stay in `build/qa-standard-mcp-*`.

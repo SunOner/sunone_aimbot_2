@@ -1,6 +1,25 @@
 #pragma once
 namespace
 {
+void testPreviewDiagnosticsKeepValuesBetweenRefreshes()
+{
+    using K=NodeKind;Service service;auto workspace=emptyWorkspace();auto& graph=workspace.graphs[0];
+    graph.nodes={defaultNode(K::Float,1),defaultNode(K::Float,2),defaultNode(K::Add,3),defaultNode(K::ImagePreview,4)};
+    node(graph,1).value=5;node(graph,2).value=7;node(graph,4).parameters["max_fps"]=1;
+    graph.links={{1,0,3,0},{2,0,3,1},{3,0,4,1}};publish(service,workspace);service.setPreviewNodes({previewKey(0,4)});
+    service.evaluate(Context{});const auto first=sampleNode(service.telemetry(),0,3);
+    require(first.value.valid&&first.value.number==12&&first.evaluated,"Initial Add diagnostics are incorrect");
+    std::this_thread::sleep_for(std::chrono::milliseconds(35));service.evaluate(Context{});
+    const auto cached=sampleNode(service.telemetry(),0,3);
+    require(cached.value.valid&&cached.value.number==12&&!cached.evaluated&&cached.evaluatedAt==first.evaluatedAt,
+        "A throttled Preview replaced the last upstream value with an artificial invalid zero or recomputed it");
+    node(graph,1).value=9;publish(service,workspace);service.setPreviewNodes({previewKey(0,4)});service.evaluate(Context{});
+    const auto changed=sampleNode(service.telemetry(),0,3);
+    require(changed.value.valid&&changed.value.number==16&&changed.evaluatedAt>first.evaluatedAt,"An edit reused diagnostics from an earlier program revision");
+    service.setPreviewNodes({});std::this_thread::sleep_for(std::chrono::milliseconds(1035));service.evaluate(Context{});
+    const auto expired=sampleNode(service.telemetry(),0,3);
+    require(!expired.value.valid&&expired.evaluatedAt.time_since_epoch().count()==0,"Unused diagnostic values outlived the bounded cache");
+}
 void testPreviewSamplingKeepsUpstreamRuntimeState()
 {
     using K=NodeKind;Fixture fixture;Service service;auto workspace=emptyWorkspace();auto& graph=workspace.graphs[0];

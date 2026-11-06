@@ -31,7 +31,7 @@ int identifier(double value,bool allowZero=false)
     if(!std::isfinite(value)||std::trunc(value)!=value||value<(allowZero?0:1)||value>1000000)throw std::invalid_argument("IDs must be whole numbers from 1 to 1000000 (or 0 for an optional filter).");
     return static_cast<int>(value);
 }
-JsonObject error(const std::string& message){JsonObject result;put(result,L"ok",false);put(result,L"error",message);return result;}
+JsonObject error(const std::string& message,const char* code="invalid_request"){JsonObject result;put(result,L"ok",false);put(result,L"error",message);put(result,L"code",code);return result;}
 std::string version(const std::string& document)
 {
     std::uint64_t hash=14695981039346656037ull;for(unsigned char byte:document){hash^=byte;hash*=1099511628211ull;}
@@ -44,11 +44,15 @@ JsonObject snapshot()
     put(result,L"execution_revision",service().revision());put(result,L"load_failed",editor.loadFailed);put(result,L"load_error",editor.loadError);
     put(result,L"saved",!editor.dirty);return result;
 }
-JsonObject catalog()
+JsonObject catalog(const JsonObject& command)
 {
     JsonArray nodes;
+    std::vector<int> kinds;
+    const bool filtered=command.HasKey(L"kinds");
+    if(filtered)for(const auto& kind:command.GetNamedArray(L"kinds"))kinds.push_back(identifier(kind.GetNumber(),true));
     for(const auto& definition:definitions())
     {
+        if(filtered&&std::find(kinds.begin(),kinds.end(),static_cast<int>(definition.kind))==kinds.end())continue;
         JsonObject item;put(item,L"kind",static_cast<int>(definition.kind));put(item,L"title",definition.title);put(item,L"category",definition.category);put(item,L"description",definition.description);
         put(item,L"can_bypass",canBypass(definition.kind));
         put(item,L"reroute",reroute(definition.kind));put(item,L"shared_calibration_source",definition.kind==NodeKind::MouseProfile);
@@ -135,12 +139,12 @@ std::string NodeEditor_McpCall(const std::string& request,bool userEditing)
         if(request.size()>16*1024*1024)return encode(error("Request exceeds 16 MiB."));
         const auto command=JsonObject::Parse(winrt::to_hstring(request));const auto operation=text(command,L"op");
         if(operation=="read")return encode(snapshot());
-        if(operation=="catalog")return encode(catalog());
+        if(operation=="catalog")return encode(catalog(command));
         if(operation=="application")return encode(applicationSnapshot());
         if(operation=="model_export")return encode(modelExport(command,userEditing));
         if(operation=="application_edit"||operation=="application_action")
         {
-            if(userEditing||editor.pointerMove||editor.keyboardMove||editor.resizeNode||editor.bendGraph>=0||editor.wireNode||editor.rightGesture||editor.panButton>=0)return encode(error("The user is editing. Retry after the current interaction."));
+            if(userEditing||editor.pointerMove||editor.keyboardMove||editor.resizeNode||editor.bendGraph>=0||editor.wireNode||editor.rightGesture||editor.panButton>=0)return encode(error("The user is editing. Retry after the current interaction.","busy"));
             if(operation=="application_edit")return encode(applicationEdit(command));
             std::string issue;if(!Overlay_AgentAction(text(command,L"action"),text(command,L"tab"),issue))return encode(error(issue));
             auto result=applicationSnapshot();put(result,L"queued",true);return encode(result);
@@ -179,37 +183,64 @@ std::string NodeEditor_McpCall(const std::string& request,bool userEditing)
         if(operation=="diagnostics")
         {
             service().requestTelemetry(std::chrono::milliseconds(1000));
-            const auto telemetry=service().telemetry();const auto workspace=service().workspaceMetadata();const auto now=std::chrono::steady_clock::now();JsonArray graphs;
+            const auto telemetry=service().telemetry();const auto workspace=service().workspaceMetadata();const auto revision=service().revision();const auto now=std::chrono::steady_clock::now();JsonArray graphs;
             const int requested=identifier(command.GetNamedNumber(L"workflow",0),true);
             const int requestedNode=identifier(command.GetNamedNumber(L"node",0),true);
             for(std::size_t g=0;g<workspace.graphs.size();++g)
             {
                 const int id=workflowId(workspace.graphs[g],g);if(requested&&requested!=id)continue;
                 JsonObject graph;JsonArray values;put(graph,L"workflow",id);
+                put(graph,L"name",workspace.graphs[g].workflowName);put(graph,L"enabled",workspace.graphs[g].enabled);
                 const auto sampled=telemetry.graphSampledAt[g];const bool hasSample=sampled.time_since_epoch().count()!=0;
                 const double age=hasSample?std::chrono::duration<double,std::milli>(now-sampled).count():-1;
-                put(graph,L"sample_age_ms",age);put(graph,L"current",hasSample&&age<=1000&&telemetry.graphRevisions[g]==service().revision());
+                put(graph,L"sample_age_ms",age);put(graph,L"current",hasSample&&age<=1000&&telemetry.graphRevisions[g]==revision);
                 for(const auto& node:telemetry.graphs[g])if(!requestedNode||requestedNode==node.nodeId)
-                {JsonObject item;put(item,L"node",node.nodeId);put(item,L"active",node.active);put(item,L"signal_active",node.signalActive);put(item,L"read_inputs",std::to_string(node.readInputs));put(item,L"value",liveValue(node.value));values.Append(item);}
+                {
+                    JsonObject item;put(item,L"node",node.nodeId);put(item,L"active",node.active);put(item,L"signal_active",node.signalActive);put(item,L"read_inputs",std::to_string(node.readInputs));put(item,L"value",liveValue(node.value));
+                    const bool evaluated=node.evaluatedAt.time_since_epoch().count()!=0;
+                    put(item,L"evaluated",node.evaluated);put(item,L"cached",evaluated&&!node.evaluated);
+                    put(item,L"value_age_ms",evaluated?std::chrono::duration<double,std::milli>(now-node.evaluatedAt).count():-1);values.Append(item);
+                }
                 put(graph,L"nodes",values);graphs.Append(graph);
             }
-            JsonObject result;put(result,L"ok",true);put(result,L"graphs",graphs);put(result,L"sampling_lease_ms",1000);return encode(result);
+            if(requested&&graphs.Size()==0)return encode(error("Workflow not found.","not_found"));
+            // A node's Boolean status alone cannot establish actual movement
+            // or calibrated recoil. Report the already sampled output actions.
+            JsonObject outputs,movement;put(outputs,L"scope","workspace");
+            const auto domainCurrent=[&](bool vision){
+                bool found=false;
+                for(std::size_t g=0;g<workspace.graphs.size();++g)
+                {
+                    const auto& graph=workspace.graphs[g];if(!graph.active||!graph.enabled||(graph.kind==GraphKind::Vision)!=vision)continue;
+                    found=true;const auto sampled=telemetry.graphSampledAt[g];
+                    if(sampled.time_since_epoch().count()==0||now-sampled>std::chrono::seconds(1)||telemetry.graphRevisions[g]!=revision)return false;
+                }
+                return found;
+            };
+            put(outputs,L"control_current",domainCurrent(false));put(outputs,L"vision_current",domainCurrent(true));
+            const auto& actions=telemetry.actions;put(outputs,L"aim",actions.aim);put(outputs,L"auto_shoot",actions.autoShoot);put(outputs,L"recoil",actions.recoil);
+            put(outputs,L"recoil_strength",actions.recoilStrength);put(outputs,L"recoil_pixel_delta_y",actions.recoilPixelDeltaY);
+            long long dx=0,dy=0;std::size_t steps=0;for(const auto& output:actions.movements)for(const auto& step:output.steps){dx+=step.dx;dy+=step.dy;++steps;}
+            put(movement,L"dx",dx);put(movement,L"dy",dy);put(movement,L"steps",steps);put(movement,L"outputs",actions.movements.size());put(outputs,L"movement",movement);
+            put(outputs,L"vision_detections",actions.visionDetections?actions.visionDetections->objects.size():0);
+            put(outputs,L"active_providers",actions.activeProviderKeys.size());put(outputs,L"active_depth",actions.activeDepthKeys.size());put(outputs,L"active_masks",actions.activeMaskKeys.size());put(outputs,L"active_renders",actions.activeRenderKeys.size());
+            JsonObject result;put(result,L"ok",true);put(result,L"graphs",graphs);put(result,L"outputs",outputs);put(result,L"execution_revision",revision);put(result,L"sampling_lease_ms",1000);return encode(result);
         }
         if(operation!="commit"&&operation!="history"&&operation!="focus")return encode(error("Unknown editor operation."));
         const auto current=snapshot();
-        if(text(command,L"expected_version")!=text(current,L"version"))return encode(error("Version conflict. Read the current workspace and retry; no changes were applied."));
+        if(text(command,L"expected_version")!=text(current,L"version"))return encode(error("Version conflict. Read the current workspace and retry; no changes were applied.","version_conflict"));
         if(userEditing||editor.pointerMove||editor.keyboardMove||editor.resizeNode||editor.bendGraph>=0||editor.wireNode||editor.rightGesture||editor.panButton>=0)
-            return encode(error("The user is editing the graph. Retry after the current interaction; no changes were applied."));
+            return encode(error("The user is editing the graph. Retry after the current interaction; no changes were applied.","busy"));
         if(operation=="focus")
         {
             const int workflow=identifier(command.GetNamedNumber(L"workflow"));const auto workspace=service().workspaceMetadata();const int graph=activePage(workspace,workflow);
-            const int node=identifier(command.GetNamedNumber(L"node",0),true);if(graph<0||(node&&!findNode(service().workspace().graphs[graph],node)))return encode(error("Workflow or node not found."));
+            const int node=identifier(command.GetNamedNumber(L"node",0),true);if(graph<0||(node&&!findNode(service().workspace().graphs[graph],node)))return encode(error("Workflow or node not found.","not_found"));
             Overlay_OpenGraphNode(graph,node);return encode(snapshot());
         }
         if(operation=="history")
         {
             const bool redo=command.GetNamedBoolean(L"redo",false);
-            if(redo?editor.redo.empty():editor.undo.empty())return encode(error(redo?"Nothing to redo.":"Nothing to undo."));
+            if(redo?editor.redo.empty():editor.undo.empty())return encode(error(redo?"Nothing to redo.":"Nothing to undo.","empty_history"));
             history(redo);NodeEditor_Flush();return encode(snapshot());
         }
         Workspace candidate;std::string issue;

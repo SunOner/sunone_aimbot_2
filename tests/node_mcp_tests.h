@@ -12,6 +12,8 @@ void testMcpEditorTransactions()
     JsonObject catalogCommand;put(catalogCommand,L"op","catalog");const auto catalog=call(catalogCommand);
     require(catalog.GetNamedArray(L"nodes").Size()==definitions().size(),"MCP hides node kinds from agents");
     require(catalog.GetNamedArray(L"nodes").GetObjectAt(static_cast<unsigned>(NodeKind::Boolean)).GetNamedObject(L"defaults").GetNamedNumber(L"value")==1,"MCP defaults differ from actual Boolean source defaults");
+    JsonArray kinds;kinds.Append(JsonValue::CreateNumberValue(static_cast<int>(NodeKind::Boolean)));put(catalogCommand,L"kinds",kinds);
+    require(call(catalogCommand).GetNamedArray(L"nodes").Size()==1,"MCP ignored the exact catalog filter");
     std::filesystem::create_directory("models");{std::ofstream fixture("models/custom.onnx");fixture<<"Model-name discovery fixture, never loaded";}
     modelMenu.value="Existing picker selection";const auto scans=modelMenu.scans;
     JsonObject sourceCommand;put(sourceCommand,L"op","sources");const auto sources=call(sourceCommand);
@@ -28,11 +30,12 @@ void testMcpEditorTransactions()
     Workspace normalized;std::string issue;require(deserialize(text(preview,L"document"),normalized,issue),"MCP preview did not return a valid document");
     require(findNode(normalized.graphs[0],1)->x==32&&std::fmod(findNode(normalized.graphs[0],1)->width,32)==0,"MCP bypassed grid normalization");
     const auto command=proposal(candidate,original);
-    require(!JsonObject::Parse(winrt::to_hstring(NodeEditor_McpCall(encode(command),true))).GetNamedBoolean(L"ok"),"MCP overwrote an active user interaction");
+    const auto busy=JsonObject::Parse(winrt::to_hstring(NodeEditor_McpCall(encode(command),true)));
+    require(!busy.GetNamedBoolean(L"ok")&&text(busy,L"code")=="busy","MCP overwrote an active user interaction or lost its error code");
     auto applied=call(command);require(applied.GetNamedBoolean(L"ok")&&applied.GetNamedBoolean(L"applied")&&applied.GetNamedBoolean(L"saved"),"MCP did not apply and persist a valid transaction");
     require(editor.undo.size()==undoCount+1&&service().revision()==revision,"A presentation-only MCP edit affected execution or created multiple Undo steps");
     require(text(applied,L"version")!=text(original,L"version"),"MCP versioning ignores presentation-only edits");
-    require(!call(command).GetNamedBoolean(L"ok"),"A stale MCP version overwrote a newer workspace");
+    const auto conflict=call(command);require(!conflict.GetNamedBoolean(L"ok")&&text(conflict,L"code")=="version_conflict","A stale MCP version overwrote a newer workspace or lost its error code");
     require(std::filesystem::is_regular_file(GraphFile),"A remote transaction did not autosave");
     JsonObject broken;put(broken,L"op","commit");put(broken,L"expected_version",text(applied,L"version"));put(broken,L"document","SUNONE_NODE_GRAPH 20\nPAGES 1\nGRAPH 0 0 0 1 2 2 0 0\nPAGE 1 1 1 \"Invalid\" \"\" -1\nNODE 1 16 0 0 0 0 0 0 0 0 0 0 0 0\nNODE 2 16 64 0 0 0 0 0 0 0 0 0 0 0\nLINK 1 0 2 0 0 0.58 0\nLINK 2 0 1 0 0 0.58 0\nEND\n");
     require(!call(broken).GetNamedBoolean(L"ok")&&text(call(readCommand),L"version")==text(applied,L"version")&&editor.undo.size()==undoCount+1,"Invalid MCP input partially changed the workspace");
@@ -50,6 +53,9 @@ void testMcpDiagnosticsLease()
     service().setTelemetryEnabled(false);service().requestTelemetry(std::chrono::milliseconds(0));
     JsonObject command;put(command,L"op","diagnostics");const auto response=JsonObject::Parse(winrt::to_hstring(NodeEditor_McpCall(encode(command))));
     require(response.GetNamedBoolean(L"ok")&&response.GetNamedNumber(L"sampling_lease_ms")==1000,"MCP cannot request bounded diagnostics");
+    require(response.GetNamedNumber(L"execution_revision")==service().revision(),"MCP diagnostics omitted the sampled execution revision");
+    put(command,L"workflow",999999);const auto missing=JsonObject::Parse(winrt::to_hstring(NodeEditor_McpCall(encode(command))));
+    require(!missing.GetNamedBoolean(L"ok")&&text(missing,L"code")=="not_found","MCP reported success for missing workflow diagnostics");
     std::this_thread::sleep_for(std::chrono::milliseconds(35));NodeGraph::Context context;service().evaluate(context);
     const auto sampled=service().telemetry().graphSampledAt[0];require(sampled.time_since_epoch().count()!=0,"Hidden runtime ignored the remote telemetry lease");
     service().requestTelemetry(std::chrono::milliseconds(0));std::this_thread::sleep_for(std::chrono::milliseconds(35));service().evaluate(context);

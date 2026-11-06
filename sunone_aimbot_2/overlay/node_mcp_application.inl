@@ -113,7 +113,7 @@ JsonObject applicationSnapshot()
 }
 JsonObject applicationEdit(const JsonObject& command)
 {
-    const auto before=applicationSnapshot();if(text(command,L"expected_settings_version")!=text(before,L"settings_version"))return error("Settings version conflict. Read get_application and retry; no settings were applied.");
+    const auto before=applicationSnapshot();if(text(command,L"expected_settings_version")!=text(before,L"settings_version"))return error("Settings version conflict. Read get_application and retry; no settings were applied.","version_conflict");
     Config next=config;const auto changes=command.GetNamedObject(L"settings");if(changes.Size()==0)return error("Provide at least one setting.");
     JsonArray restart;
     for(const auto& entry:changes)
@@ -131,7 +131,7 @@ JsonObject applicationEdit(const JsonObject& command)
 JsonObject modelExport(const JsonObject& command,bool userEditing)
 {
     const auto action=text(command,L"action",L"status");
-    if(action!="status"&&userEditing)return error("The user is editing. Retry after the current interaction.");
+    if(action!="status"&&userEditing)return error("The user is editing. Retry after the current interaction.","busy");
     if(action=="cancel")ModelExport::cancel();
     else if(action=="start")
     {
