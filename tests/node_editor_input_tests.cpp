@@ -1290,6 +1290,9 @@ void testWireAnimationIsContinuousAcrossGeometryAndZoom()
     advanceWireAnimation(large,350,1.75f,event,1,1);
     require(std::abs(normal.phase-small.phase)<0.000001&&std::abs(normal.phase-large.phase)<0.000001,
         "Zoom changed the pulse speed relative to the graph");
+    WireAnimation veryLong;
+    advanceWireAnimation(veryLong,12000,1,event,1,1);
+    require(veryLong.phase==normal.phase&&veryLong.activity==normal.activity,"A long wire delayed a data pulse");
     advanceWireAnimation(animation,201,1,event,2,4);
     require(animation.activity==0&&animation.phase==1,"A signal looped or survived its bounded lifetime");
     advanceWireAnimation(animation,201,1,event,3,5);
@@ -1320,6 +1323,35 @@ void testWireAnimationIsContinuousAcrossGeometryAndZoom()
     require(telemetryFresh(0,now),"A current completed graph sample was rejected");
     --editor.live.graphRevisions[0];
     require(!telemetryFresh(0,now),"A late result from the previous graph version was highlighted as current data");
+}
+
+void testWirePulsesPreserveTypeColorsWithoutExtraGeometry()
+{
+    gestureScenario="Whole-wire colored pulses without particles or extra geometry";
+    EditorHarness harness;
+    for(const auto type:{ValueType::Boolean,ValueType::Float,ValueType::Integer,ValueType::Point,ValueType::Movement,ValueType::Detections})
+    {
+        const ImU32 color=wireColor(type,true,false),idle=wirePulseColor(color,0),peak=wirePulseColor(color,1);
+        require((idle&IM_COL32_A_MASK)==(color&IM_COL32_A_MASK)&&(peak&IM_COL32_A_MASK)==(color&IM_COL32_A_MASK),"A wire pulse changed opacity instead of its color intensity");
+        require((peak&0x00ffffff)==(color&0x00ffffff)&&idle!=peak,"A wire pulse washed out the port type color or had no contrast");
+        const int r=(color>>IM_COL32_R_SHIFT)&255,g=(color>>IM_COL32_G_SHIFT)&255,b=(color>>IM_COL32_B_SHIFT)&255;
+        for(float level:{0.0f,0.25f,0.6f,1.0f})
+        {
+            const auto shade=wirePulseColor(color,level);const int sr=(shade>>IM_COL32_R_SHIFT)&255,sg=(shade>>IM_COL32_G_SHIFT)&255,sb=(shade>>IM_COL32_B_SHIFT)&255;
+            require(std::abs(sr*g-sg*r)<=255&&std::abs(sg*b-sb*g)<=255&&std::abs(sr*b-sb*r)<=255,"A pulse shifted the type hue toward white");
+        }
+        for(float zoom:{0.25f,1.0f,1.75f})
+        {
+            RoutedWire route;route.path=wirePath({10,10},{800*zoom,300*zoom},zoom);
+            ImDrawList draw(ImGui::GetDrawListSharedData());draw._ResetForNewFrame();draw.PushClipRectFullScreen();
+            WireAnimation animation;wire(&draw,route,color,2*zoom,animation);
+            const auto quiet=draw.VtxBuffer;const int indices=draw.IdxBuffer.Size;
+            draw._ResetForNewFrame();draw.PushClipRectFullScreen();animation.activity=1;wire(&draw,route,color,2*zoom,animation);
+            require(draw.VtxBuffer.Size==quiet.Size&&draw.IdxBuffer.Size==indices,"A pulse added particles or another wire mesh");
+            for(int vertex=0;vertex<quiet.Size;++vertex)
+                require(distanceSquared(draw.VtxBuffer[vertex].pos,quiet[vertex].pos)==0&&(draw.VtxBuffer[vertex].col&0x00ffffff)==(color&0x00ffffff),"A pulse moved along the wire or added a white highlight");
+        }
+    }
 }
 
 void testWireSplinesAreSmoothAndScaleInvariant()
@@ -1928,6 +1960,37 @@ void testRouteCacheInvalidationAndAffineNavigation()
     for(std::size_t i=0;i<cached.size();++i)
         require(distanceSquared(cached[i],cache.routes[0].path[i])<0.01f,"Cached and rebuilt spline geometry differ after zoom");
 }
+void testNodeActivityFadesSmoothlyAndIndependentlyOfFrameRate()
+{
+    gestureScenario="Smooth node activity without delaying live values";
+    EditorHarness harness;
+    NodeDisplay display;auto node=defaultNode(NodeKind::Clamp,1);NodeValue sample;
+    sample.value.type=ValueType::Number;sample.signalSequence=1;sample.active=sample.signalActive=true;
+    const auto origin=std::chrono::steady_clock::now();sample.signaledAt=origin;
+    const auto update=[&](double time){return updateNodeDisplay(display,node,&sample,false,false,time,
+        origin+std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(time)));};
+    require(update(0)==0&&display.activeFade==0,"A node jumped to full brightness on the first event");
+    const float rising=update(.016),active=display.activeFade;
+    require(rising>0&&rising<.35f&&active>0&&active<1,"A node did not ease into its activity highlight");
+    require(update(.032)>rising&&display.activeFade>active,"The activity highlight did not rise smoothly");
+    update(.08);const float before=display.activeFade;sample.active=false;
+    update(.096);require(display.activeFade>0&&display.activeFade<before,"The activity strip switched off abruptly");
+    const float tail=update(.24);require(tail>0&&tail<rising,"A finished event did not retain a short smooth fade");
+    require(update(.32)<tail&&update(.8)==0&&display.activeFade==0,"A stopped node did not finish fading out");
+
+    float reference=0;
+    for(int fps:{30,60,240})
+    {
+        NodeDisplay state;NodeValue current;current.active=true;
+        for(int frame=0;frame<=fps/10;++frame)
+            updateNodeDisplay(state,node,&current,false,false,static_cast<double>(frame)/fps,origin);
+        if(!reference)reference=state.activeFade;
+        require(std::abs(state.activeFade-reference)<0.0001f,"Node activity easing depends on render FPS");
+    }
+    editor.canvasRoutes[0].displays.push_back(display);invalidateActivity(0);
+    const auto& reset=editor.canvasRoutes[0].displays.back();
+    require(reset.glow==0&&reset.activeFade==0&&reset.visualAt<0,"A new graph revision retained activity from the previous program");
+}
 void testHotNodeDisplayIsThrottledAndEditsAreImmediate()
 {
     gestureScenario="Rapid data is coalesced without delaying edits or errors";
@@ -2129,7 +2192,7 @@ int main(int argc,char** argv)
         run("testCoalescedReleaseFinalizesEveryDrag",testCoalescedReleaseFinalizesEveryDrag);run("testReleaseBackAtOriginRestoresDrag",testReleaseBackAtOriginRestoresDrag);
         run("testComboAnimationAdvancesOnceAndRespectsParentAlpha",testComboAnimationAdvancesOnceAndRespectsParentAlpha);
         run("testRerouteIsRenderedAsOnePoint",testRerouteIsRenderedAsOnePoint);run("testReroutePointAcceptsBothWireDirections",testReroutePointAcceptsBothWireDirections);
-        run("testWireAnimationIsContinuousAcrossGeometryAndZoom",testWireAnimationIsContinuousAcrossGeometryAndZoom);run("testWireSplinesAreSmoothAndScaleInvariant",testWireSplinesAreSmoothAndScaleInvariant);run("testWirePositionsFollowTheDrawnArcLength",testWirePositionsFollowTheDrawnArcLength);
+        run("testWireAnimationIsContinuousAcrossGeometryAndZoom",testWireAnimationIsContinuousAcrossGeometryAndZoom);run("testWirePulsesPreserveTypeColorsWithoutExtraGeometry",testWirePulsesPreserveTypeColorsWithoutExtraGeometry);run("testWireSplinesAreSmoothAndScaleInvariant",testWireSplinesAreSmoothAndScaleInvariant);run("testWirePositionsFollowTheDrawnArcLength",testWirePositionsFollowTheDrawnArcLength);
         run("testManualBendGesturesAcrossZoom",testManualBendGesturesAcrossZoom);run("testBendCancellationAndFineControl",testBendCancellationAndFineControl);run("testManualBendsKeepTiesClipboardAndCache",testManualBendsKeepTiesClipboardAndCache);run("testBendHandlesRespectOtherControls",testBendHandlesRespectOtherControls);
         run("testSelectionClipboardIsPortableAndTransactional",testSelectionClipboardIsPortableAndTransactional);
         run("testQuickAddConnectsBothDirectionsAndKeepsOldInputUntilSuccess",testQuickAddConnectsBothDirectionsAndKeepsOldInputUntilSuccess);
@@ -2148,7 +2211,7 @@ int main(int argc,char** argv)
         run("testGroupKeyboardMoveDuplicateAndClipboard",testGroupKeyboardMoveDuplicateAndClipboard);run("testLeavingEditorCancelsPreviewAndDefersAutosave",testLeavingEditorCancelsPreviewAndDefersAutosave);
         run("testKeyboardPortsConnectFollowAndDisconnect",testKeyboardPortsConnectFollowAndDisconnect);run("testControlSaveWorksFromProperties",testControlSaveWorksFromProperties);
         run("testCatalogCanBeTraversedWithKeyboard",testCatalogCanBeTraversedWithKeyboard);run("testZGestureRemovesCrossedTiesWithoutCuttingWires",testZGestureRemovesCrossedTiesWithoutCuttingWires);
-        run("testRouteCacheInvalidationAndAffineNavigation",testRouteCacheInvalidationAndAffineNavigation);run("testHotNodeDisplayIsThrottledAndEditsAreImmediate",testHotNodeDisplayIsThrottledAndEditsAreImmediate);run("testOutputWaitingAndRealErrorsRemainDistinct",testOutputWaitingAndRealErrorsRemainDistinct);run("testLargeGraphAnimationAndTextBudgets",testLargeGraphAnimationAndTextBudgets);
+        run("testRouteCacheInvalidationAndAffineNavigation",testRouteCacheInvalidationAndAffineNavigation);run("testNodeActivityFadesSmoothlyAndIndependentlyOfFrameRate",testNodeActivityFadesSmoothlyAndIndependentlyOfFrameRate);run("testHotNodeDisplayIsThrottledAndEditsAreImmediate",testHotNodeDisplayIsThrottledAndEditsAreImmediate);run("testOutputWaitingAndRealErrorsRemainDistinct",testOutputWaitingAndRealErrorsRemainDistinct);run("testLargeGraphAnimationAndTextBudgets",testLargeGraphAnimationAndTextBudgets);
         run("testDisplayCacheRefreshesAfterRevisionAndReopen",testDisplayCacheRefreshesAfterRevisionAndReopen);
         std::cout << "Node editor input tests passed\n";
         return 0;

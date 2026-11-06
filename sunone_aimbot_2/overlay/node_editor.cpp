@@ -97,12 +97,12 @@ float nodeSettingsTop(const Node& node)
     return Layout::settingsTop(node);
 }
 const ImU32 Cyan = IM_COL32(96, 205, 255, 255);
+constexpr float WirePulseDuration=0.18f;
 struct WireAnimation
 {
     std::uint64_t signal=0;
     double born=-1;
     double started=-1;
-    float duration=0.25f;
     double phase=1;
     float strength=0;
     float activity=0;
@@ -161,8 +161,8 @@ struct NodeDisplay
     int id=0;
     NodeKind kind=NodeKind::Count;
     std::uint64_t sequence=0,textSequence=0,formats=0,flashes=0;
-    double lastEvent=-1,flashAt=-1,lastFlash=-1,rapidUntil=-1,textAt=-1,constant=0;
-    float strength=0;
+    double lastEvent=-1,flashAt=-1,lastFlash=-1,rapidUntil=-1,textAt=-1,constant=0,visualAt=-1;
+    float strength=0,glow=0,activeFade=0;
     int quickEvents=0;
     bool available=false,disabled=false;
     std::string text,error;
@@ -1648,23 +1648,25 @@ ImVec2 wirePosition(const std::vector<ImVec2>& path,float distance)
     }
     return path.back();
 }
-void advanceWireAnimation(WireAnimation& animation,float length,float scale,const SignalEvent& event,double now,int frame,bool allowStart=true)
+void advanceWireAnimation(WireAnimation& animation,float,float,const SignalEvent& event,double now,int frame,bool allowStart=true)
 {
     if(animation.frame==frame)return;
     animation.frame=frame;
-    if(animation.started>=0)animation.phase=std::clamp((now-animation.born)/animation.duration,0.0,1.0);
+    if(animation.started>=0)animation.phase=std::clamp((now-animation.born)/WirePulseDuration,0.0,1.0);
     if(event.sequence!=animation.signal)
     {
         animation.signal=event.sequence;
-        if(allowStart&&animation.phase>=1&&now-animation.started>=MinSignalInterval&&event.sequence&&event.strength>0&&event.age>=0&&event.age<SignalDuration)
+        if(allowStart&&animation.phase>=1&&now-animation.started>=MinSignalInterval&&event.sequence&&event.strength>0&&event.age>=0&&event.age<WirePulseDuration)
         {
             animation.born=now-event.age;animation.started=now;
-            animation.duration=std::clamp(length/std::max(1.0f,720*scale),0.12f,0.36f);
             animation.strength=std::clamp(event.strength,0.0f,1.0f);
-            animation.phase=std::clamp((now-animation.born)/animation.duration,0.0,1.0);
+            animation.phase=std::clamp((now-animation.born)/WirePulseDuration,0.0,1.0);
         }
     }
-    animation.activity=animation.strength*static_cast<float>((1-animation.phase)*std::min(1.0,animation.phase*10+0.2));
+    // The whole wire responds immediately; length and zoom never delay data.
+    const float t=static_cast<float>(animation.phase);
+    const float attack=0.2f+0.8f*std::min(1.0f,t/0.08f);
+    animation.activity=animation.strength*attack*(1-t*t*(3-2*t));
 }
 ImVec2 routedPosition(const RoutedWire& route,float phase)
 {
@@ -1677,15 +1679,20 @@ ImVec2 routedPosition(const RoutedWire& route,float phase)
     const float length=route.cumulative[i]-route.cumulative[i-1];const float t=length>0?(at-route.cumulative[i-1])/length:0;
     return add(route.path[i-1],ImVec2((route.path[i].x-route.path[i-1].x)*t,(route.path[i].y-route.path[i-1].y)*t));
 }
-void wire(ImDrawList* draw,const RoutedWire& route,ImU32 color,float thickness,const WireAnimation& animation,float scale)
+ImU32 wirePulseColor(ImU32 color,float activity)
+{
+    // Scale all RGB channels together to preserve the type hue, including at
+    // the pulse peak. Alpha and geometry stay fixed; no white core or particles.
+    const float gain=0.74f+0.26f*std::clamp(activity,0.0f,1.0f);
+    return (color&IM_COL32_A_MASK)|IM_COL32(
+        static_cast<int>(((color>>IM_COL32_R_SHIFT)&255)*gain),
+        static_cast<int>(((color>>IM_COL32_G_SHIFT)&255)*gain),
+        static_cast<int>(((color>>IM_COL32_B_SHIFT)&255)*gain),0);
+}
+void wire(ImDrawList* draw,const RoutedWire& route,ImU32 color,float thickness,const WireAnimation& animation)
 {
     const auto& path=route.path;
-    draw->AddPolyline(path.data(),static_cast<int>(path.size()),color,0,thickness);
-    if(animation.activity<0.001f)return;
-    const ImU32 rgb=color&0x00ffffff;
-    const ImVec2 position=routedPosition(route,static_cast<float>(animation.phase));
-    draw->AddCircleFilled(position,std::clamp(5*scale,3.0f,6.0f),rgb|IM_COL32(0,0,0,static_cast<int>(30*animation.activity)),8);
-    draw->AddCircleFilled(position,std::clamp(2.2f*scale,1.2f,3.0f),IM_COL32(220,245,255,static_cast<int>(230*animation.activity)),8);
+    draw->AddPolyline(path.data(),static_cast<int>(path.size()),wirePulseColor(color,animation.activity),0,thickness);
 }
 void previewWire(ImDrawList* draw,ImVec2 start,ImVec2 end,ImU32 color)
 {
@@ -2263,6 +2270,7 @@ void invalidateActivity(std::size_t graph)
     {
         display.sequence=display.textSequence=0;display.textAt=display.lastEvent=display.flashAt=display.lastFlash=display.rapidUntil=-1;
         display.quickEvents=0;display.strength=0;
+        display.glow=display.activeFade=0;display.visualAt=-1;
     }
     for(auto it=editor.wireAnimations.begin();it!=editor.wireAnimations.end();)
         if(it->first[0]==static_cast<int>(graph))it=editor.wireAnimations.erase(it);else++it;
@@ -2334,10 +2342,24 @@ float updateNodeDisplay(NodeDisplay& display,const Node& node,const NodeValue* s
         display.kind=node.kind;display.disabled=node.disabled;display.available=available;display.error=error;display.constant=node.value;
         display.textSequence=sequence;display.textAt=now;++display.formats;
     }
-    if(rapid)return 0.16f*display.strength*std::clamp(static_cast<float>((display.rapidUntil-now)/0.1),0.0f,1.0f);
-    if(display.flashAt<0||now-display.flashAt>=SignalDuration)return 0;
-    const float fade=std::clamp(1-static_cast<float>((now-display.flashAt)/SignalDuration),0.0f,1.0f);
-    return fade*fade*display.strength;
+    float target=0;
+    if(rapid)target=0.16f*display.strength*std::clamp(static_cast<float>((display.rapidUntil-now)/0.1),0.0f,1.0f);
+    else if(display.flashAt>=0&&now-display.flashAt<SignalDuration)
+    {
+        const float fade=std::clamp(1-static_cast<float>((now-display.flashAt)/SignalDuration),0.0f,1.0f);
+        target=fade*fade*display.strength;
+    }
+    // Smooth only the visual response. Values, errors and execution retain
+    // their immediate updates; hot streams still use the low steady highlight.
+    const float elapsed=display.visualAt<0?0:static_cast<float>(std::max(0.0,now-display.visualAt));
+    display.visualAt=now;
+    const float attack=1-std::exp(-elapsed/0.04f),release=1-std::exp(-elapsed/0.07f);
+    const float active=sample&&!node.disabled&&(sample->active||(available&&rapid))?1.0f:0.0f;
+    display.glow+=(target-display.glow)*(target>display.glow?attack:release);
+    display.activeFade+=(active-display.activeFade)*(active>display.activeFade?attack:release);
+    if(target==0&&display.glow<0.001f)display.glow=0;
+    if(active==0&&display.activeFade<0.001f)display.activeFade=0;
+    return display.glow;
 }
 SignalEvent wireSignal(const NodeValue* source,const NodeValue* target,int pin,std::chrono::steady_clock::time_point now)
 {
@@ -2487,13 +2509,13 @@ const std::string& catalogDefaultValue(const InputDefaultDisplay& value)
 {
     return value.kind==InputDefaultKind::Number||value.kind==InputDefaultKind::Text?value.fullText:value.text;
 }
-void drawNodeShell(ImDrawList* draw,ImVec2 p,ImVec2 q,float header,float zoom,ImU32 accent,bool bypassed,bool selected,float hoverFade,bool active,float signal)
+void drawNodeShell(ImDrawList* draw,ImVec2 p,ImVec2 q,float header,float zoom,ImU32 accent,bool bypassed,bool selected,float hoverFade,float active,float signal)
 {
     draw->AddRectFilled(add(p,ImVec2(3,4)),add(q,ImVec2(3,4)),IM_COL32(0,0,0,50),6*zoom);
     draw->AddRectFilled(p,q,bypassed?IM_COL32(33,34,38,255):IM_COL32(37,39,44,255),6*zoom);
     draw->AddRectFilled(p,ImVec2(q.x,p.y+header),IM_COL32(46,49,55,255),6*zoom);
     draw->AddRect(p,q,selected?Cyan:IM_COL32(74+static_cast<int>(26*hoverFade),79+static_cast<int>(35*hoverFade),88+static_cast<int>(43*hoverFade),255),6*zoom,0,selected?2.0f:1.0f);
-    draw->AddRectFilled(add(p,ImVec2(0,8*zoom)),add(p,ImVec2(3*zoom,24*zoom)),(accent&0x00ffffff)|IM_COL32(0,0,0,active?230:85),2);
+    draw->AddRectFilled(add(p,ImVec2(0,8*zoom)),add(p,ImVec2(3*zoom,24*zoom)),(accent&0x00ffffff)|IM_COL32(0,0,0,85+static_cast<int>(145*active)),2);
     if(signal>0.01f)draw->AddRect(p,q,(accent&0x00ffffff)|IM_COL32(0,0,0,static_cast<int>(210*signal)),6*zoom,0,1.0f+signal);
 }
 struct LocalSettingsRow {ImRect label,value;};
@@ -4088,7 +4110,7 @@ void canvas(Graph& graph, int index)
             if(signalPulses>=pulseBudget)animation.activity=0;
             else ++signalPulses;
         }
-        wire(draw,route,color,2*graph.zoom,animation,graph.zoom);
+        wire(draw,route,color,2*graph.zoom,animation);
     }
     editor.drawnSignalPulses=signalPulses;
     int hoverBend=drawWireBendHandle(draw,graph,index,routes,origin,end,hovered,leftGesture,hoverLink);
@@ -4164,8 +4186,7 @@ void canvas(Graph& graph, int index)
         const ImU32 accent = node.disabled?IM_COL32(133,141,154,255):node.bypassed?IM_COL32(211,176,114,255):def.outputs.empty() ? Cyan : pinColor(def.outputs.front().type);
         if(!isReroute)
         {
-            const bool active=sample&&(sample->active||(value->valid&&ImGui::GetTime()<display.rapidUntil));
-            drawNodeShell(draw,p,q,HeaderHeight*graph.zoom,graph.zoom,accent,node.bypassed,selected,hoverFade,active,signal);
+            drawNodeShell(draw,p,q,HeaderHeight*graph.zoom,graph.zoom,accent,node.bypassed,selected,hoverFade,display.activeFade,signal);
         }
         const float font = std::max(graph.zoom<0.4f?8.0f:0.0f,ImGui::GetFontSize()*graph.zoom);
         if (!reroute(node.kind))
