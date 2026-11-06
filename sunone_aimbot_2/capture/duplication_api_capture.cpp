@@ -6,6 +6,8 @@
 #include <algorithm>
 #include <cstdint>
 #include <iostream>
+#include <iomanip>
+#include <sstream>
 
 #ifdef USE_CUDA
 #include <cuda_d3d11_interop.h>
@@ -14,9 +16,21 @@
 
 #include "duplication_api_capture.h"
 #include "sunone_aimbot_2.h"
+#include "other_tools.h"
 
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "dxgi.lib")
+
+namespace
+{
+std::string FormatHresult(HRESULT hr)
+{
+    std::ostringstream result;
+    result << "0x" << std::uppercase << std::hex << std::setw(8) << std::setfill('0')
+        << static_cast<uint32_t>(hr);
+    return result.str();
+}
+}
 
 template <typename T>
 inline void SafeRelease(T** ppInterface)
@@ -66,7 +80,8 @@ public:
         int& outScreenWidth,
         int& outScreenHeight,
         ID3D11Device** outDevice,
-        ID3D11DeviceContext** outContext,const std::string& monitorDevice)
+        ID3D11DeviceContext** outContext, const std::string& monitorDevice,
+        std::string& outMonitorDevice)
     {
         HRESULT hr = S_OK;
 
@@ -74,7 +89,7 @@ public:
         hr = CreateDXGIFactory1(__uuidof(IDXGIFactory1), (void**)&factory);
         if (FAILED(hr))
         {
-            std::cerr << "[DDA] CreateDXGIFactory1 failed hr=" << std::hex << hr << std::endl;
+            std::cerr << "[DDA] CreateDXGIFactory1 failed hr=" << FormatHresult(hr) << std::endl;
             return hr;
         }
 
@@ -94,7 +109,7 @@ public:
                 break;
             if (FAILED(hr))
             {
-                std::cerr << "[DDA] EnumAdapters1 failed hr=" << std::hex << hr << std::endl;
+                std::cerr << "[DDA] EnumAdapters1 failed hr=" << FormatHresult(hr) << std::endl;
                 SafeRelease(&factory);
                 return hr;
             }
@@ -107,7 +122,7 @@ public:
                     break;
                 if (FAILED(hr))
                 {
-                    std::cerr << "[DDA] EnumOutputs failed hr=" << std::hex << hr << std::endl;
+                    std::cerr << "[DDA] EnumOutputs failed hr=" << FormatHresult(hr) << std::endl;
                     SafeRelease(&candidateAdapter);
                     SafeRelease(&factory);
                     return hr;
@@ -141,6 +156,20 @@ public:
             return DXGI_ERROR_NOT_FOUND;
         }
 
+        DXGI_OUTPUT_DESC oDesc{};
+        hr = output->GetDesc(&oDesc);
+        if (FAILED(hr))
+        {
+            std::cerr << "[DDA] GetDesc failed hr=" << FormatHresult(hr) << std::endl;
+            SafeRelease(&output);
+            SafeRelease(&adapter);
+            SafeRelease(&factory);
+            return hr;
+        }
+        // DXGI and EnumDisplayMonitors do not necessarily enumerate in the same
+        // order. Preserve the device name for a fallback to another capture API.
+        outMonitorDevice = WideToUtf8(oDesc.DeviceName);
+
         {
             D3D_FEATURE_LEVEL featureLevels[] = { D3D_FEATURE_LEVEL_11_0 };
             UINT createDeviceFlags = 0;
@@ -159,7 +188,7 @@ public:
             );
             if (FAILED(hr))
             {
-                std::cerr << "[DDA] D3D11CreateDevice failed hr=" << std::hex << hr << std::endl;
+                std::cerr << "[DDA] D3D11CreateDevice failed hr=" << FormatHresult(hr) << std::endl;
                 SafeRelease(&output);
                 SafeRelease(&adapter);
                 SafeRelease(&factory);
@@ -177,7 +206,7 @@ public:
         hr = output->QueryInterface(__uuidof(IDXGIOutput1), (void**)&m_output1);
         if (FAILED(hr))
         {
-            std::cerr << "[DDA] QueryInterface(IDXGIOutput1) failed hr=" << std::hex << hr << std::endl;
+            std::cerr << "[DDA] QueryInterface(IDXGIOutput1) failed hr=" << FormatHresult(hr) << std::endl;
             SafeRelease(&m_context);
             SafeRelease(&m_device);
             SafeRelease(&output);
@@ -189,7 +218,12 @@ public:
         hr = m_output1->DuplicateOutput(m_device, &m_duplication);
         if (FAILED(hr))
         {
-            std::cerr << "[DDA] DuplicateOutput failed hr=" << std::hex << hr << std::endl;
+            DXGI_ADAPTER_DESC1 adapterDesc{};
+            adapter->GetDesc1(&adapterDesc);
+            std::cerr << "[DDA] DuplicateOutput failed hr=" << FormatHresult(hr)
+                << (hr == DXGI_ERROR_UNSUPPORTED ? " (DXGI_ERROR_UNSUPPORTED)" : "")
+                << " monitor=" << outMonitorDevice
+                << " adapter=" << WideToUtf8(adapterDesc.Description) << std::endl;
             SafeRelease(&m_output1);
             SafeRelease(&m_context);
             SafeRelease(&m_device);
@@ -201,8 +235,6 @@ public:
 
         m_duplication->GetDesc(&m_duplDesc);
 
-        DXGI_OUTPUT_DESC oDesc{};
-        output->GetDesc(&oDesc);
         outScreenWidth = oDesc.DesktopCoordinates.right - oDesc.DesktopCoordinates.left;
         outScreenHeight = oDesc.DesktopCoordinates.bottom - oDesc.DesktopCoordinates.top;
 
@@ -291,18 +323,18 @@ DuplicationAPIScreenCapture::DuplicationAPIScreenCapture(int desiredWidth, int d
 {
     m_ddaManager = std::make_unique<DDAManager>();
 
-    HRESULT hr = m_ddaManager->Initialize(
+    initializationResult_ = m_ddaManager->Initialize(
         monitorIndex,
         regionWidth,
         regionHeight,
         screenWidth,
         screenHeight,
         &d3dDevice,
-        &d3dContext,monitorDevice
+        &d3dContext, monitorDevice, monitorDevice_
     );
-    if (FAILED(hr))
+    if (FAILED(initializationResult_))
     {
-        std::cerr << "[DDA] DDAManager Initialize failed hr=0x" << std::hex << hr << std::endl;
+        std::cerr << "[DDA] DDAManager Initialize failed hr=" << FormatHresult(initializationResult_) << std::endl;
         return;
     }
 
@@ -312,7 +344,10 @@ DuplicationAPIScreenCapture::DuplicationAPIScreenCapture(int desiredWidth, int d
 
     initialized_ = createStagingTextureCPU();
     if (!initialized_)
+    {
+        initializationResult_ = E_FAIL;
         return;
+    }
 #ifdef USE_CUDA
     createCudaInteropTexture();
 #endif
@@ -358,8 +393,8 @@ cv::Mat DuplicationAPIScreenCapture::GetNextFrameCpu()
     }
     else if (FAILED(hr))
     {
-        std::cerr << "[DuplicationAPIScreenCapture] AcquireNextFrame (CPU) failed hr=0x"
-            << std::hex << hr << std::endl;
+        std::cerr << "[DuplicationAPIScreenCapture] AcquireNextFrame (CPU) failed hr="
+            << FormatHresult(hr) << std::endl;
         if (frameCtx.hasAcquiredFrame)
             m_ddaManager->ReleaseFrame();
         return cv::Mat();
@@ -401,7 +436,7 @@ cv::Mat DuplicationAPIScreenCapture::GetNextFrameCpu()
     HRESULT hrMap = d3dContext->Map(stagingTextureCPU, 0, D3D11_MAP_READ, 0, &mapped);
     if (FAILED(hrMap))
     {
-        std::cerr << "[DDA] Map stagingTextureCPU failed hr=" << std::hex << hrMap << std::endl;
+        std::cerr << "[DDA] Map stagingTextureCPU failed hr=" << FormatHresult(hrMap) << std::endl;
         if (hrMap == DXGI_ERROR_DEVICE_REMOVED || hrMap == DXGI_ERROR_DEVICE_RESET)
             capture_method_changed.store(true);
         return cv::Mat();
@@ -485,8 +520,8 @@ bool DuplicationAPIScreenCapture::GetNextFrameGpu(
     }
     else if (FAILED(hr))
     {
-        std::cerr << "[DuplicationAPIScreenCapture] AcquireNextFrame (GPU) failed hr=0x"
-            << std::hex << hr << std::endl;
+        std::cerr << "[DuplicationAPIScreenCapture] AcquireNextFrame (GPU) failed hr="
+            << FormatHresult(hr) << std::endl;
         if (frameCtx.hasAcquiredFrame)
             m_ddaManager->ReleaseFrame();
         SetGpuCaptureStatus(status, GpuCaptureStatus::AcquireFailed);
@@ -617,7 +652,7 @@ bool DuplicationAPIScreenCapture::createCudaInteropTexture()
     HRESULT hr = d3dDevice->CreateTexture2D(&desc, nullptr, &interopTextureGPU);
     if (FAILED(hr))
     {
-        std::cerr << "[DDA] CreateTexture2D(interop) failed hr=" << std::hex << hr << std::endl;
+        std::cerr << "[DDA] CreateTexture2D(interop) failed hr=" << FormatHresult(hr) << std::endl;
         return false;
     }
 
@@ -680,7 +715,7 @@ bool DuplicationAPIScreenCapture::createStagingTextureCPU()
     HRESULT hr = d3dDevice->CreateTexture2D(&desc, nullptr, &stagingTextureCPU);
     if (FAILED(hr))
     {
-        std::cerr << "[DDA] CreateTexture2D(staging) failed hr=" << std::hex << hr << std::endl;
+        std::cerr << "[DDA] CreateTexture2D(staging) failed hr=" << FormatHresult(hr) << std::endl;
         return false;
     }
     return true;

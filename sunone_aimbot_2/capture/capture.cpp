@@ -203,7 +203,8 @@ void CountGpuCaptureStatus(CudaCaptureDiagnostics& diag, GpuCaptureStatus status
     }
 }
 
-void MaybeLogCudaCaptureDiagnostics(CudaCaptureDiagnostics& diag, const CaptureThreadConfig& cfg)
+void MaybeLogCudaCaptureDiagnostics(CudaCaptureDiagnostics& diag, const CaptureThreadConfig& cfg,
+    const std::string& activeMethod)
 {
     if (!cfg.verbose)
         return;
@@ -215,7 +216,8 @@ void MaybeLogCudaCaptureDiagnostics(CudaCaptureDiagnostics& diag, const CaptureT
     diag.lastLog = now;
     std::cout
         << "[CaptureDiag] backend=" << cfg.backend
-        << " method=" << cfg.capture_method
+        << " method=" << activeMethod
+        << " requested_method=" << cfg.capture_method
         << " capture_fps=" << cfg.capture_fps
         << " use_cuda=" << (cfg.capture_use_cuda ? "true" : "false")
         << " circle_fov=" << (cfg.circle_fov_enabled ? "true" : "false")
@@ -365,21 +367,60 @@ void captureThread(int CAPTURE_WIDTH, int CAPTURE_HEIGHT)
         }
 
         WinrtApartmentGuard winrtApartment;
+        std::string activeCapturerMethod;
+        // Remember an unsupported DDA target so a failed WinRT retry does not
+        // recreate DDA and repeat the same error every second.
+        std::optional<std::pair<int, std::string>> unsupportedDdaTarget;
+        std::string fallbackMonitorDevice;
         auto createCapturer = [&](const CaptureThreadConfig& cfg, int width, int height) -> std::unique_ptr<IScreenCapture>
         {
+            activeCapturerMethod.clear();
             try
             {
                 const std::string method = NormalizeCaptureMethod(cfg.capture_method);
                 if (method != cfg.capture_method)
                     std::cout << "[Capture] Unknown capture_method '" << cfg.capture_method << "'. Falling back to duplication_api." << std::endl;
 
+                const auto target = std::make_pair(cfg.monitor_idx, cfg.capture_monitor_device);
+                if (method != "duplication_api" || (unsupportedDdaTarget && *unsupportedDdaTarget != target))
+                {
+                    unsupportedDdaTarget.reset();
+                    fallbackMonitorDevice.clear();
+                }
+                // The previous capture object must be destroyed before this
+                // call, including a WinRT fallback for a requested DDA backend.
+                winrtApartment.Ensure(method == "winrt" || unsupportedDdaTarget.has_value());
+
                 if (method == "duplication_api")
                 {
-                    if (cfg.verbose)
-                        std::cout << "[Capture] Using Duplication API" << std::endl;
-                    auto capture = std::make_unique<DuplicationAPIScreenCapture>(width, height, cfg.monitor_idx,cfg.capture_monitor_device);
-                    if (!capture->isInitialized())
-                        return nullptr;
+                    if (!unsupportedDdaTarget)
+                    {
+                        if (cfg.verbose)
+                            std::cout << "[Capture] Using Duplication API" << std::endl;
+                        auto capture = std::make_unique<DuplicationAPIScreenCapture>(width, height, cfg.monitor_idx, cfg.capture_monitor_device);
+                        if (capture->isInitialized())
+                        {
+                            activeCapturerMethod = method;
+                            return capture;
+                        }
+                        if (capture->initializationResult() != DXGI_ERROR_UNSUPPORTED || capture->monitorDevice().empty())
+                            return nullptr;
+
+                        fallbackMonitorDevice = capture->monitorDevice();
+                        unsupportedDdaTarget = target;
+                        std::cout << "[Capture] DDA is unsupported for " << fallbackMonitorDevice
+                            << ". Trying WinRT for the same monitor. Inference backend remains " << cfg.backend << "." << std::endl;
+                    }
+
+                    winrtApartment.Ensure(true);
+                    WinRTScreenCapture::Options options;
+                    options.target = "monitor";
+                    options.monitorDevice = fallbackMonitorDevice;
+                    options.captureBorders = cfg.capture_borders;
+                    options.captureCursor = cfg.capture_cursor;
+                    auto capture = std::make_unique<WinRTScreenCapture>(width, height, options);
+                    activeCapturerMethod = "winrt";
+                    std::cout << "[Capture] Using WinRT fallback for " << fallbackMonitorDevice << "." << std::endl;
                     return capture;
                 }
 
@@ -396,20 +437,24 @@ void captureThread(int CAPTURE_WIDTH, int CAPTURE_HEIGHT)
                     options.captureBorders = cfg.capture_borders;
                     options.captureCursor = cfg.capture_cursor;
 
-                    return std::make_unique<WinRTScreenCapture>(width, height, options);
+                    auto capture = std::make_unique<WinRTScreenCapture>(width, height, options);
+                    activeCapturerMethod = method;
+                    return capture;
                 }
 
                 if (method == "virtual_camera")
                 {
                     if (cfg.verbose)
                         std::cout << "[Capture] Using Virtual Camera" << std::endl;
-                    return std::make_unique<VirtualCameraCapture>(
+                    auto capture = std::make_unique<VirtualCameraCapture>(
                         cfg.virtual_camera_width,
                         cfg.virtual_camera_heigth,
                         cfg.virtual_camera_name,
                         cfg.capture_fps,
                         cfg.verbose
                     );
+                    activeCapturerMethod = method;
+                    return capture;
                 }
 
                 if (cfg.verbose)
@@ -417,12 +462,21 @@ void captureThread(int CAPTURE_WIDTH, int CAPTURE_HEIGHT)
                 auto capture = std::make_unique<UDPCapture>(width, height, cfg.udp_ip, cfg.udp_port);
                 if (!capture->isInitialized())
                     return nullptr;
+                activeCapturerMethod = method;
                 return capture;
+            }
+            catch (const winrt::hresult_error& e)
+            {
+                std::cerr << "[Capture] Failed to initialize "
+                    << (unsupportedDdaTarget ? "WinRT fallback" : cfg.capture_method)
+                    << " capture: " << winrt::to_string(e.message()) << std::endl;
+                return nullptr;
             }
             catch (const std::exception& e)
             {
-                std::cerr << "[Capture] Failed to initialize '" << cfg.capture_method
-                    << "' capture: " << e.what() << std::endl;
+                std::cerr << "[Capture] Failed to initialize "
+                    << (unsupportedDdaTarget ? "WinRT fallback" : cfg.capture_method)
+                    << " capture: " << e.what() << std::endl;
                 return nullptr;
             }
         };
@@ -444,12 +498,8 @@ void captureThread(int CAPTURE_WIDTH, int CAPTURE_HEIGHT)
             }
         };
 
-        std::string desiredCaptureMethod = NormalizeCaptureMethod(currentCfg.capture_method);
-        winrtApartment.Ensure(initiallyRequested&&desiredCaptureMethod == "winrt");
-
         std::unique_ptr<IScreenCapture> capturer = initiallyRequested?createCapturer(currentCfg, captureWidth, captureHeight):nullptr;
         publishCaptureSourceSize(capturer.get());
-        std::string activeCapturerMethod = capturer ? desiredCaptureMethod : std::string();
         auto lastCapturerCreateAttempt = std::chrono::steady_clock::now();
         bool waitingForWinrtWindowTarget = !capturer && IsWinrtWindowTargetMissing(currentCfg);
 
@@ -586,30 +636,18 @@ void captureThread(int CAPTURE_WIDTH, int CAPTURE_HEIGHT)
                 }
 
                 const std::string nextMethod = NormalizeCaptureMethod(currentCfg.capture_method);
-                desiredCaptureMethod = nextMethod;
-                const bool nextNeedsWinrt = (nextMethod == "winrt");
 
                 // Always teardown current backend first to avoid overlap between old/new capture objects.
                 // WinRT must be destroyed before apartment teardown.
-                if (capturer)
-                {
-                    const bool activeWasWinrt = (activeCapturerMethod == "winrt");
-                    capturer.reset();
-                    activeCapturerMethod.clear();
-                    if (activeWasWinrt && !nextNeedsWinrt)
-                        winrtApartment.Ensure(false);
-                }
-
-                winrtApartment.Ensure(nextNeedsWinrt);
+                capturer.reset();
+                activeCapturerMethod.clear();
 
                 if (nextMethod == "virtual_camera")
                     VirtualCameraCapture::GetAvailableVirtualCameras(true);
 
                 capturer = createCapturer(currentCfg, captureWidth, captureHeight);
                 publishCaptureSourceSize(capturer.get());
-                if (capturer)
-                    activeCapturerMethod = nextMethod;
-                else
+                if (!capturer)
                 {
                     activeCapturerMethod.clear();
                     waitingForWinrtWindowTarget = IsWinrtWindowTargetMissing(currentCfg);
@@ -634,10 +672,7 @@ void captureThread(int CAPTURE_WIDTH, int CAPTURE_HEIGHT)
                 const auto now = std::chrono::steady_clock::now();
                 if (now - lastCapturerCreateAttempt >= std::chrono::seconds(1))
                 {
-                    desiredCaptureMethod = NormalizeCaptureMethod(currentCfg.capture_method);
-                    winrtApartment.Ensure(desiredCaptureMethod == "winrt");
-
-                    if (desiredCaptureMethod == "virtual_camera")
+                    if (NormalizeCaptureMethod(currentCfg.capture_method) == "virtual_camera")
                         VirtualCameraCapture::GetAvailableVirtualCameras(true);
 
                     capturer = createCapturer(currentCfg, captureWidth, captureHeight);
@@ -647,7 +682,6 @@ void captureThread(int CAPTURE_WIDTH, int CAPTURE_HEIGHT)
                     if (capturer)
                     {
                         waitingForWinrtWindowTarget = false;
-                        activeCapturerMethod = desiredCaptureMethod;
                         lastSuccessfulFrameTime = now;
                         if (currentCfg.verbose)
                             std::cout << "[Capture] Capture backend recovered." << std::endl;
@@ -681,7 +715,7 @@ void captureThread(int CAPTURE_WIDTH, int CAPTURE_HEIGHT)
 
 #ifdef USE_CUDA
             const bool preferGpuCapturePath =
-                NormalizeCaptureMethod(currentCfg.capture_method) == "duplication_api" &&
+                activeCapturerMethod == "duplication_api" &&
                 currentCfg.capture_use_cuda;
             cudaDiag.lastPreferGpu = preferGpuCapturePath;
             cudaDiag.lastNeedCpuCopy = needCpuCopyFromGpu;
@@ -780,7 +814,7 @@ void captureThread(int CAPTURE_WIDTH, int CAPTURE_HEIGHT)
                     if (!frameDuration.has_value())
                         std::this_thread::yield();
 #ifdef USE_CUDA
-                    MaybeLogCudaCaptureDiagnostics(cudaDiag, currentCfg);
+                    MaybeLogCudaCaptureDiagnostics(cudaDiag, currentCfg, activeCapturerMethod);
 #endif
                     applyFrameLimiter();
                     continue;
@@ -810,7 +844,7 @@ void captureThread(int CAPTURE_WIDTH, int CAPTURE_HEIGHT)
                     if (!frameDuration.has_value())
                         std::this_thread::sleep_for(std::chrono::milliseconds(1));
 #ifdef USE_CUDA
-                    MaybeLogCudaCaptureDiagnostics(cudaDiag, currentCfg);
+                    MaybeLogCudaCaptureDiagnostics(cudaDiag, currentCfg, activeCapturerMethod);
 #endif
                     applyFrameLimiter();
                     continue;
@@ -835,7 +869,7 @@ void captureThread(int CAPTURE_WIDTH, int CAPTURE_HEIGHT)
                     if (roiW <= 0 || roiH <= 0)
                     {
 #ifdef USE_CUDA
-                        MaybeLogCudaCaptureDiagnostics(cudaDiag, currentCfg);
+                        MaybeLogCudaCaptureDiagnostics(cudaDiag, currentCfg, activeCapturerMethod);
 #endif
                         applyFrameLimiter();
                         continue;
@@ -896,7 +930,7 @@ void captureThread(int CAPTURE_WIDTH, int CAPTURE_HEIGHT)
             }
 
 #ifdef USE_CUDA
-                MaybeLogCudaCaptureDiagnostics(cudaDiag, currentCfg);
+                MaybeLogCudaCaptureDiagnostics(cudaDiag, currentCfg, activeCapturerMethod);
 #endif
                 applyFrameLimiter();
             }

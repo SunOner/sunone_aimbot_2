@@ -51,6 +51,8 @@ public:
 
     cv::Mat GetNextFrameCpu() override;
     bool isInitialized() const { return initialized_; }
+    HRESULT initializationResult() const { return initializationResult_; }
+    const std::string& monitorDevice() const { return monitorDevice_; }
 #ifdef USE_CUDA
     bool GetNextFrameGpu(
         cv::cuda::GpuMat& gpuFrameBgra,
@@ -81,6 +83,8 @@ private:
     int regionWidth = 0;
     int regionHeight = 0;
     bool initialized_ = false;
+    HRESULT initializationResult_ = E_FAIL;
+    std::string monitorDevice_;
 
     bool createStagingTextureCPU();
 #ifdef USE_CUDA
