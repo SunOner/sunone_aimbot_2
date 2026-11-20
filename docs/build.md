@@ -89,6 +89,47 @@ After a full wrapper build:
 
 This builds the existing app target without dependency setup or CMake reconfiguration. Rerun the full backend wrapper after dependency or build-system changes.
 
+### Optional update and build at startup
+
+In a dedicated clone on `main`, double-click `UPDATE_BUILD.bat`. The menu shows
+the saved backend and schedule for this checkout. Select DML or CUDA, then
+choose **Check and build now** to check system tools, install missing ones and
+verify the first build. Automatic builds start
+only after you enable a trigger. Reopen the same menu to switch backend or disable
+the task. Switching backend takes effect on the next run, including when the two
+backends have last built different commits.
+
+- **At boot** runs before sign-in. Register this trigger from an elevated shell
+  under your own Windows account. Task Scheduler needs your account password
+  (a Windows Hello PIN cannot be used). The build task runs with limited privileges.
+- **At sign-in** runs under your interactive account and requires no stored password.
+- **Install missing Windows build tools** uses WinGet for Git, CMake 3.24+ and
+  Visual Studio Build Tools with the C++ workload and Windows SDK. If an existing
+  Visual Studio installation is incomplete, use Visual Studio Installer to modify
+  the C++ workload. Reopen the terminal after installation. For CUDA, prepare the
+  GPU driver and any vendor downloads listed by the CUDA wrapper before scheduling.
+
+Each run fetches upstream `main`, requires a fast-forward and stops on tracked
+local edits. It builds Release in the usual backend folder and writes a transcript
+to `build/updater/last-DML.log` or `last-CUDA.log`. Ordinary application source
+changes use the incremental target. Documentation-only updates skip compilation.
+Build-system, dependency and unknown changes, missing build outputs or an
+incremental failure trigger dependency setup and a fresh CMake configure/build.
+Prepared dependencies can be reused. A failed build is retried on the next run.
+
+The same actions are available from PowerShell:
+
+```powershell
+.\tools\update_build.ps1 -Action InstallPrerequisites
+.\tools\update_build.ps1 -Action SetBackend -Backend CUDA
+.\tools\update_build.ps1 -Action Run
+.\tools\update_build.ps1 -Action EnableAtBoot
+.\tools\update_build.ps1 -Action Disable
+```
+
+Run `python tests/update_build_integration.py` for offline updater checks using Git,
+PowerShell and fixture build wrappers.
+
 ## 5. What the Wrappers Prepare
 
 Full wrappers import `VsDevCmd.bat`, restore backend dependencies, prepare OpenCV and build `ai.exe` with Ninja Multi-Config. Dependency diagnostics are written to `build\dependency-resolution.json`.
