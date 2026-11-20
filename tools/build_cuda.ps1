@@ -100,7 +100,7 @@ try {
         $resolution = Get-BestCompatibleCudaDependencySet
         if (-not $resolution.TensorRtRoot -and ($copied | Where-Object { $_.id -eq "tensorrt" })) {
             $trtFile = ($copied | Where-Object { $_.id -eq "tensorrt" } | Select-Object -First 1).cached
-            throw "TensorRT archive was extracted but a valid Windows SDK layout was not found. Expected include\NvInfer.h, lib\nvinfer_10.lib, and bin\nvinfer_10.dll under sunone_aimbot_2\modules\TensorRT-*. The file may be source code instead of the Windows binary SDK: $trtFile"
+            throw "TensorRT archive was extracted but a valid Windows SDK layout was not found. Expected include\NvInfer.h, lib\nvinfer_10.lib, lib\nvonnxparser_10.lib, and bin\nvinfer_10.dll under sunone_aimbot_2\modules\TensorRT-*. The file may be source code instead of the Windows binary SDK: $trtFile"
         }
     }
 
