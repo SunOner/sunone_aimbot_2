@@ -1,6 +1,7 @@
+#requires -Version 5.1
 [CmdletBinding()]
 param(
-    [ValidateSet('Menu', 'SetBackend', 'Run', 'EnableAtBoot', 'EnableAtLogon', 'Disable', 'InstallPrerequisites')]
+    [ValidateSet('Menu', 'SetBackend', 'Run', 'EnableAtBoot', 'EnableAtLogon', 'Disable', 'InstallPrerequisites', 'CheckEnvironment')]
     [string]$Action = 'Menu',
     [ValidateSet('CUDA', 'DML')]
     [string]$Backend,
@@ -12,6 +13,9 @@ $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 $upstream = 'https://github.com/SunOner/sunone_aimbot_2.git'
 $logDir = Join-Path $root 'build/updater'
+
+. (Join-Path $PSScriptRoot 'update_environment.ps1')
+Assert-UpdaterHost
 
 function Invoke-RepoGit {
     & git -C $root @args
@@ -28,7 +32,6 @@ function Install-MissingTool {
 }
 
 if ($Action -eq 'InstallPrerequisites') {
-    . (Join-Path $PSScriptRoot 'build_common.ps1')
     if (-not (Get-Command git.exe -ErrorAction SilentlyContinue)) { Install-MissingTool 'Git.Git' }
     try {
         Import-VisualStudioEnvironment
@@ -38,15 +41,15 @@ if ($Action -eq 'InstallPrerequisites') {
         Install-MissingTool 'Microsoft.VisualStudio.2022.BuildTools' @('--override', '--passive --wait --norestart --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended')
         Import-VisualStudioEnvironment
     }
-    $cmake = Get-Command cmake.exe -ErrorAction SilentlyContinue
-    $versionLine = if ($cmake) { @(& $cmake.Source --version)[0] }
-    if ($versionLine -notmatch 'cmake version (\d+\.\d+)' -or [version]$Matches[1] -lt [version]'3.24') {
+    if ((Get-UpdaterCMakeVersion) -lt [version]'3.24') {
         Install-MissingTool 'Kitware.CMake'
     }
     # WinGet installers may update PATH outside this PowerShell process.
     $env:PATH = @($env:PATH, [Environment]::GetEnvironmentVariable('Path', 'Machine'),
         [Environment]::GetEnvironmentVariable('Path', 'User')) -join ';'
     if (-not (Get-Command git.exe -ErrorAction SilentlyContinue)) { throw 'Reopen the terminal to load the installed Git.' }
+    Assert-UpdaterCompiler
+    if ((Get-UpdaterCMakeVersion) -lt [version]'3.24') { throw 'CMake 3.24+ is still unavailable. Reopen PowerShell and check PATH order.' }
     Write-Host 'Windows build tools checked.'
     return
 }
@@ -85,19 +88,30 @@ if (-not $Backend) {
     $Backend = if ([IO.File]::Exists($preference)) { [IO.File]::ReadAllText($preference).Trim() } else { 'DML' }
 }
 
+if ($Action -eq 'CheckEnvironment') {
+    Test-UpdaterEnvironment $Backend
+    return
+}
+
 if ($Action -ne 'Run') {
+    $hasScheduler = [bool](Get-Command Get-ScheduledTask -ErrorAction SilentlyContinue)
+    if (-not $hasScheduler -and $Action -ne 'Menu') {
+        throw 'The ScheduledTasks module is unavailable. Use Windows PowerShell 5.1 for scheduling.'
+    }
     $user = [Security.Principal.WindowsIdentity]::GetCurrent()
     $taskName = "Sunone build update - $($user.User.Value) - $rootKey"
     if ($Action -eq 'Menu') {
         while ($true) {
-            $existing = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
-            $schedule = if (-not $existing) { 'off' }
+            $existing = if ($hasScheduler) { Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue }
+            $schedule = if (-not $hasScheduler) { 'scheduler unavailable' }
+                        elseif (-not $existing) { 'off' }
                         elseif ($existing.Triggers[0].CimClass.CimClassName -eq 'MSFT_TaskBootTrigger') { 'at boot' }
                         else { 'at sign-in' }
             Write-Host "Backend: $Backend | Automatic build: $schedule"
             Write-Host '1) Select DML   2) Select CUDA   3) Check and build now'
             Write-Host '4) Enable at boot   5) Enable at sign-in   6) Disable automatic builds'
-            Write-Host '7) Install missing Windows build tools   0) Exit'
+            Write-Host '7) Install missing Windows build tools'
+            Write-Host '8) Check build environment   0) Exit'
             try {
                 switch (Read-Host 'Choose an option') {
                     '1' { Save-Backend 'DML'; $Backend = 'DML' }
@@ -107,6 +121,7 @@ if ($Action -ne 'Run') {
                     '5' { & $PSCommandPath -Action EnableAtLogon -Backend $Backend }
                     '6' { & $PSCommandPath -Action Disable }
                     '7' { & $PSCommandPath -Action InstallPrerequisites }
+                    '8' { & $PSCommandPath -Action CheckEnvironment -Backend $Backend }
                     '0' { return }
                 }
             }
@@ -118,6 +133,9 @@ if ($Action -ne 'Run') {
             Unregister-ScheduledTask -TaskName $taskName -Confirm:$false
         }
         return
+    }
+    if ($Action -eq 'EnableAtBoot' -and -not ([Security.Principal.WindowsPrincipal]::new($user)).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+        throw 'Register the boot trigger from an elevated PowerShell, or choose the sign-in trigger.'
     }
     Save-Backend $Backend
     $taskArgs = '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}" -Action Run' -f $PSCommandPath
@@ -189,6 +207,9 @@ try {
             & $PSCommandPath -Action InstallPrerequisites
             $prepared = $true
         }
+        if (-not (Get-Command git -CommandType Application -ErrorAction SilentlyContinue)) {
+            throw 'Git is missing. Use Install missing Windows build tools in the menu.'
+        }
         if ((Invoke-RepoGit rev-parse --show-toplevel) -ne ($root -replace '\\','/')) { throw 'Run from a repository checkout.' }
         if ((Invoke-RepoGit branch --show-current) -ne 'main') { throw 'Switch to main or use a dedicated clone.' }
         if (Invoke-RepoGit status --porcelain --untracked-files=no) { throw 'Commit or stash tracked changes before updating.' }
@@ -208,6 +229,7 @@ try {
         if ($mode -eq 'Current') { Write-Host "Ready: $exe"; return }
         if ($mode -ne 'Skip') {
             if ($PrepareSystemTools -and -not $prepared) { & $PSCommandPath -Action InstallPrerequisites }
+            Test-UpdaterEnvironment $Backend -AllowDependencySetup
             # A partial build may change the output. Retry from full setup next time.
             if (Test-Path -LiteralPath $stamp) { Remove-Item -LiteralPath $stamp }
             if ($mode -eq 'Incremental') {

@@ -45,6 +45,14 @@ def run_tests(folder):
     git(source, "config", "user.name", "Fixture")
     git(source, "config", "user.email", "fixture@example.invalid")
     commit("tools/update_build.ps1", SCRIPT.read_text())
+    # The updater's Windows-only probes have their own fixture tests.
+    commit("tools/update_environment.ps1", """
+function Assert-UpdaterHost {}
+function Test-UpdaterEnvironment {
+    param([string]$Backend, [switch]$AllowDependencySetup)
+    if (Test-Path "$PSScriptRoot/../build/broken-toolchain") { throw 'SDK unavailable' }
+}
+""")
     commit(".gitignore", "/build/\n")
     for backend in ("dml", "cuda"):
         commit(f"tools/build_{backend}.ps1", """
@@ -68,6 +76,11 @@ if (Test-Path "$PSScriptRoot/build/dml/fail-incremental") { exit 1 }
     commit("docs/build.md", "docs")
     update(" - Skip")
     commit("sunone_aimbot_2/app.cpp", "code")
+    broken = clone / "build/broken-toolchain"
+    broken.touch()
+    update("SDK unavailable", success=False)
+    assert (clone / "build/dml/last-successful-update.txt").is_file()
+    broken.unlink()
     update(" - Incremental")
     commit("CMakeLists.txt", "changed dependencies")
     update(" - Full")

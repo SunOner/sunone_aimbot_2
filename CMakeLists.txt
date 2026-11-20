@@ -200,6 +200,14 @@ if(AIMBOT_OPENCV_INCLUDE_DIR STREQUAL "" OR
     endif()
 endif()
 
+# Ninja uses the SDK selected by VsDevCmd, including SDKs outside the default drive.
+if(AIMBOT_CPPWINRT_INCLUDE_DIR STREQUAL "" AND DEFINED ENV{WindowsSdkDir} AND DEFINED ENV{WindowsSDKVersion})
+    file(TO_CMAKE_PATH "$ENV{WindowsSdkDir}/Include/$ENV{WindowsSDKVersion}/cppwinrt" _active_cppwinrt)
+    if(EXISTS "${_active_cppwinrt}/winrt/base.h")
+        set(AIMBOT_CPPWINRT_INCLUDE_DIR "${_active_cppwinrt}" CACHE PATH "Path to Windows SDK cppwinrt include directory" FORCE)
+    endif()
+endif()
+
 if(AIMBOT_CPPWINRT_INCLUDE_DIR STREQUAL "")
     if(DEFINED CMAKE_VS_WINDOWS_TARGET_PLATFORM_VERSION AND DEFINED ENV{WindowsSdkDir})
         file(TO_CMAKE_PATH "$ENV{WindowsSdkDir}" _winsdk_dir)

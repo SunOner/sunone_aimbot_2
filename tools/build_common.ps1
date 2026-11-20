@@ -188,12 +188,13 @@ function Get-VisualStudioInstallation {
 function Import-VisualStudioEnvironment {
     param(
         [string]$Architecture = 'x64',
-        [string]$HostArchitecture = 'x64'
+        [string]$HostArchitecture = 'x64',
+        [switch]$Force
     )
 
     $requiredTools = @('cl.exe', 'link.exe', 'rc.exe', 'mt.exe')
     $missingTools = @($requiredTools | Where-Object { -not (Get-CommandPath $_) })
-    if ($missingTools.Count -eq 0) {
+    if (-not $Force -and $missingTools.Count -eq 0) {
         return
     }
 
@@ -497,6 +498,14 @@ function Get-KnownDependencyCompatibilityProfiles {
     )
 }
 
+function Get-NvccRelease {
+    param([string]$CudaRoot)
+    $banner = & (Join-Path $CudaRoot 'bin/nvcc.exe') --version
+    if ($LASTEXITCODE -eq 0 -and ($banner -join ' ') -match '\brelease\s+(\d+\.\d+)') {
+        return [version]$Matches[1]
+    }
+}
+
 function Get-CudaInstallations {
     $roots = New-Object System.Collections.Generic.List[string]
     if ($env:CUDA_PATH) { $roots.Add($env:CUDA_PATH) }
@@ -511,7 +520,9 @@ function Get-CudaInstallations {
         Test-Path -LiteralPath (Join-Path $_ 'bin\nvcc.exe')
     } | Sort-Object {
         $name = [System.IO.Path]::GetFileName($_) -replace '^[vV]', ''
-        [version]($name -replace '[^\d\.].*$', '')
+        $version = $null
+        if ([version]::TryParse($name, [ref]$version)) { $version }
+        else { Get-NvccRelease $_ }
     } -Descending
 }
 
@@ -524,6 +535,7 @@ function Find-TensorRtRoot {
         Where-Object {
             (Test-Path -LiteralPath (Join-Path $_.FullName 'include\NvInfer.h')) -and
             (Test-Path -LiteralPath (Join-Path $_.FullName 'lib\nvinfer_10.lib')) -and
+            (Test-Path -LiteralPath (Join-Path $_.FullName 'lib\nvonnxparser_10.lib')) -and
             (Test-Path -LiteralPath (Join-Path $_.FullName 'bin\nvinfer_10.dll'))
         } |
         Select-Object -First 1 -ExpandProperty FullName
@@ -552,7 +564,7 @@ function Get-BestCompatibleCudaDependencySet {
 
     $cudaVersion = ''
     if ($cudaRoot) {
-        $cudaVersion = ([System.IO.Path]::GetFileName($cudaRoot.TrimEnd('\', '/')) -replace '^[vV]', '')
+        $cudaVersion = [string](Get-NvccRelease $cudaRoot)
     }
 
     $arch = ''
